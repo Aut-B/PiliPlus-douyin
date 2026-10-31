@@ -52,8 +52,15 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
         result(FlutterError(code: "bad_args", message: "缺少参数", details: nil))
         return
       }
-      present(args: args)
-      result(nil)
+      if present(args: args) {
+        result(nil)
+      } else {
+        result(FlutterError(
+          code: "no_presenter",
+          message: "找不到可用的窗口，无法打开网页",
+          details: nil
+        ))
+      }
     case "close":
       webController?.closeSelf()
       result(nil)
@@ -68,9 +75,10 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
     }
   }
 
-  private func present(args: [String: Any]) {
+  private func present(args: [String: Any]) -> Bool {
     guard let root = Self.topViewController() else {
-      return
+      NSLog("[ShortVideoWeb] no top view controller")
+      return false
     }
     let controller = ShortVideoWebViewController(args: args) { [weak self] method, payload in
       self?.channel.invokeMethod(method, arguments: payload)
@@ -78,13 +86,15 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
     webController = controller
     let navigation = UINavigationController(rootViewController: controller)
     navigation.modalPresentationStyle = .fullScreen
+    navigation.view.backgroundColor = .systemBackground
     root.present(navigation, animated: true)
+    NSLog("[ShortVideoWeb] presented from \(type(of: root))")
+    return true
   }
 
   private static func topViewController() -> UIViewController? {
-    let scenes = UIApplication.shared.connectedScenes
     var root: UIViewController?
-    for scene in scenes {
+    for scene in UIApplication.shared.connectedScenes {
       guard let windowScene = scene as? UIWindowScene else { continue }
       for window in windowScene.windows where window.isKeyWindow {
         root = window.rootViewController
@@ -94,6 +104,9 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
     }
     if root == nil {
       root = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?.rootViewController
+    }
+    if root == nil {
+      root = UIApplication.shared.windows.first?.rootViewController
     }
     var top = root
     while let presented = top?.presentedViewController {
@@ -109,6 +122,8 @@ final class ShortVideoWebViewController: UIViewController {
 
   private var webView: WKWebView!
   private let statusLabel = UILabel()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let hintButton = UIButton(type: .system)
   private lazy var startButton = UIBarButtonItem(
     title: "开始抓取",
     style: .done,
@@ -123,9 +138,13 @@ final class ShortVideoWebViewController: UIViewController {
   private var startedAt = Date()
   private var collecting = false
   private var didNotifyClose = false
+  private var hookInstalled = false
+  private var pendingStart = false
+  private var didFinishLoading = false
 
   private var homeURL: String { args["url"] as? String ?? "https://www.douyin.com/" }
-  private var loginURL: String { args["loginUrl"] as? String ?? "https://www.douyin.com/" }
+  private var favoritesURL: String { args["favoritesUrl"] as? String ?? homeURL }
+  private var loginURL: String { args["loginUrl"] as? String ?? homeURL }
   private var userAgent: String { args["userAgent"] as? String ?? "" }
   private var hookScript: String { args["hookScript"] as? String ?? "" }
   private var driverScript: String { args["driverScript"] as? String ?? "" }
@@ -166,6 +185,12 @@ final class ShortVideoWebViewController: UIViewController {
         target: self,
         action: #selector(openLogin)
       ),
+      UIBarButtonItem(
+        image: UIImage(systemName: "safari"),
+        style: .plain,
+        target: self,
+        action: #selector(openInSafari)
+      ),
     ]
 
     let configuration = WKWebViewConfiguration()
@@ -173,13 +198,6 @@ final class ShortVideoWebViewController: UIViewController {
     configuration.defaultWebpagePreferences.allowsContentJavaScript = true
     configuration.defaultWebpagePreferences.preferredContentMode = .desktop
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
-    configuration.userContentController.addUserScript(
-      WKUserScript(
-        source: hookScript,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-      )
-    )
     configuration.userContentController.add(self, name: "shortvideo")
 
     let web = WKWebView(frame: .zero, configuration: configuration)
@@ -187,6 +205,8 @@ final class ShortVideoWebViewController: UIViewController {
     web.navigationDelegate = self
     web.uiDelegate = self
     web.allowsBackForwardNavigationGestures = true
+    web.isOpaque = true
+    web.backgroundColor = .white
     web.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(web)
 
@@ -196,6 +216,17 @@ final class ShortVideoWebViewController: UIViewController {
     statusLabel.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(statusLabel)
 
+    spinner.translatesAutoresizingMaskIntoConstraints = false
+    spinner.hidesWhenStopped = true
+    view.addSubview(spinner)
+
+    hintButton.setTitle("网页空白？点这里重试", for: .normal)
+    hintButton.titleLabel?.font = .systemFont(ofSize: 12)
+    hintButton.translatesAutoresizingMaskIntoConstraints = false
+    hintButton.addTarget(self, action: #selector(retry), for: .touchUpInside)
+    hintButton.isHidden = true
+    view.addSubview(hintButton)
+
     NSLayoutConstraint.activate([
       web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -204,14 +235,20 @@ final class ShortVideoWebViewController: UIViewController {
       statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
       statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
       statusLabel.bottomAnchor.constraint(
+        equalTo: hintButton.topAnchor,
+        constant: -4
+      ),
+      hintButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+      hintButton.bottomAnchor.constraint(
         equalTo: view.safeAreaLayoutGuide.bottomAnchor,
         constant: -8
       ),
+      spinner.centerXAnchor.constraint(equalTo: web.centerXAnchor),
+      spinner.centerYAnchor.constraint(equalTo: web.centerYAnchor),
     ])
 
     webView = web
     load(homeURL)
-    setStatus("正在打开网页…")
   }
 
   override func viewDidDisappear(_ animated: Bool) {
@@ -231,11 +268,22 @@ final class ShortVideoWebViewController: UIViewController {
   }
 
   @objc private func reloadFavorites() {
-    load(homeURL)
+    load(favoritesURL)
   }
 
   @objc private func openLogin() {
     load(loginURL)
+  }
+
+  @objc private func openInSafari() {
+    guard let url = webView.url ?? URL(string: homeURL) else { return }
+    UIApplication.shared.open(url)
+  }
+
+  @objc private func retry() {
+    hintButton.isHidden = true
+    didFinishLoading = false
+    load(webView.url?.absoluteString ?? homeURL)
   }
 
   @objc private func toggleCollecting() {
@@ -252,19 +300,65 @@ final class ShortVideoWebViewController: UIViewController {
     var request = URLRequest(url: url)
     request.timeoutInterval = 30
     webView.load(request)
+    didFinishLoading = false
+    spinner.startAnimating()
     setStatus("正在打开 \(urlString)…")
+    scheduleBlankCheck()
+  }
+
+  /// 10 秒还没渲染出内容就提示一下——比一片白什么都不说要好排查。
+  private func scheduleBlankCheck() {
+    hintButton.isHidden = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+      guard let self, !self.didFinishLoading else { return }
+      self.hintButton.isHidden = false
+      self.spinner.stopAnimating()
+    }
   }
 
   func startCollecting() {
     guard !collecting else { return }
+    if !isOnFavoritesPage {
+      pendingStart = true
+      load(favoritesURL)
+      setStatus("正在打开收藏页，加载完自动开始抓取…")
+      return
+    }
+    beginCollecting()
+  }
+
+  private var isOnFavoritesPage: Bool {
+    guard let current = webView.url?.absoluteString else { return false }
+    if favoritesURL.contains("/user/self") {
+      return current.contains("/user/self") || current.contains("showTab=favorite")
+    }
+    if favoritesURL.contains("tiktok.com/@") {
+      return current.contains("tiktok.com/@")
+    }
+    return current.contains(favoritesURL)
+  }
+
+  private func beginCollecting() {
     collecting = true
     startButton.title = "停止抓取"
     idleRounds = 0
     lastCount = received
     startedAt = Date()
-    webView.evaluateJavaScript(driverScript)
-    startTimer()
     setStatus("正在抓取…如果一直没动静，请先在网页里登录")
+    installHook { [weak self] in
+      guard let self else { return }
+      self.webView.evaluateJavaScript(self.driverScript)
+      self.startTimer()
+    }
+  }
+
+  /// 只在抓取时才注入：登录 / 搜索阶段页面是干净的，不会被影响。
+  private func installHook(_ completion: @escaping () -> Void) {
+    guard !hookInstalled else { completion(); return }
+    webView.evaluateJavaScript(hookScript) { [weak self] _, _ in
+      self?.hookInstalled = true
+      completion()
+    }
   }
 
   func stopCollecting(message: String? = nil) {
@@ -331,7 +425,32 @@ extension ShortVideoWebViewController: WKScriptMessageHandler {
 }
 
 extension ShortVideoWebViewController: WKNavigationDelegate {
+  func webView(
+    _ webView: WKWebView,
+    didStartProvisionalNavigation navigation: WKNavigation!
+  ) {
+    hookInstalled = false
+    spinner.startAnimating()
+  }
+
+  func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    didFinishLoading = true
+    spinner.stopAnimating()
+    hintButton.isHidden = true
+    if !collecting {
+      setStatus("页面已响应：\(webView.url?.absoluteString.prefix(60) ?? "")")
+    }
+  }
+
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    didFinishLoading = true
+    spinner.stopAnimating()
+    hintButton.isHidden = true
+    if pendingStart {
+      pendingStart = false
+      beginCollecting()
+      return
+    }
     if !collecting {
       setStatus("页面已加载：登录后点右上角「开始抓取」")
     }
@@ -353,24 +472,39 @@ extension ShortVideoWebViewController: WKNavigationDelegate {
     report(error)
   }
 
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    spinner.stopAnimating()
+    hintButton.isHidden = false
+    setStatus("网页进程被系统回收，点「重试」或右上角刷新")
+  }
+
   private func report(_ error: Error) {
     let ns = error as NSError
     if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorCancelled { return }
-    setStatus("网页加载失败：\(error.localizedDescription)")
+    spinner.stopAnimating()
+    hintButton.isHidden = false
+    setStatus("网页加载失败：\(error.localizedDescription)（\(ns.code)）")
   }
 }
 
 extension ShortVideoWebViewController: WKUIDelegate {
+  /// `window.open` / `target=_blank` 一律在本页打开。
+  ///
+  /// 抖音的「登录」、搜索结果、视频详情全是新窗口链接；不实现这个回调，
+  /// 点了就什么都不发生——这正是「登录按钮点不动」的真正原因。
   func webView(
     _ webView: WKWebView,
     createWebViewWith configuration: WKWebViewConfiguration,
     for navigationAction: WKNavigationAction,
     windowFeatures: WKWindowFeatures
   ) -> WKWebView? {
-    if let url = navigationAction.request.url,
-       let scheme = url.scheme?.lowercased(),
-       scheme == "http" || scheme == "https" {
-      webView.load(URLRequest(url: url))
+    if let url = navigationAction.request.url {
+      let scheme = (url.scheme ?? "").lowercased()
+      if scheme == "http" || scheme == "https" || scheme == "about" {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 30
+        webView.load(request)
+      }
     }
     return nil
   }

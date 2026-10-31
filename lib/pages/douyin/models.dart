@@ -9,7 +9,8 @@ enum ShortVideoPlatform {
     id: 'douyin',
     title: '抖音收藏',
     album: '抖音',
-    homeUrl: 'https://www.douyin.com/user/self?showTab=favorite_collection',
+    homeUrl: 'https://www.douyin.com/',
+    favoritesUrl: 'https://www.douyin.com/user/self?showTab=favorite_collection',
     referer: 'https://www.douyin.com/',
     userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -28,7 +29,8 @@ enum ShortVideoPlatform {
     id: 'tiktok',
     title: 'TikTok 收藏',
     album: 'TikTok',
-    homeUrl: 'https://www.tiktok.com/@me',
+    homeUrl: 'https://www.tiktok.com/',
+    favoritesUrl: 'https://www.tiktok.com/@me',
     referer: 'https://www.tiktok.com/',
     userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -49,6 +51,7 @@ enum ShortVideoPlatform {
     required this.title,
     required this.album,
     required this.homeUrl,
+    required this.favoritesUrl,
     required this.referer,
     required this.userAgent,
     required this.mobileUserAgent,
@@ -62,6 +65,10 @@ enum ShortVideoPlatform {
   final String title;
   final String album;
   final String homeUrl;
+
+  /// 收藏页。登录在首页做，抓取在收藏页做——`/user/self` 未登录时是半残页，
+  /// 直接当首页会连登录按钮都点不动。
+  final String favoritesUrl;
   final String referer;
   final String userAgent;
   final String mobileUserAgent;
@@ -101,6 +108,7 @@ class ShortVideo {
     required this.cover,
     required this.durationMs,
     required this.playUrl,
+    this.videoId = '',
     this.updatedAt = 0,
   });
 
@@ -111,7 +119,22 @@ class ShortVideo {
   final String cover;
   final int durationMs;
   final String playUrl;
+
+  /// 站点自己的视频 id（抖音是 `play_addr.uri`）。用它拼出来的地址不带过期
+  /// 签名，同步到别的手机、或者放几个小时之后都还能播。
+  final String videoId;
   final double updatedAt;
+
+  /// 不带过期签名的播放地址；没有 `videoId` 时返回 null。
+  String? get stableUrl {
+    if (videoId.isEmpty) return null;
+    final encoded = Uri.encodeComponent(videoId);
+    return platform == 'tiktok'
+        ? 'https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/play/'
+              '?video_id=$encoded&ratio=720p&line=0'
+        : 'https://www.iesdouyin.com/aweme/v1/play/'
+              '?video_id=$encoded&ratio=720p&line=0';
+  }
 
   /// 跨 App 的唯一键（不同平台的数字 id 会撞）。
   String get key => '$platform:$id';
@@ -124,16 +147,18 @@ class ShortVideo {
     return '${total ~/ 60}:${(total % 60).toString().padLeft(2, '0')}';
   }
 
-  ShortVideo copyWith({String? playUrl, double? updatedAt}) => ShortVideo(
-    id: id,
-    platform: platform,
-    desc: desc,
-    author: author,
-    cover: cover,
-    durationMs: durationMs,
-    playUrl: playUrl ?? this.playUrl,
-    updatedAt: updatedAt ?? this.updatedAt,
-  );
+  ShortVideo copyWith({String? playUrl, String? videoId, double? updatedAt}) =>
+      ShortVideo(
+        id: id,
+        platform: platform,
+        desc: desc,
+        author: author,
+        cover: cover,
+        durationMs: durationMs,
+        playUrl: playUrl ?? this.playUrl,
+        videoId: videoId ?? this.videoId,
+        updatedAt: updatedAt ?? this.updatedAt,
+      );
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -143,6 +168,7 @@ class ShortVideo {
     'cover': cover,
     'durationMS': durationMs,
     'playURL': playUrl,
+    'videoID': videoId,
     'updatedAt': updatedAt,
   };
 
@@ -154,6 +180,7 @@ class ShortVideo {
     cover: '${json['cover'] ?? ''}',
     durationMs: (json['durationMS'] as num?)?.toInt() ?? 0,
     playUrl: '${json['playURL'] ?? ''}',
+    videoId: '${json['videoID'] ?? ''}',
     updatedAt: (json['updatedAt'] as num?)?.toDouble() ?? 0,
   );
 }
@@ -222,6 +249,7 @@ abstract final class ShortVideoParser {
     String? playUrl;
     var durationMs = 0;
     var cover = '';
+    var videoId = '';
 
     switch (platform) {
       case ShortVideoPlatform.douyin:
@@ -230,6 +258,7 @@ abstract final class ShortVideoParser {
           'play_addr',
           'download_addr',
         ]);
+        videoId = _uri(videoMap);
         durationMs = _int(videoMap['duration']) ?? 0;
         cover =
             _firstUrl(videoMap, const [
@@ -240,6 +269,7 @@ abstract final class ShortVideoParser {
             '';
       case ShortVideoPlatform.tiktok:
         playUrl = _tiktokPlayUrl(videoMap);
+        videoId = _string(videoMap['id']) ?? _string(videoMap['videoID']) ?? '';
         // TikTok 的 duration 是秒。
         durationMs = (_int(videoMap['duration']) ?? 0) * 1000;
         cover =
@@ -262,8 +292,25 @@ abstract final class ShortVideoParser {
       cover: cover,
       durationMs: durationMs,
       playUrl: playUrl,
+      videoId: videoId,
       updatedAt: DateTime.now().millisecondsSinceEpoch.toDouble(),
     );
+  }
+
+  /// 抖音的 `video.play_addr.uri`，形如 `v0300fg10000cj2m3k3c77u7v6k0`。
+  static String _uri(Map<String, dynamic> video) {
+    for (final key in const [
+      'play_addr',
+      'play_addr_h264',
+      'download_addr',
+    ]) {
+      final entry = video[key];
+      if (entry is Map) {
+        final value = _string(entry['uri']);
+        if (value != null && value.isNotEmpty) return value;
+      }
+    }
+    return '';
   }
 
   static String? _tiktokPlayUrl(Map<String, dynamic> video) {
@@ -370,7 +417,10 @@ List<ShortVideo> mergeShortVideos(
     var playUrl = winner.playUrl;
     if (playUrl.isEmpty) playUrl = existing.playUrl;
     if (playUrl.isEmpty) playUrl = video.playUrl;
-    byKey[key] = winner.copyWith(playUrl: playUrl);
+    var videoId = winner.videoId;
+    if (videoId.isEmpty) videoId = existing.videoId;
+    if (videoId.isEmpty) videoId = video.videoId;
+    byKey[key] = winner.copyWith(playUrl: playUrl, videoId: videoId);
   }
 
   return order.map((key) => byKey[key]!).toList();

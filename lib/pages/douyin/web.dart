@@ -48,6 +48,7 @@ abstract final class ShortVideoWeb {
     _ensureHandler();
     await _channel.invokeMethod('open', {
       'url': platform.homeUrl,
+      'favoritesUrl': platform.favoritesUrl,
       'loginUrl': platform.loginUrl,
       'userAgent': platform.userAgent,
       'title': '${platform.album} · 登录与抓取',

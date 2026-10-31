@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:get/get.dart';
@@ -29,6 +30,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   VideoController? _controller;
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<bool>? _playingSub;
+  StreamSubscription<String>? _errorSub;
+
+  /// 已经探测过的播放地址（按 `platform:id` 缓存）。
+  final Map<String, String> _resolved = {};
 
   late int _index;
   bool _singleLoop = false;
@@ -67,29 +72,78 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _completedSub = player.stream.completed.listen((completed) {
       if (completed) _onCompleted();
     });
+    _errorSub = player.stream.error.listen((message) {
+      if (!mounted || message.isEmpty) return;
+      _showToast('播放失败：$message');
+    });
     setState(() {
       _player = player;
       _controller = controller;
     });
-    await player.open(Media(_current.playUrl), play: true);
+    await _openIndex(_index);
+  }
+
+  /// 打开第 `index` 条。
+  ///
+  /// 网页里抄到的直链带过期签名（两小时左右），放久了、同步到别的手机都会
+  /// 陆续播不了。这里优先用 `video_id` 的长期地址（先探一下通不通），
+  /// 不通再退回抓到的直链。
+  Future<void> _openIndex(int index) async {
+    final video = widget.videos[index];
+    var url = _resolved[video.key];
+    if (url == null) {
+      final stable = video.stableUrl;
+      if (stable != null && await _probe(stable, video)) {
+        url = stable;
+      } else {
+        url = video.playUrl;
+      }
+      _resolved[video.key] = url;
+    }
+    await _player?.open(Media(url), play: true);
+  }
+
+  /// 只取两个字节确认能播，别把整段视频拉下来。
+  Future<bool> _probe(String url, ShortVideo video) async {
+    final platform =
+        ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 6);
+    try {
+      final request = await client.getUrl(Uri.parse(url));
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
+      request.headers.set(HttpHeaders.userAgentHeader, platform.userAgent);
+      request.headers.set(HttpHeaders.refererHeader, platform.referer);
+      final response = await request.close().timeout(const Duration(seconds: 8));
+      final mime = response.headers.contentType?.mimeType ?? '';
+      final ok =
+          (response.statusCode == 200 || response.statusCode == 206) &&
+          !mime.contains('html');
+      await response.drain<void>();
+      return ok;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
+    }
   }
 
   void _onCompleted() {
     if (!mounted) return;
     if (_singleLoop) {
-      _player?.open(Media(_current.playUrl), play: true);
+      _openIndex(_index);
       return;
     }
     final next = (_index + 1) % widget.videos.length;
     setState(() => _index = next);
-    _player?.open(Media(_current.playUrl), play: true);
+    _openIndex(next);
   }
 
   Future<void> _jump(int delta) async {
     final next = _index + delta;
     if (next < 0 || next >= widget.videos.length) return;
     setState(() => _index = next);
-    await _player?.open(Media(_current.playUrl), play: true);
+    await _openIndex(next);
   }
 
   void _toggleLoop() {
@@ -113,6 +167,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   void dispose() {
     _completedSub?.cancel();
     _playingSub?.cancel();
+    _errorSub?.cancel();
     _player?.dispose();
     super.dispose();
   }

@@ -200,6 +200,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            const SizedBox(height: 10),
+            Text(
+              '网页打不开也不要紧：在 Kumone 里抓同一份收藏，'
+              '两台手机配同一个 WebDAV，这里点右上角同步就行。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.8),
+              ),
+            ),
           ],
         ),
       ),
