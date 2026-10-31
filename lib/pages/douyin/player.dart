@@ -1,12 +1,21 @@
+import 'dart:async';
+
 import 'package:PiliPlus/pages/douyin/models.dart';
-import 'package:material_ui/material_ui.dart';
 import 'package:get/get.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
-/// Full-screen Douyin playback. Uses media_kit directly instead of the
-/// Bilibili video page: there is no aid/cid, no danmaku and no quality ladder,
-/// just one URL per video plus the loop mode the user asked for.
+const _douyinUserAgent =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/131.0.0.0 Safari/537.36';
+
+/// Full-screen Douyin playback.
+///
+/// Uses media_kit directly instead of the Bilibili video page: there is no
+/// aid/cid, no danmaku and no quality ladder — just one URL per video, plus the
+/// loop mode the user asked for.
 class DouyinPlayerPage extends StatefulWidget {
   const DouyinPlayerPage({super.key, required this.videos, required this.index});
 
@@ -18,8 +27,11 @@ class DouyinPlayerPage extends StatefulWidget {
 }
 
 class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
-  late final Player _player;
-  late final VideoController _controller;
+  Player? _player;
+  VideoController? _controller;
+  StreamSubscription<bool>? _completedSub;
+  StreamSubscription<bool>? _playingSub;
+
   late int _index;
   bool _singleLoop = false;
   bool _playing = false;
@@ -30,48 +42,57 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
   void initState() {
     super.initState();
     _index = widget.index.clamp(0, widget.videos.length - 1);
-    _player = Player();
-    _controller = VideoController(_player);
-    _player.stream.playing.listen((value) {
-      if (mounted) setState(() => _playing = value);
-    });
-    _open();
+    _init();
   }
 
-  Future<void> _open() async {
-    await _player.setPlaylistMode(
-      _singleLoop ? PlaylistMode.single : PlaylistMode.loop,
+  Future<void> _init() async {
+    final player = await Player.create(
+      configuration: const PlayerConfiguration(
+        options: {'autoplay': 'yes'},
+      ),
     );
-    await _player.open(
-      Playlist([
-        for (final video in widget.videos)
-          Media(
-            video.playUrl,
-            httpHeaders: const {
-              'User-Agent':
-                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                  'AppleWebKit/537.36 (KHTML, like Gecko) '
-                  'Chrome/131.0.0.0 Safari/537.36',
-              'Referer': 'https://www.douyin.com/',
-            },
-          ),
-      ], index: _index),
-      play: true,
+    final controller = await VideoController.create(player);
+    if (!mounted) {
+      player.dispose();
+      return;
+    }
+    player.setMediaHeader(
+      userAgent: _douyinUserAgent,
+      referer: 'https://www.douyin.com/',
     );
+    _playingSub = player.stream.playing.listen((value) {
+      if (mounted) setState(() => _playing = value);
+    });
+    _completedSub = player.stream.completed.listen((completed) {
+      if (completed) _onCompleted();
+    });
+    setState(() {
+      _player = player;
+      _controller = controller;
+    });
+    await player.open(Media(_current.playUrl), play: true);
+  }
+
+  void _onCompleted() {
+    if (!mounted) return;
+    if (_singleLoop) {
+      _player?.open(Media(_current.playUrl), play: true);
+      return;
+    }
+    final next = (_index + 1) % widget.videos.length;
+    setState(() => _index = next);
+    _player?.open(Media(_current.playUrl), play: true);
   }
 
   Future<void> _jump(int delta) async {
     final next = _index + delta;
     if (next < 0 || next >= widget.videos.length) return;
     setState(() => _index = next);
-    await _player.jump(next);
+    await _player?.open(Media(_current.playUrl), play: true);
   }
 
-  Future<void> _toggleLoop() async {
+  void _toggleLoop() {
     setState(() => _singleLoop = !_singleLoop);
-    await _player.setPlaylistMode(
-      _singleLoop ? PlaylistMode.single : PlaylistMode.loop,
-    );
     _showToast(_singleLoop ? '单个循环' : '列表循环');
   }
 
@@ -89,17 +110,20 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
 
   @override
   void dispose() {
-    _player.dispose();
+    _completedSub?.cancel();
+    _playingSub?.cancel();
+    _player?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final controller = _controller;
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: () => _player.playOrPause(),
+        onTap: () => _player?.playOrPause(),
         onVerticalDragEnd: (details) {
           final velocity = details.primaryVelocity ?? 0;
           if (velocity < -200) {
@@ -111,16 +135,18 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Center(
-              child: AspectRatio(
-                aspectRatio: 9 / 16,
-                child: Video(
-                  controller: _controller,
-                  controls: NoVideoControls,
-                  fill: Colors.black,
+            if (controller == null)
+              const Center(child: CircularProgressIndicator())
+            else
+              Center(
+                child: AspectRatio(
+                  aspectRatio: 9 / 16,
+                  child: SimpleVideo(
+                    controller: controller,
+                    fill: Colors.black,
+                  ),
                 ),
               ),
-            ),
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
               left: 8,
@@ -150,7 +176,7 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
                 ],
               ),
             ),
-            if (!_playing)
+            if (!_playing && controller != null)
               const Center(
                 child: Icon(
                   Icons.play_circle_fill,

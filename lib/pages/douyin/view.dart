@@ -147,15 +147,26 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
     final parsed = DouyinParser.fromResponseBody(body);
     if (parsed.isEmpty) return;
 
-    final known = _videos.map((e) => e.id).toSet();
-    var added = 0;
+    final indexById = <String, int>{
+      for (var i = 0; i < _videos.length; i++) _videos[i].id: i,
+    };
+    var changed = 0;
     for (final video in parsed) {
-      if (known.add(video.id)) {
+      final index = indexById[video.id];
+      if (index != null) {
+        // Play URLs are signed and expire; a re-scrape refreshes them instead
+        // of keeping the stale copy.
+        if (_videos[index].playUrl != video.playUrl) {
+          _videos[index] = video;
+          changed++;
+        }
+      } else {
         _videos.add(video);
-        added++;
+        indexById[video.id] = _videos.length - 1;
+        changed++;
       }
     }
-    if (added == 0) return;
+    if (changed == 0) return;
     setState(() => _status = '已抓取 ${_videos.length} 条…');
     _save();
   }
