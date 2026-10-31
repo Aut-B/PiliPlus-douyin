@@ -8,7 +8,7 @@ import 'package:material_ui/material_ui.dart';
 
 /// 抖音 / TikTok 收藏列表。
 ///
-/// 抓取本身在 [ShortVideoWebPage] 里做（网页登录 + 旁观接口返回），这里只负责
+/// 抓取本身在原生 WKWebView 里做（网页登录 + 旁观接口返回），这里只负责
 /// 展示、播放和 WebDAV 同步。
 class ShortVideoFavoritesPage extends StatefulWidget {
   const ShortVideoFavoritesPage({super.key, required this.platform});
@@ -73,11 +73,49 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   Future<void> _openWeb() async {
-    await Get.to(() => ShortVideoWebPage(platform: platform));
-    _reload();
-    if (!mounted) return;
-    setState(() => _status = '本地 ${_videos.length} 条');
-    await _sync(silent: true);
+    ShortVideoWeb.onPayload = _ingest;
+    ShortVideoWeb.onStatus = (text) {
+      if (mounted) setState(() => _status = text);
+    };
+    ShortVideoWeb.onClosed = () {
+      if (!mounted) return;
+      _reload();
+      setState(() => _status = '本地 ${_videos.length} 条');
+      _sync(silent: true);
+    };
+    try {
+      await ShortVideoWeb.open(platform);
+    } catch (e) {
+      if (mounted) setState(() => _status = '打开网页失败：$e');
+      SmartDialog.showToast('打开网页失败: $e');
+    }
+  }
+
+  void _ingest(String body) {
+    final parsed = ShortVideoParser.fromResponseBody(body, platform);
+    if (parsed.isEmpty) return;
+
+    final indexById = <String, int>{
+      for (var i = 0; i < _videos.length; i++) _videos[i].id: i,
+    };
+    var changed = 0;
+    for (final video in parsed) {
+      final index = indexById[video.id];
+      if (index != null) {
+        // 直链是签名过的，会过期；重抓时用新的覆盖旧的。
+        if (_videos[index].playUrl != video.playUrl) {
+          _videos[index] = video;
+          changed++;
+        }
+      } else {
+        _videos.add(video);
+        indexById[video.id] = _videos.length - 1;
+        changed++;
+      }
+    }
+    if (changed == 0) return;
+    ShortVideoRepo.save(platform, _videos);
+    if (mounted) setState(() => _status = '已抓取 ${_videos.length} 条');
   }
 
   void _play(int index) {
