@@ -1,0 +1,1817 @@
+import 'dart:async';
+import 'dart:math' show min;
+import 'dart:ui';
+
+import 'package:PiliPlus/common/style.dart';
+import 'package:PiliPlus/common/widgets/pair.dart';
+import 'package:PiliPlus/common/widgets/progress_bar/segment_progress_bar.dart';
+import 'package:PiliPlus/common/widgets/scaffold/mini_scaffold.dart';
+import 'package:PiliPlus/grpc/bilibili/app/listener/v1.pbenum.dart'
+    show PlaylistSource;
+import 'package:PiliPlus/grpc/dm.dart';
+import 'package:PiliPlus/http/browser_ua.dart';
+import 'package:PiliPlus/http/fav.dart';
+import 'package:PiliPlus/http/init.dart';
+import 'package:PiliPlus/http/loading_state.dart';
+import 'package:PiliPlus/http/user.dart';
+import 'package:PiliPlus/http/video.dart';
+import 'package:PiliPlus/models/common/account_type.dart';
+import 'package:PiliPlus/models/common/sponsor_block/action_type.dart';
+import 'package:PiliPlus/models/common/sponsor_block/post_segment_model.dart';
+import 'package:PiliPlus/models/common/sponsor_block/segment_model.dart';
+import 'package:PiliPlus/models/common/sponsor_block/segment_type.dart';
+import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/source_type.dart';
+import 'package:PiliPlus/models/common/video/video_decode_type.dart';
+import 'package:PiliPlus/models/common/video/video_quality.dart';
+import 'package:PiliPlus/models/common/video/video_type.dart';
+import 'package:PiliPlus/models/video/play/url.dart';
+import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
+import 'package:PiliPlus/models_new/media_list/media_list.dart';
+import 'package:PiliPlus/models_new/pgc/pgc_info_model/result.dart';
+import 'package:PiliPlus/models_new/video/video_detail/data.dart';
+import 'package:PiliPlus/models_new/video/video_detail/episode.dart' as ugc;
+import 'package:PiliPlus/models_new/video/video_pbp/data.dart';
+import 'package:PiliPlus/models_new/video/video_play_info/subtitle.dart';
+import 'package:PiliPlus/models_new/video/video_stein_edgeinfo/data.dart';
+import 'package:PiliPlus/pages/audio/view.dart';
+import 'package:PiliPlus/pages/common/publish/publish_route.dart';
+import 'package:PiliPlus/pages/search/widgets/search_text.dart';
+import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
+import 'package:PiliPlus/pages/video/download_panel/view.dart';
+import 'package:PiliPlus/pages/video/introduction/pgc/controller.dart';
+import 'package:PiliPlus/pages/video/introduction/ugc/controller.dart';
+import 'package:PiliPlus/pages/video/medialist/view.dart';
+import 'package:PiliPlus/pages/video/note/view.dart';
+import 'package:PiliPlus/pages/video/post_panel/view.dart';
+import 'package:PiliPlus/pages/video/send_danmaku/view.dart';
+import 'package:PiliPlus/pages/video/widgets/header_control.dart';
+import 'package:PiliPlus/plugin/pl_player/controller.dart';
+import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
+import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
+import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/services/download/download_service.dart';
+import 'package:PiliPlus/utils/accounts.dart';
+import 'package:PiliPlus/utils/connectivity_utils.dart';
+import 'package:PiliPlus/utils/extension/context_ext.dart';
+import 'package:PiliPlus/utils/extension/iterable_ext.dart';
+import 'package:PiliPlus/utils/extension/nested_scroll_ext.dart';
+import 'package:PiliPlus/utils/extension/num_ext.dart';
+import 'package:PiliPlus/utils/extension/size_ext.dart';
+import 'package:PiliPlus/utils/page_utils.dart';
+import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/storage.dart';
+import 'package:PiliPlus/utils/storage_pref.dart';
+import 'package:PiliPlus/utils/theme_utils.dart';
+import 'package:PiliPlus/utils/utils.dart';
+import 'package:PiliPlus/utils/video_utils.dart';
+import 'package:collection/collection.dart';
+import 'package:dio/dio.dart' show Options;
+import 'package:extended_nested_scroll_view/extended_nested_scroll_view.dart'
+    show ExtendedNestedScrollViewState;
+import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
+import 'package:get/get.dart';
+import 'package:hive_ce/hive.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:media_kit/media_kit.dart' hide Subtitle;
+
+class VideoDetailController extends GetxController
+    with GetTickerProviderStateMixin, BlockMixin {
+  /// 路由传参
+  late final Map args;
+  late String bvid;
+  late int aid;
+  late final RxInt cid;
+  int? epId;
+  int? seasonId;
+  int? pgcType;
+  late final String heroTag;
+  late final RxString cover;
+
+  // 视频类型 默认投稿视频
+  late final VideoType videoType;
+  @override
+  late final isUgc = videoType == VideoType.ugc;
+  VideoType? _actualVideoType;
+  late final ugcIntroCtr = Get.find<UgcIntroController>(tag: heroTag);
+  late final pgcIntroCtr = Get.find<PgcIntroController>(tag: heroTag);
+
+  // 页面来源 稍后再看 收藏夹
+  late bool isPlayAll;
+  late SourceType sourceType;
+  late BiliDownloadEntryInfo entry;
+  @override
+  late bool isFileSource;
+  late bool _mediaDesc = false;
+  late final RxList<MediaListItemModel> mediaList = <MediaListItemModel>[].obs;
+  late String watchLaterTitle;
+
+  /// tabs相关配置
+  late TabController tabCtr;
+
+  // 请求返回的视频信息
+  late PlayUrlModel data;
+  final RxBool videoState = false.obs;
+
+  /// 播放器配置 画质 音质 解码格式
+  final Rxn<VideoQuality> currentVideoQa = Rxn<VideoQuality>();
+  AudioQuality? currentAudioQa;
+  late VideoDecodeFormatType currentDecodeFormats;
+
+  // 是否开始自动播放 存在多p的情况下，第二p需要为true
+  final RxBool _autoPlay = Pref.autoPlayEnable.obs;
+
+  final videoPlayerKey = GlobalKey();
+  final childKey = GlobalKey<MiniScaffoldState>();
+
+  final plPlayerController = PlPlayerController.getInstance()
+    ..brightness.value = -1;
+  bool get setSystemBrightness => plPlayerController.setSystemBrightness;
+  bool get removeSafeArea => plPlayerController.removeSafeArea;
+  double get uiScale => plPlayerController.uiScale;
+
+  late VideoItem firstVideo;
+  String? videoUrl;
+  String? audioUrl;
+  Duration? defaultST;
+  Duration? playedTime;
+  String playedTimePos(bool hasParams) {
+    final pos = playedTime?.inMilliseconds;
+    if (pos != null && pos > 0) {
+      return '${hasParams ? '&' : '?'}t=${pos / 1000}';
+    }
+    return '';
+  }
+
+  // 亮度
+  double? brightness;
+
+  late final headerCtrKey = GlobalKey<TimeBatteryMixin>();
+
+  Box setting = GStorage.setting;
+
+  // 预设的解码格式
+  late List<VideoDecodeFormatType> preferCodecs = Pref.preferCodecs;
+
+  bool get showReply => isFileSource
+      ? false
+      : isUgc
+      ? plPlayerController.showVideoReply
+      : plPlayerController.showBangumiReply;
+
+  bool get showRelatedVideo =>
+      isFileSource ? false : plPlayerController.showRelatedVideo;
+
+  ScrollController? introScrollCtr;
+  ScrollController get effectiveIntroScrollCtr =>
+      introScrollCtr ??= ScrollController();
+
+  int? seasonCid;
+  late final RxInt seasonIndex = 0.obs;
+
+  PlayerStatus? playerStatus;
+
+  late final scrollKey = GlobalKey<ExtendedNestedScrollViewState>();
+  late final RxBool isVertical;
+  late final RxDouble scrollRatio = 0.0.obs;
+
+  ScrollController? _scrollCtr;
+  ScrollController get scrollCtr => _scrollCtr ??= ScrollController();
+
+  late bool isExpanding = false;
+  late bool isCollapsing = false;
+
+  late double minVideoHeight;
+  late double maxVideoHeight;
+  late double videoHeight;
+  late double animHeight;
+
+  AnimationController? animController;
+  AnimationController get animationController =>
+      animController ??= (AnimationController(
+        vsync: this,
+        duration: const Duration(milliseconds: 200),
+      )..addListener(_animListener));
+
+  void refreshPage() {
+    scrollKey.currentState?.refresh();
+  }
+
+  void _animListener() {
+    if (animationController.isForwardOrCompleted) {
+      _calcAnimHeight();
+      refreshPage();
+    }
+  }
+
+  void _calcAnimHeight() {
+    if (isExpanding) {
+      animHeight = clampDouble(
+        videoHeight * animationController.value,
+        kToolbarHeight,
+        videoHeight,
+      );
+    } else if (isCollapsing) {
+      animHeight = clampDouble(
+        maxVideoHeight -
+            (maxVideoHeight - minVideoHeight) * animationController.value,
+        minVideoHeight,
+        maxVideoHeight,
+      );
+    }
+  }
+
+  void animToTop() {
+    scrollKey.currentState?.animToTop();
+  }
+
+  bool _needAnimOnDimensionChanged(bool isVertical) {
+    if (isFullScreen) {
+      if (PlatformUtils.isMobile) {
+        plPlayerController.changeOrientation(isVertical: isVertical);
+      }
+      return false;
+    }
+    return true;
+  }
+
+  @pragma('vm:notify-debugger-on-exception')
+  void _setVideoHeight() {
+    try {
+      var width = firstVideo.width;
+      var height = firstVideo.height;
+      if (width == null || height == null) {
+        if (isUgc && !isFileSource) {
+          final cid = this.cid.value;
+          final part = ugcIntroCtr.videoDetail.value.pages?.firstWhereOrNull(
+            (e) => e.cid == cid,
+          );
+          if (part != null) {
+            final dimension = part.dimension!;
+            width = dimension.width!;
+            height = dimension.height!;
+          } else {
+            return;
+          }
+        } else {
+          return;
+        }
+      }
+      final isVertical = height > width;
+      if (_scrollCtr?.hasClients != true) {
+        videoHeight = isVertical ? maxVideoHeight : minVideoHeight;
+        if (this.isVertical.value != isVertical) {
+          this.isVertical.value = isVertical;
+          _needAnimOnDimensionChanged(isVertical);
+        }
+        return;
+      }
+      if (this.isVertical.value != isVertical) {
+        this.isVertical.value = isVertical;
+        double videoHeight = isVertical ? maxVideoHeight : minVideoHeight;
+        if (this.videoHeight != videoHeight) {
+          if (videoHeight > this.videoHeight) {
+            // current minVideoHeight
+            if (_needAnimOnDimensionChanged(isVertical)) {
+              isExpanding = true;
+              animationController.forward(
+                from: (minVideoHeight - scrollCtr.offset) / maxVideoHeight,
+              );
+            }
+            this.videoHeight = maxVideoHeight;
+          } else {
+            // current maxVideoHeight
+            final currentHeight = (maxVideoHeight - scrollCtr.offset)
+                .toPrecision(2);
+            double minVideoHeightPrecise = minVideoHeight.toPrecision(2);
+            if (currentHeight == minVideoHeightPrecise) {
+              this.videoHeight = minVideoHeight;
+              if (_needAnimOnDimensionChanged(isVertical)) {
+                isExpanding = true;
+                animationController.forward(from: 1);
+              }
+            } else if (currentHeight < minVideoHeightPrecise) {
+              // expand
+              if (_needAnimOnDimensionChanged(isVertical)) {
+                isExpanding = true;
+                animationController.forward(
+                  from: currentHeight / minVideoHeight,
+                );
+              }
+              this.videoHeight = minVideoHeight;
+            } else {
+              // collapse
+              if (_needAnimOnDimensionChanged(isVertical)) {
+                isCollapsing = true;
+                animationController.forward(
+                  from: scrollCtr.offset / (maxVideoHeight - minVideoHeight),
+                );
+              }
+              this.videoHeight = minVideoHeight;
+            }
+          }
+        }
+      } else {
+        if (scrollCtr.offset != 0) {
+          isExpanding = true;
+          animationController.forward(from: 1 - scrollCtr.offset / videoHeight);
+        }
+      }
+    } catch (_) {}
+  }
+
+  final isLoginVideo = Accounts.get(AccountType.video).isLogin;
+
+  late final watchProgress = GStorage.watchProgress;
+  void cacheLocalProgress() {
+    if (plPlayerController.playerStatus.isCompleted) {
+      watchProgress.put(cid.value.toString(), entry.totalTimeMilli);
+    } else if (playedTime case final playedTime?) {
+      watchProgress.put(cid.value.toString(), playedTime.inMilliseconds);
+    }
+  }
+
+  void _initLocalSkipIfNeeded() {
+    if (plPlayerController.enableBlock) {
+      resetBlock();
+      if (entry.segments case final list? when list.isNotEmpty) {
+        handleSBData(list);
+      }
+    }
+  }
+
+  void initFileSource(BiliDownloadEntryInfo entry) {
+    this.entry = entry;
+    _initLocalSkipIfNeeded();
+    firstVideo = VideoItem(
+      id: entry.preferedVideoQuality,
+      quality: VideoQuality.fromCode(entry.preferedVideoQuality),
+      width: entry.ep?.width ?? entry.pageData?.width ?? 1,
+      height: entry.ep?.height ?? entry.pageData?.height ?? 1,
+    );
+    if (watchProgress.get(cid.value.toString()) case final int progress?) {
+      if (progress >= entry.totalTimeMilli - 400) {
+        defaultST = Duration.zero;
+      } else {
+        defaultST = Duration(milliseconds: progress);
+      }
+    } else {
+      defaultST = Duration.zero;
+    }
+    data = PlayUrlModel(timeLength: entry.totalTimeMilli);
+    _setVideoHeight();
+  }
+
+  @override
+  void onInit() {
+    super.onInit();
+    // 解析恢复后把落空的取流补回来（见 [_onDnsRecovered]）。
+    Request.addDnsRecoveredListener(_onDnsRecovered);
+    args = Get.arguments;
+    videoType = args['videoType'];
+    if (videoType == VideoType.pgc) {
+      if (!isLoginVideo) {
+        _actualVideoType = VideoType.ugc;
+      }
+    } else if (args['pgcApi'] == true) {
+      _actualVideoType = VideoType.pgc;
+    }
+
+    bvid = args['bvid'];
+    aid = args['aid'];
+    cid = RxInt(args['cid']);
+    epId = args['epId'];
+    seasonId = args['seasonId'];
+    pgcType = args['pgcType'];
+    heroTag = args['heroTag'];
+    cover = RxString(args['cover'] ?? '');
+    isVertical = RxBool(args['isVertical'] ?? false);
+
+    sourceType = args['sourceType'] ?? SourceType.normal;
+    isFileSource = sourceType == SourceType.file;
+    isPlayAll = sourceType != SourceType.normal && !isFileSource;
+    if (isFileSource) {
+      initFileSource(args['entry']);
+    } else if (isPlayAll) {
+      watchLaterTitle = args['favTitle'];
+      _mediaDesc = args['desc'];
+      getMediaList();
+    }
+
+    tabCtr = TabController(
+      length: 2,
+      vsync: this,
+      initialIndex: Pref.defaultShowComment ? 1 : 0,
+    );
+  }
+
+  Future<void> getMediaList({
+    bool isReverse = false,
+    bool isLoadPrevious = false,
+  }) async {
+    final count = args['count'];
+    if (!isReverse && count != null && mediaList.length >= count) {
+      return;
+    }
+    final res = await UserHttp.getMediaList(
+      type: args['mediaType'] ?? sourceType.mediaType,
+      bizId: args['mediaId'] ?? -1,
+      ps: 20,
+      direction: isLoadPrevious ? true : false,
+      oid: isReverse
+          ? null
+          : mediaList.isEmpty
+          ? args['isContinuePlaying'] == true
+                ? args['oid']
+                : null
+          : isLoadPrevious
+          ? mediaList.first.aid
+          : mediaList.last.aid,
+      otype: isReverse
+          ? null
+          : mediaList.isEmpty
+          ? null
+          : isLoadPrevious
+          ? mediaList.first.type
+          : mediaList.last.type,
+      desc: _mediaDesc,
+      sortField: args['sortField'] ?? 1,
+      withCurrent: mediaList.isEmpty && args['isContinuePlaying'] == true
+          ? true
+          : false,
+    );
+    if (res case Success(:final response)) {
+      if (response.mediaList.isNotEmpty) {
+        if (isReverse) {
+          mediaList.value = response.mediaList;
+          for (final item in mediaList) {
+            if (item.cid != null) {
+              try {
+                ugcIntroCtr.onChangeEpisode(item);
+              } catch (_) {}
+              break;
+            }
+          }
+        } else if (isLoadPrevious) {
+          mediaList.insertAll(0, response.mediaList);
+        } else {
+          mediaList.addAll(response.mediaList);
+        }
+      }
+    } else {
+      res.toast();
+    }
+  }
+
+  void showMediaListPanel(BuildContext context) {
+    if (mediaList.isNotEmpty) {
+      Widget panel() => MediaListPanel(
+        mediaList: mediaList,
+        onChangeEpisode: (episode) {
+          try {
+            ugcIntroCtr.onChangeEpisode(episode);
+          } catch (_) {}
+        },
+        panelTitle: watchLaterTitle,
+        bvid: bvid,
+        count: args['count'],
+        loadMoreMedia: getMediaList,
+        desc: _mediaDesc,
+        onReverse: () {
+          _mediaDesc = !_mediaDesc;
+          getMediaList(isReverse: true);
+        },
+        loadPrevious: args['isContinuePlaying'] == true
+            ? () => getMediaList(isLoadPrevious: true)
+            : null,
+        onDelete:
+            sourceType == SourceType.watchLater ||
+                (sourceType == SourceType.fav && args['isOwner'] == true)
+            ? (item, index) async {
+                if (sourceType == SourceType.watchLater) {
+                  final res = await UserHttp.toViewDel(
+                    aids: item.aid.toString(),
+                  );
+                  if (res.isSuccess) {
+                    mediaList.removeAt(index);
+                  }
+                } else {
+                  final res = await FavHttp.favVideo(
+                    resources: '${item.aid}:${item.type}',
+                    delIds: '${args['mediaId']}',
+                  );
+                  if (res.isSuccess) {
+                    mediaList.removeAt(index);
+                    SmartDialog.showToast('取消收藏');
+                  } else {
+                    res.toast();
+                  }
+                }
+              }
+            : null,
+      );
+      if (plPlayerController.isFullScreen.value || showVideoSheet) {
+        PageUtils.showVideoBottomSheet(
+          context,
+          child: plPlayerController.darkVideoPage
+              ? Theme(data: ThemeUtils.darkTheme, child: panel())
+              : panel(),
+        );
+      } else {
+        childKey.currentState?.showBottomSheet(
+          constraints: const BoxConstraints(),
+          (context) => panel(),
+        );
+      }
+    } else {
+      getMediaList();
+    }
+  }
+
+  bool isPortrait = true;
+
+  bool get horizontalScreen => plPlayerController.horizontalScreen;
+
+  bool get showVideoSheet =>
+      (!horizontalScreen && !isPortrait) || plPlayerController.isDesktopPip;
+
+  @override
+  late final RxString videoLabel = ''.obs;
+  @override
+  int? get timeLength => data.timeLength;
+  @override
+  BlockConfigMixin get blockConfig => plPlayerController;
+  @override
+  Player? get player => plPlayerController.videoPlayerController;
+  @override
+  bool get isFullScreen => plPlayerController.isFullScreen.value;
+  @override
+  bool get autoPlay => _autoPlay.value;
+  set autoPlay(bool value) {
+    _autoPlay.value = value;
+    // 界面（用户按了播放）把它打开——那它就不再是「被失败关掉的」，补偿重取不该再以
+    // 「恢复」的名义动它。
+    if (value) _autoPlayKilledByFailure = false;
+  }
+  @override
+  bool get preInitPlayer => plPlayerController.preInitPlayer;
+  @override
+  int get currPosInMilliseconds =>
+      defaultST?.inMilliseconds ?? plPlayerController.positionInMilliseconds;
+  @override
+  Future<void> seekTo(Duration duration, {required bool isSeek}) =>
+      plPlayerController.seekTo(duration, isSeek: isSeek);
+
+  @override
+  Widget buildItem(Object item, Animation<double> animation) {
+    final theme = ThemeUtils.theme;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: SlideTransition(
+        position: animation.drive(
+          Tween<Offset>(
+            begin: const Offset(-1.0, 0.0),
+            end: Offset.zero,
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(top: 5),
+          child: GestureDetector(
+            onHorizontalDragUpdate: (DragUpdateDetails details) {
+              if (details.delta.dx < 0) {
+                onRemoveItem(listData.indexOf(item), item);
+              }
+            },
+            child: SearchText(
+              bgColor: theme.colorScheme.secondaryContainer.withValues(
+                alpha: 0.8,
+              ),
+              textColor: theme.colorScheme.onSecondaryContainer,
+              padding: const .symmetric(horizontal: 8, vertical: 4),
+              fontSize: 14,
+              text: item is SegmentModel
+                  ? '跳过: ${item.segmentType.shortTitle}'
+                  : '上次看到第${(item as int) + 1}P，点击跳转',
+              onTap: (_) {
+                if (item is int) {
+                  try {
+                    final part = ugcIntroCtr.videoDetail.value.pages![item];
+                    ugcIntroCtr.onChangeEpisode(part);
+                    SmartDialog.showToast('已跳至第${item + 1}P');
+                  } catch (e) {
+                    if (kDebugMode) debugPrint('$e');
+                    SmartDialog.showToast('跳转失败');
+                  }
+                  onRemoveItem(listData.indexOf(item), item);
+                } else if (item is SegmentModel) {
+                  onSkip(item, isSeek: false);
+                  onRemoveItem(listData.indexOf(item), item);
+                }
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  ({int mode, int fontSize, Color color})? dmConfig;
+  String? savedDanmaku;
+
+  /// 发送弹幕
+  Future<void> showShootDanmakuSheet() async {
+    if (plPlayerController.dmState.contains(cid.value)) {
+      SmartDialog.showToast('UP主已关闭弹幕');
+      return;
+    }
+    final isPlaying =
+        _autoPlay.value && plPlayerController.playerStatus.isPlaying;
+    if (isPlaying) {
+      await plPlayerController.pause();
+    }
+    await Get.key.currentState!.push(
+      PublishRoute(
+        pageBuilder: (buildContext, animation, secondaryAnimation) {
+          final child = SendDanmakuPanel(
+            cid: cid.value,
+            bvid: bvid,
+            progress: plPlayerController.positionInMilliseconds,
+            initialValue: savedDanmaku,
+            onSave: (danmaku) => savedDanmaku = danmaku,
+            onSuccess: (danmakuModel) {
+              savedDanmaku = null;
+              plPlayerController.danmakuController?.addDanmaku(danmakuModel);
+            },
+            dmConfig: dmConfig,
+            onSaveDmConfig: (dmConfig) => this.dmConfig = dmConfig,
+          );
+          if (plPlayerController.darkVideoPage) {
+            return Theme(data: ThemeUtils.darkTheme, child: child);
+          }
+          return child;
+        },
+      ),
+    );
+    if (isPlaying) {
+      plPlayerController.play();
+    }
+  }
+
+  VideoItem findVideoByQa(int qa, {bool setCodecs = false}) {
+    /// 根据currentVideoQa和currentDecodeFormats 重新设置videoUrl
+    final videoList = data.dash!.video!.where((i) => i.id == qa).toList();
+
+    final currentCodes = currentDecodeFormats.codes;
+    VideoItem? bestVideo;
+    int bestIndex = preferCodecs.length;
+    for (final video in videoList) {
+      final c = video.codecs!;
+      if (currentCodes.any(c.startsWith)) {
+        return video;
+      }
+      for (int i = 0; i < bestIndex; i++) {
+        if (preferCodecs[i].codes.any(c.startsWith)) {
+          bestIndex = i;
+          bestVideo = video;
+          break;
+        }
+      }
+    }
+
+    if (setCodecs) {
+      if (bestIndex < preferCodecs.length) {
+        currentDecodeFormats = preferCodecs[bestIndex];
+      } else {
+        currentDecodeFormats = VideoDecodeFormatType.fromString(
+          videoList.first.codecs!,
+        );
+      }
+    }
+
+    return bestVideo ?? videoList.first;
+  }
+
+  /// 更新画质、音质
+  void updatePlayer() {
+    final currentVideoQa = this.currentVideoQa.value;
+    if (currentVideoQa == null) return;
+    _autoPlay.value = true;
+    _autoPlayKilledByFailure = false;
+    playedTime = plPlayerController.videoPlayerController?.state.position;
+    plPlayerController
+      ..isBuffering.value = false
+      ..buffered.value = 0;
+
+    firstVideo = findVideoByQa(currentVideoQa.code, setCodecs: true);
+    videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
+
+    /// 根据currentAudioQa 重新设置audioUrl
+    if (currentAudioQa != null) {
+      final firstAudio = data.dash!.audio!.firstWhere(
+        (i) => i.id == currentAudioQa!.code,
+        orElse: () => data.dash!.audio!.first,
+      );
+      audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
+    }
+
+    playerInit();
+  }
+
+  Future<void>? initPlayerIfNeeded(bool autoFullScreenFlag) {
+    plPlayerController.noteAutoPlayIntent(_autoPlay.value);
+    if (_autoPlay.value ||
+        (plPlayerController.preInitPlayer && !plPlayerController.processing) &&
+            (isFileSource
+                ? true
+                : videoPlayerKey.currentState?.mounted == true)) {
+      plPlayerController.noteQueryStage('装载播放器');
+      return playerInit(
+        autoFullScreenFlag: autoFullScreenFlag && _autoPlay.value,
+      );
+    }
+    // 静默返回：这一集连播放器都不会被叫到。现场看上去和「地址取到了但不播」一模一样
+    // ——画面不动、mpv 一句错都不报——所以必须留下一条读数。真机上的成因是「自动播放」
+    // 被上一次失败的取流关掉了，而它同时还是装源的闸门（见上面判断的第一项）。
+    plPlayerController
+      ..noteLoadSkipped(cid.value, '自动播放已关且预加载条件不满足')
+      ..noteQueryStage('未装源：自动播放已关');
+    return null;
+  }
+
+  Future<void> playerInit({
+    bool? autoplay,
+    bool autoFullScreenFlag = false,
+  }) async {
+    Duration? seek = defaultST ?? playedTime;
+    if (seek == .zero) seek = null;
+    seek ??= getFirstSegment();
+    await plPlayerController.setDataSource(
+      isFileSource
+          ? FileSource(
+              dir: args['dirPath'],
+              typeTag: entry.typeTag!,
+              isMp4: entry.mediaType == 1,
+              hasDashAudio: entry.hasDashAudio,
+            )
+          : NetworkSource(
+              videoSource: videoUrl!,
+              audioSource: audioUrl,
+            ),
+      seekTo: seek,
+      duration: data.timeLength == null
+          ? null
+          : Duration(milliseconds: data.timeLength!),
+      isVertical: isVertical.value,
+      aid: aid,
+      bvid: bvid,
+      cid: cid.value,
+      autoplay: autoplay ?? _autoPlay.value,
+      epid: isUgc ? null : epId,
+      seasonId: isUgc ? null : seasonId,
+      pgcType: isUgc ? null : pgcType,
+      videoType: videoType,
+      onInit: () {
+        videoState.value = true;
+        setSubtitle(vttSubtitlesIndex.value);
+      },
+      width: firstVideo.width,
+      height: firstVideo.height,
+      volume: volume,
+      autoFullScreenFlag: autoFullScreenFlag,
+    );
+
+    if (isClosed) return;
+
+    if (plPlayerController.enableBlock) {
+      initSkip();
+    }
+
+    if (!isFileSource) {
+      if (vttSubtitlesIndex.value == -1) {
+        _queryPlayInfo();
+      }
+
+      if (plPlayerController.showDmChart && dmTrend.value == null) {
+        _getDmTrend();
+      }
+    }
+
+    defaultST = null;
+  }
+
+  bool isQuerying = false;
+
+  /// 取流进行中被丢下的那一次请求（只留一次，当前请求一结束就补发）。
+  ///
+  /// 原先 [queryVideoUrl] 遇到 [isQuerying] 直接返回，把请求丢掉。对「切画质」
+  /// 这类可以再点的操作，丢掉无所谓；但「播完自动换集」这一次取流只有一次机会，
+  /// 引擎不会再发起，界面上也不会显示「加载中」——一旦落空，播放就永久停在上一集
+  /// 结尾（黑屏、无声、无提示，只能退出重进）。所以这里改为排队，最多留一次。
+  bool _pendingQuery = false;
+
+  /// 排队的那次请求是否带 fromReset（补发时原样带上）。
+  bool _pendingQueryFromReset = false;
+
+  /// 排队的那次请求是否带 resumePlay（补发时原样带上）。
+  bool _pendingQueryResumePlay = false;
+
+  /// 「这一轮取流要把播放意图恢复回来」。
+  ///
+  /// 只要有任何一处这么要求过（补偿重取、换集看门狗、解析恢复），就置为 true，本轮
+  /// 结束时消费掉。**不能只看参数**：一次取流可能要在网络阶梯上熬上几分钟，而这几分钟
+  /// 里来的补偿请求只能排队等它结束——真机的现场就是「地址终于取回来了、也装进了播放器，
+  /// 可自动播放早被上一次失败关掉了」，排队那一轮的 `resumePlay` 要等本轮彻底结束才生效，
+  /// 白白再走一遍接口、再等一轮阶梯。让正在跑的这一轮也认这个意图，第一份地址到手时就能
+  /// 把播放恢复回来。
+  bool _resumePlayIntent = false;
+
+  /// 「自动播放」是不是**被一次失败的取流**关掉的（而不是用户自己关的）。
+  ///
+  /// 这个区别很要紧：`_autoPlay` 既是「装源之后要不要自己播」的意图，又是**装源的闸门**
+  /// （见 `initPlayerIfNeeded` 的第一个条件）。用户把设置里的「自动播放」关掉时它是
+  /// false——那是**用户的意图**，补偿重取不该擅自替他打开；只有「本来在播、被一次失败
+  /// 关掉」这一种，才是补偿重取该恢复回来的。
+  bool _autoPlayKilledByFailure = false;
+
+  /// 取流链连续抛了几次异常（干净跑完一次就归零）。
+  int _queryThrowStreak = 0;
+
+  /// 上一次取流是不是失败了（成功取到就复位）。用于回到前台时判断要不要静默重取。
+  bool _playUrlFailed = false;
+
+  /// 回到前台时，如果上一次取流失败过就静默重取一次。
+  ///
+  /// 画中画会把 App 连着在后台留好几分钟，而这段时间里设备的域名解析可能整段不可用
+  /// （连播正好在此时换集，取流就失败了，播放随之停住，且不会自行恢复——真机上用户只能
+  /// 退出重进）。回到前台说明人还在，再取一次比让他自己去找重试入口要好。只在前一次
+  /// 确实失败时才动，所以不会干扰正常播放。
+  void retryPlayUrlIfFailed() {
+    if (!_playUrlFailed || isFileSource || isQuerying) return;
+    _playUrlFailed = false;
+    // 上一次是**失败**收场，那次失败已经把自动播放关掉了，所以这一次必须带 resumePlay。
+    queryVideoUrl(resumePlay: true);
+  }
+
+  /// 控制器是否已关闭。
+  ///
+  /// 解析恢复的订阅列表是全局的，注销不保证及时（`onClose` 与订阅回调可能交错），
+  /// 回调落到已关闭的控制器上会去写已经 `close()` 掉的 Rx，所以留一道闸。
+  bool _disposed = false;
+
+  /// 解析恢复后的补发入口（订阅 `Init` 的恢复信号）。
+  ///
+  /// 取流落空时阶梯最多替我们等约 4 分钟；一旦阶梯走完、界面已经回到「没在播」的状态，
+  /// 就没有人再补这一次请求了——真机上这就是「卡住不动、必须退出重进」。这里让解析一
+  /// 恢复就补一次，用户不必做任何动作。
+  ///
+  /// 两种现场都收：① 取流这一次落空（`_playUrlFailed`）；② 取流其实成功了、栽在拉流上
+  /// ——mpv 自己的域名解析同样走系统 DNS，解析一断照样 `Failed to open`。
+  ///
+  /// 第三种现场也一并收下：**取流的那次请求还挂在阶梯上、播放器里又什么都没装上**
+  /// （时长仍是 0），此时上面两个判据都不成立，而它同样会表现为「停着不动」。判据用
+  /// 「时长仍是 0 且没在播放」而不是「没在播放」——**用户自己按了暂停**的视频时长
+  /// 大于 0，不会被这里误伤。
+  void _onDnsRecovered() {
+    if (_disposed || isFileSource) return;
+    final player = plPlayerController;
+    if (isQuerying) {
+      // 取流还在阶梯上熬着（也可能正卡在某一层，见 `RetryInterceptor` 的解析阶梯）。
+      // 这一轮迟早会给出结论，而它一旦成功就是我们要的结果——所以只把「恢复播放」的
+      // 意图交给它，不再排一次取流：多排一次会让刚装好的地址被重装一遍，画面白跳。
+      _resumePlayIntent = true;
+      player.noteDnsRecover('解析恢复：取流正在进行，已把「恢复播放」交给这一轮');
+      return;
+    }
+    if (_playUrlFailed) {
+      player.noteDnsRecover('解析恢复：自动补了一次取流');
+      retryPlayUrlIfFailed();
+      return;
+    }
+    // 画面正好好走着就什么都不做。mpv 的运行期噪音（例如后台期间某个连接被系统收走后的
+    // `tcp: ffurl_read returned …`，它会自己换一条连接继续读）也会留在 `mediaError` 里，
+    // 而它不是故障——照着它重取，只会把正在播放的视频打断重开。
+    if (player.playerStatus.isPlaying && !player.isBuffering.value) return;
+    final failedPull = player.mediaError.value.isNotEmpty;
+    final nothingLoaded = !failedPull && player.duration.value <= 0;
+    if (!failedPull && !nothingLoaded) return;
+    // 拉流这一头栽了：重新取流，而不是 refreshPlayer——后者只是拿旧地址重开，
+    // 真机上早验证过「点播放也没用」。
+    player.noteDnsRecover(
+      failedPull ? '解析恢复：拉流失败，重新取流一次' : '解析恢复：播放器里空着，重新取流一次',
+    );
+    queryVideoUrl(resumePlay: true);
+  }
+
+  final languages = Rxn<List<LanguageItem>>();
+  final currLang = Rxn<String>();
+  void setLanguage(String language) {
+    if (currLang.value == language) return;
+    if (!isLoginVideo) {
+      SmartDialog.showToast('账号未登录');
+      return;
+    }
+    currLang.value = language;
+    queryVideoUrl(fromReset: true);
+  }
+
+  Future<LoadingState<PlayUrlModel>> _getVideoUrl(int quality) {
+    return VideoHttp.videoUrl(
+      cid: cid.value,
+      bvid: bvid,
+      qn: quality,
+      epid: epId,
+      seasonId: seasonId,
+      tryLook: plPlayerController.tryLook,
+      videoType: _actualVideoType ?? videoType,
+      language: currLang.value,
+      voiceBalance: plPlayerController.enableAudioNormalization,
+    );
+  }
+
+  Future<void> _supplementVideoQualities() async {
+    final quality = data.missingVideoQualityBelowHighest;
+    if (quality == -1) return;
+    final result = await _getVideoUrl(quality);
+    if (result case Success(:final response)) {
+      data.dash!.video!.merge(response.dash?.video);
+    }
+  }
+
+  Volume? volume;
+
+  // 视频链接
+  /// TODO: merge [DownloadHttp.getVideoUrl].
+  Future<void> queryVideoUrl({
+    bool fromReset = false,
+    bool autoFullScreenFlag = false,
+    bool resumePlay = false,
+  }) async {
+    if (isFileSource) {
+      return initPlayerIfNeeded(autoFullScreenFlag);
+    }
+    _resumePlayIntent = _resumePlayIntent || resumePlay;
+    if (isQuerying) {
+      // 这里原来是直接 return，把这个请求丢掉。但「播完换集」这一次取流只有一次
+      // 机会：引擎不会再自己发起，界面也不会显示「加载中」（此时既没在缓冲、也没在
+      // 播放），被丢掉之后现场就是黑屏、没声音、没提示，而且不会自愈。
+      // 改成排队：最多留一次待办，当前这一轮结束后补发；补发时读的是最新的 cid，
+      // 所以换集的那一次不会落空。
+      _pendingQuery = true;
+      _pendingQueryFromReset = _pendingQueryFromReset || fromReset;
+      _pendingQueryResumePlay = _pendingQueryResumePlay || resumePlay;
+      plPlayerController.noteQueryQueued();
+      return;
+    }
+    isQuerying = true;
+    try {
+      await _queryVideoUrl(fromReset, autoFullScreenFlag, resumePlay);
+      _queryThrowStreak = 0;
+    } catch (err) {
+      // 取流链上任何一句抛出都会把它掐断。原先「补发排队请求」那一步跑在保护区之外，
+      // 一抛出就再也走不到：队列里那一次请求被永久丢掉，既没有读数也没有提示，而且
+      // 绝不会自己好。这里把异常收下来记进读数，并且照样走补发。
+      _queryThrowStreak++;
+      plPlayerController.noteQueryThrew(err, _queryThrowStreak);
+      if (kDebugMode) debugPrint('queryVideoUrl err: $err');
+    } finally {
+      isQuerying = false;
+      _resumePlayIntent = false;
+    }
+    if (_pendingQuery) {
+      if (_queryThrowStreak >= 3) {
+        // 连续抛异常时不再自动补发，否则会是「抛出 → 补发 → 再抛」的死循环。
+        // 待办留着不清，等下一次外部触发的、干净跑完的那一轮把它带走。
+        return;
+      }
+      _pendingQuery = false;
+      final pendingFromReset = _pendingQueryFromReset;
+      final pendingResumePlay = _pendingQueryResumePlay;
+      _pendingQueryFromReset = false;
+      _pendingQueryResumePlay = false;
+      plPlayerController.noteQueryReissued();
+      // 让这一轮彻底退栈后再补发，避免同帧递归。
+      scheduleMicrotask(
+        () => queryVideoUrl(
+          fromReset: pendingFromReset,
+          resumePlay: pendingResumePlay,
+        ),
+      );
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  Future<void> _queryVideoUrl(
+    bool fromReset,
+    bool autoFullScreenFlag,
+    bool resumePlay,
+  ) async {
+    _playUrlFailed = false;
+    plPlayerController
+      ..clearLoadNote()
+      ..noteAutoPlayIntent(_autoPlay.value)
+      ..noteQueryStage('请求接口');
+    if (plPlayerController.enableSponsorBlock && isBlock && !fromReset) {
+      querySponsorBlock(bvid: bvid, cid: cid.value);
+    }
+    if (plPlayerController.cacheVideoQa == null) {
+      final isWiFi = await ConnectivityUtils.isWiFi;
+      plPlayerController
+        ..cacheVideoQa = isWiFi
+            ? Pref.defaultVideoQa
+            : Pref.defaultVideoQaCellular
+        ..cacheAudioQa = isWiFi
+            ? Pref.defaultAudioQa
+            : Pref.defaultAudioQaCellular;
+      preferCodecs = isWiFi ? Pref.preferCodecs : Pref.preferCodecsCellular;
+    }
+
+    final result = await _getVideoUrl(VideoQuality.hdrVivid.code);
+
+    if (result case Success(:final response)) {
+      plPlayerController.noteQueryStage('补取画质');
+      data = response;
+      if (_resumePlayIntent && _autoPlayKilledByFailure) {
+        // 上一次取流失败把「要自动播」这件事关掉了（见下面的失败分支）。那是**当时那一轮**
+        // 的事实，却被写成了全局意图，而唯一会把它恢复回来的地方是「切换画质」。于是补偿
+        // 性的重取（换集看门狗、解析恢复、回到前台）即使把地址拿到了，`setDataSource`
+        // 也不会播——收尾里的 `if (_autoPlay) playIfExists()` 不成立，`_createVideoController`
+        // 又是用 `open(play: false)` 装源的；更糟的是它同时还是**装源的闸门**
+        // （`initPlayerIfNeeded`），关着的时候连播放器都不会被叫到。结果是新集既没装上，
+        // 也不报错。真机上这就是「播完第四个，第五个接不上；看门狗说已经重新取流，画面
+        // 还是不动」。这一次是补偿，而且这个意图确实是**上一次失败**关掉的（不是用户
+        // 自己关的），把它恢复回来。
+        _autoPlay.value = true;
+        _autoPlayKilledByFailure = false;
+        plPlayerController.noteAutoResume();
+      }
+      plPlayerController.noteAutoPlayIntent(_autoPlay.value);
+      if (data.dash != null) await _supplementVideoQualities();
+
+      languages.value = data.language?.items;
+      currLang.value = data.curLanguage;
+
+      volume = data.volume;
+
+      if (!fromReset) {
+        final progress = args.remove('progress');
+        if (progress != null) {
+          defaultST = Duration(milliseconds: progress);
+        } else {
+          defaultST = Duration(milliseconds: data.lastPlayTime);
+        }
+      }
+
+      if (!isUgc && !fromReset && plPlayerController.enablePgcSkip) {
+        if (data.clipInfoList case final clipInfoList?) {
+          resetBlock();
+          handleSBData(clipInfoList);
+        }
+      }
+
+      if (data.acceptDesc?.contains('试看') == true) {
+        SmartDialog.showToast(
+          '该视频为专属视频，仅提供试看',
+          displayTime: const Duration(seconds: 3),
+        );
+      }
+      if (data.dash == null) {
+        if (data.durl case final durl?) {
+          // it will cause all files to be opened simultaneously
+          if (durl.length > 1) {
+            // TODO: refa
+            final sb = StringBuffer('edl://!no_chapters;');
+            for (var i in durl) {
+              final video = VideoUtils.getCdnUrl(i.playUrls);
+              sb.write('%${video.length}%$video,length=${i.length! / 1000};');
+            }
+            videoUrl = sb.toString();
+          } else {
+            videoUrl = VideoUtils.getCdnUrl(durl.single.playUrls);
+          }
+
+          audioUrl = '';
+
+          // 实际为FLV/MP4格式，但已被淘汰，这里仅做兜底处理
+          final videoQuality = VideoQuality.fromCode(data.quality!);
+          firstVideo = VideoItem(
+            id: data.quality!,
+            baseUrl: videoUrl,
+            codecs: 'avc1',
+            quality: videoQuality,
+          );
+          _setVideoHeight();
+          currentDecodeFormats = VideoDecodeFormatType.AVC;
+          currentVideoQa.value = videoQuality;
+          await initPlayerIfNeeded(autoFullScreenFlag);
+          plPlayerController.finishQueryStage();
+          return;
+        } else {
+          SmartDialog.showToast('视频资源不存在');
+          _autoPlay.value = false;
+          _autoPlayKilledByFailure = true;
+          videoState.value = false;
+          if (plPlayerController.isFullScreen.value) {
+            plPlayerController.triggerFullScreen(status: false);
+          }
+          return;
+        }
+      }
+
+      // if (kDebugMode) debugPrint("allVideosList:${allVideosList}");
+      final cacheVideoQa = plPlayerController.cacheVideoQa!;
+      final targetVideoQa = data.findAvailableVideoQuality(cacheVideoQa);
+      currentVideoQa.value = VideoQuality.fromCode(targetVideoQa);
+
+      /// 优先顺序 设置中指定解码格式 -> 当前可选的首个解码格式
+      final supportFormats = data.supportFormats!;
+
+      // 根据画质选编码格式
+      currentDecodeFormats = VideoUtils.selectCodec(
+        supportFormats
+            .firstWhere(
+              (e) => e.quality == targetVideoQa,
+              orElse: () => supportFormats.first,
+            )
+            .codecs!,
+        preferCodecs,
+      );
+
+      /// 取出符合当前画质的videoList
+      final videosList = data.dash!.video!
+          .where((e) => e.quality.code == targetVideoQa)
+          .toList();
+
+      /// 取出符合当前解码格式的videoItem
+      firstVideo = videosList.firstWhere(
+        (e) => currentDecodeFormats.codes.any(e.codecs!.startsWith),
+        orElse: () => videosList.first,
+      );
+      _setVideoHeight();
+
+      videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
+
+      /// 优先顺序 设置中指定质量 -> 当前可选的最高质量
+      AudioItem? firstAudio;
+      final audioList = data.dash?.audio;
+      if (audioList != null && audioList.isNotEmpty) {
+        final audioIds = audioList.map((map) => map.id).toList();
+        int closestNumber = audioIds.findClosestTarget(
+          (e) => e <= plPlayerController.cacheAudioQa,
+          (a, b) => a > b ? a : b,
+        );
+        if (!audioIds.contains(plPlayerController.cacheAudioQa) &&
+            audioIds.any((e) => e > plPlayerController.cacheAudioQa)) {
+          closestNumber = AudioQuality.k192.code;
+        }
+        firstAudio = audioList.firstWhere(
+          (e) => e.id == closestNumber,
+          orElse: () => audioList.first,
+        );
+        audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
+        currentAudioQa = AudioQuality.fromCode(firstAudio.id);
+      } else {
+        audioUrl = '';
+      }
+      await initPlayerIfNeeded(autoFullScreenFlag);
+      plPlayerController.finishQueryStage();
+    } else {
+      // 这一轮确实没得播，所以关掉自动播放。要留意它是**全局意图**而不是「本轮结果」——
+      // 任何补偿重取都必须带 `resumePlay: true` 才能把它恢复（见上面成功分支）。
+      _playUrlFailed = true;
+      _autoPlay.value = false;
+      _autoPlayKilledByFailure = true;
+      // 失败分支是**静默**的：只有一句 toast，几秒后连它也没了。把「接口这一轮没给出
+      // 可用地址」写进阶段读数，事后再看就知道卡在哪一步、卡了多久。
+      // 原文一并收下——「接口未返回可用地址」这个标题分不出域名解析失败、连接超时
+      // 和 B 站风控（code != 0），而这三者的下一步完全不同。[LoadingState.toString]
+      // 对失败态就是那句 errMsg，与 toast 显示的一致，照抄即可。
+      plPlayerController
+        ..noteQueryStage('接口未返回可用地址')
+        ..noteQueryErr(result.toString())
+        ..noteAutoPlayIntent(false);
+      videoState.value = false;
+      if (plPlayerController.isFullScreen.value) {
+        plPlayerController.triggerFullScreen(status: false);
+      }
+      result.toast();
+    }
+  }
+
+  late final List<PostSegmentModel> postList = <PostSegmentModel>[];
+  void onBlock(BuildContext context) {
+    if (postList.isEmpty) {
+      postList.add(
+        PostSegmentModel(
+          segment: Pair(
+            first: 0,
+            second: plPlayerController.positionInMilliseconds / 1000,
+          ),
+          category: SegmentType.sponsor,
+          actionType: ActionType.skip,
+        ),
+      );
+    }
+    if (plPlayerController.isFullScreen.value || showVideoSheet) {
+      final child = PostPanel(
+        enableSlide: false,
+        videoDetailController: this,
+        plPlayerController: plPlayerController,
+      );
+      PageUtils.showVideoBottomSheet(
+        context,
+        child: plPlayerController.darkVideoPage
+            ? Theme(data: ThemeUtils.darkTheme, child: child)
+            : child,
+      );
+    } else {
+      childKey.currentState?.showBottomSheet(
+        constraints: const BoxConstraints(),
+        (context) => PostPanel(
+          videoDetailController: this,
+          plPlayerController: plPlayerController,
+        ),
+      );
+    }
+  }
+
+  RxList<Subtitle> subtitles = RxList<Subtitle>();
+  final Map<int, ({bool isData, String id})> vttSubtitles = {};
+  late final vttSubtitlesIndex = (-1).obs;
+  late final showVP = true.obs;
+  late final viewPointList = <ViewPointSegment>[].obs;
+
+  // 设定字幕轨道
+  Future<void> setSubtitle(int index) async {
+    if (index <= 0) {
+      await plPlayerController.videoPlayerController?.setSubtitleTrack(.no());
+      vttSubtitlesIndex.value = index;
+      return;
+    }
+
+    Future<void> setSub(({bool isData, String id}) subtitle) async {
+      final sub = subtitles[index - 1];
+
+      String subUri = subtitle.id;
+      if (subtitle.isData) {
+        subUri = 'memory://$subUri';
+      }
+      await plPlayerController.videoPlayerController?.setSubtitleTrack(
+        SubtitleTrack(subUri, sub.lanDoc, sub.lan, uri: true),
+      );
+      vttSubtitlesIndex.value = index;
+    }
+
+    var subtitle = vttSubtitles[index - 1];
+    if (subtitle == null) {
+      final result = await VideoHttp.getSubtitles(
+        subtitles[index - 1].subtitleUrl!,
+      );
+      if (!isClosed && result != null) {
+        subtitle = (isData: true, id: result);
+        vttSubtitles[index - 1] = subtitle;
+      } else {
+        return;
+      }
+    }
+    await setSub(subtitle);
+  }
+
+  // interactive video
+  int? graphVersion;
+  EdgeInfoData? steinEdgeInfo;
+  late final RxBool showSteinEdgeInfo = false.obs;
+
+  Future<void> getSteinEdgeInfo([int? edgeId]) async {
+    steinEdgeInfo = null;
+    try {
+      final res = await Request().get(
+        '/x/stein/edgeinfo_v2',
+        queryParameters: {
+          'bvid': bvid,
+          'graph_version': graphVersion,
+          'edge_id': ?edgeId,
+        },
+      );
+      if (res.data['code'] == 0) {
+        steinEdgeInfo = EdgeInfoData.fromJson(res.data['data']);
+      } else {
+        if (kDebugMode) {
+          debugPrint('getSteinEdgeInfo error: ${res.data['message']}');
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('getSteinEdgeInfo: $e');
+    }
+  }
+
+  late bool continuePlayingPart = Pref.continuePlayingPart;
+
+  Future<void> _queryPlayInfo() async {
+    vttSubtitles.clear();
+    vttSubtitlesIndex.value = 0;
+    if (plPlayerController.showViewPoints) {
+      viewPointList.clear();
+    }
+    final res = await VideoHttp.playInfo(
+      bvid: bvid,
+      cid: cid.value,
+      seasonId: seasonId,
+      epId: epId,
+    );
+    if (res case Success(:final response)) {
+      // interactive video
+      if (isUgc && graphVersion == null) {
+        try {
+          if (ugcIntroCtr.videoDetail.value.rights?.isSteinGate == 1) {
+            graphVersion = response.interaction?.graphVersion;
+            getSteinEdgeInfo();
+          }
+        } catch (e) {
+          if (kDebugMode) debugPrint('handle stein: $e');
+        }
+      }
+
+      if (isUgc && continuePlayingPart) {
+        continuePlayingPart = false;
+        final lastCid = response.lastPlayCid;
+        if (lastCid != null && lastCid != 0 && lastCid != cid.value) {
+          try {
+            final pages = ugcIntroCtr.videoDetail.value.pages;
+            if (pages != null && pages.length > 1) {
+              final index = pages.indexWhere((item) => item.cid == lastCid);
+              if (index != -1) {
+                onAddItem(index);
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (plPlayerController.showViewPoints &&
+          response.viewPoints?.firstOrNull?.type == 2) {
+        try {
+          viewPointList.value = response.viewPoints!.map((item) {
+            final end = (item.to! / (data.timeLength! / 1000)).clamp(0.0, 1.0);
+            return ViewPointSegment(
+              end: end,
+              title: item.content,
+              url: item.imgUrl,
+              from: item.from,
+              to: item.to,
+            );
+          }).toList();
+        } catch (_) {}
+      }
+
+      if (response.subtitle?.subtitles case final sub? when (sub.isNotEmpty)) {
+        _setSubtitle(sub);
+      } else if (!Accounts.main.isLogin) {
+        final res = await DmGrpc.dmView(aid, cid.value);
+        if (res case Success(:final response)) {
+          if (response.hasSubtitle() &&
+              response.subtitle.subtitles.isNotEmpty) {
+            _setSubtitle(
+              response.subtitle.subtitles
+                  .map(
+                    (i) => Subtitle(
+                      lan: i.lan,
+                      lanDoc: i.lanDoc,
+                      subtitleUrl: i.subtitleUrl.replaceFirst(
+                        RegExp('^https?:'),
+                        '',
+                      ),
+                      isAi: i.type == .AI,
+                    ),
+                  )
+                  .toList()
+                ..sort(),
+            );
+          }
+        } else {
+          res.toast();
+        }
+      }
+    }
+  }
+
+  Future<void> _setSubtitle(List<Subtitle> sub) async {
+    subtitles.value = sub;
+    final idx = switch (Pref.subtitlePreferenceV2) {
+      .off => 0,
+      .on => 1,
+      .withoutAi => sub.first.lan.startsWith('ai') ? 0 : 1,
+      .auto =>
+        !sub.first.lan.startsWith('ai') ||
+                (PlatformUtils.isMobile &&
+                    (await FlutterVolumeController.getVolume() ?? 0.0) <= 0.0)
+            ? 1
+            : 0,
+    };
+    await setSubtitle(idx);
+  }
+
+  void updateMediaListHistory(int aid) {
+    if (args['sortField'] != null) {
+      VideoHttp.medialistHistory(
+        desc: _mediaDesc ? 1 : 0,
+        oid: aid,
+        upperMid: args['mediaId'],
+      );
+    }
+  }
+
+  void makeHeartBeat() {
+    if (plPlayerController.enableHeart &&
+        !plPlayerController.playerStatus.isCompleted &&
+        playedTime != null) {
+      try {
+        plPlayerController.makeHeartBeat(
+          data.timeLength != null
+              ? (data.timeLength! - playedTime!.inMilliseconds).abs() <= 1000
+                    ? -1
+                    : playedTime!.inSeconds
+              : playedTime!.inSeconds,
+          type: HeartBeatType.completed,
+          isManual: true,
+          aid: aid,
+          bvid: bvid,
+          cid: cid.value,
+          epid: isUgc ? null : epId,
+          seasonId: isUgc ? null : seasonId,
+          pgcType: isUgc ? null : pgcType,
+          videoType: videoType,
+        );
+      } catch (_) {}
+    }
+  }
+
+  @override
+  void onClose() {
+    _disposed = true;
+    Request.removeDnsRecoveredListener(_onDnsRecovered);
+    cid.close();
+    if (isFileSource) {
+      cacheLocalProgress();
+    }
+    introScrollCtr?.dispose();
+    introScrollCtr = null;
+    tabCtr.dispose();
+    _scrollCtr?.dispose();
+    animController
+      ?..removeListener(_animListener)
+      ..dispose();
+    subtitles.clear();
+    vttSubtitles.clear();
+    super.onClose();
+  }
+
+  void onReset({bool isStein = false}) {
+    if (isFileSource) {
+      cacheLocalProgress();
+    }
+
+    playedTime = null;
+    defaultST = null;
+    videoUrl = null;
+    audioUrl = null;
+
+    // danmaku
+    savedDanmaku = null;
+
+    // subtitle
+    subtitles.clear();
+    vttSubtitlesIndex.value = -1;
+    vttSubtitles.clear();
+
+    // sponsor block
+    if (blockConfig.enableBlock) {
+      resetBlock();
+    }
+
+    if (!isFileSource) {
+      // language
+      languages.value = null;
+      currLang.value = null;
+
+      // dm trend
+      if (plPlayerController.showDmChart) {
+        dmTrend.value = null;
+      }
+
+      // view point
+      if (plPlayerController.showViewPoints) {
+        viewPointList.clear();
+      }
+
+      // interactive video
+      if (!isStein) {
+        graphVersion = null;
+      }
+      steinEdgeInfo = null;
+      showSteinEdgeInfo.value = false;
+    }
+  }
+
+  late final Rx<LoadingState<List<double>>?> dmTrend =
+      Rx<LoadingState<List<double>>?>(null);
+  late final RxBool showDmTrendChart = true.obs;
+
+  Future<void> _getDmTrend() async {
+    dmTrend.value = LoadingState<List<double>>.loading();
+    try {
+      final res = await Request().get(
+        'https://bvc.bilivideo.com/pbp/data',
+        queryParameters: {
+          'aid': aid,
+          'bvid': bvid,
+          'cid': cid.value,
+          'r': 'loader',
+        },
+        options: Options(
+          headers: {
+            'user-agent': BrowserUa.pc,
+            'origin': 'https://www.bilibili.com',
+            'referer': 'https://www.bilibili.com/video/$bvid',
+          },
+        ),
+      );
+      dynamic json;
+      try {
+        json = (res.data['modules'] as List).first['params']['data'];
+      } catch (_) {
+        json = res.data;
+      }
+      final data = PbpData.fromJson(json);
+      final stepSec = data.stepSec ?? 0;
+      if (stepSec != 0 && data.events?.eDefault?.isNotEmpty == true) {
+        dmTrend.value = Success(data.events!.eDefault!);
+        return;
+      }
+      dmTrend.value = const Error(null);
+    } catch (e) {
+      dmTrend.value = const Error(null);
+      if (kDebugMode) debugPrint('_getDmTrend: $e');
+    }
+  }
+
+  void showNoteList(BuildContext context) {
+    String? title;
+    try {
+      title = ugcIntroCtr.videoDetail.value.title;
+    } catch (_) {}
+    if (plPlayerController.isFullScreen.value || showVideoSheet) {
+      final child = NoteListPage(
+        oid: aid,
+        enableSlide: false,
+        heroTag: heroTag,
+        isStein: graphVersion != null,
+        title: title,
+      );
+      PageUtils.showVideoBottomSheet(
+        context,
+        child: plPlayerController.darkVideoPage
+            ? Theme(data: ThemeUtils.darkTheme, child: child)
+            : child,
+      );
+    } else {
+      childKey.currentState?.showBottomSheet(
+        constraints: const BoxConstraints(),
+        (context) => NoteListPage(
+          oid: aid,
+          heroTag: heroTag,
+          isStein: graphVersion != null,
+          title: title,
+        ),
+      );
+    }
+  }
+
+  @pragma('vm:notify-debugger-on-exception')
+  bool onSkipSegment() {
+    try {
+      if (plPlayerController.enableBlock) {
+        if (listData.lastOrNull case final SegmentModel item) {
+          onSkip(item, isSeek: false);
+          onRemoveItem(listData.indexOf(item), item);
+          return true;
+        }
+      }
+    } catch (e, s) {
+      Utils.reportError(e, s);
+    }
+    return false;
+  }
+
+  void toAudioPage() {
+    int? id;
+    int? extraId;
+    PlaylistSource from = PlaylistSource.UP_ARCHIVE;
+    if (isPlayAll) {
+      id = args['mediaId'];
+      extraId = sourceType.extraId;
+      from = sourceType.playlistSource!;
+    } else if (isUgc) {
+      try {
+        id = ugcIntroCtr.videoDetail.value.ugcSeason?.id;
+        if (id != null) {
+          extraId = 8;
+          from = PlaylistSource.MEDIA_LIST;
+        }
+      } catch (_) {}
+    }
+    AudioPage.toAudioPage(
+      itemType: 1,
+      id: id,
+      oid: aid,
+      subId: [cid.value],
+      from: from,
+      heroTag: _autoPlay.value ? heroTag : null,
+      start: playedTime,
+      audioUrl: audioUrl,
+      extraId: extraId,
+    );
+  }
+
+  Future<void> onDownload(BuildContext context) async {
+    VideoDetailData? videoDetail;
+    List<ugc.BaseEpisodeItem>? episodes;
+    PgcInfoModel? pgcItem;
+    if (isUgc) {
+      try {
+        videoDetail = ugcIntroCtr.videoDetail.value;
+        if (videoDetail.ugcSeason?.sections case final sections?) {
+          episodes = <ugc.BaseEpisodeItem>[];
+          for (final i in sections) {
+            if (i.episodes case final e?) {
+              episodes.addAll(e);
+            }
+          }
+        } else {
+          episodes = videoDetail.pages;
+        }
+      } catch (e, s) {
+        if (kDebugMode) {
+          debugPrint('download ugc: $e\n\n$s');
+        }
+      }
+    } else {
+      try {
+        pgcItem = pgcIntroCtr.pgcItem;
+        episodes = pgcItem.episodes;
+      } catch (e, s) {
+        if (kDebugMode) {
+          debugPrint('download pgc: $e\n\n$s');
+        }
+      }
+    }
+    if (episodes != null && episodes.isNotEmpty) {
+      final downloadService = Get.find<DownloadService>();
+      await downloadService.waitForInitialization;
+      if (!context.mounted) {
+        return;
+      }
+      final Set<int> cidSet = downloadService.downloadList
+          .followedBy(downloadService.waitDownloadQueue)
+          .map((e) => e.cid)
+          .toSet();
+      final index = episodes.indexWhere(
+        (e) => e.cid == (seasonCid ?? cid.value),
+      );
+
+      showModalBottomSheet(
+        context: context,
+        useSafeArea: true,
+        isScrollControlled: true,
+        constraints: BoxConstraints(
+          maxWidth: min(640, context.mediaQueryShortestSide),
+        ),
+        builder: (context) {
+          final maxChildSize =
+              PlatformUtils.isMobile && !context.mediaQuerySize.isPortrait
+              ? 1.0
+              : 0.7;
+          return DraggableScrollableSheet(
+            snap: true,
+            expand: false,
+            minChildSize: 0,
+            snapSizes: [maxChildSize],
+            maxChildSize: maxChildSize,
+            initialChildSize: maxChildSize,
+            builder: (context, scrollController) => DownloadPanel(
+              index: index,
+              videoDetail: videoDetail,
+              pgcItem: pgcItem,
+              episodes: episodes!,
+              scrollController: scrollController,
+              videoDetailController: this,
+              heroTag: heroTag,
+              ugcIntroController: isUgc ? ugcIntroCtr : null,
+              cidSet: cidSet,
+            ),
+          );
+        },
+      );
+    }
+  }
+
+  void editPlayUrl() {
+    String videoUrl = this.videoUrl ?? '';
+    String audioUrl = this.audioUrl ?? '';
+    Widget textField({
+      required String label,
+      required String initialValue,
+      required ValueChanged<String> onChanged,
+    }) => TextFormField(
+      minLines: 1,
+      maxLines: 3,
+      onChanged: onChanged,
+      initialValue: initialValue,
+      decoration: InputDecoration(
+        label: Text(label),
+        border: const OutlineInputBorder(),
+      ),
+    );
+    showDialog(
+      context: Get.context!,
+      builder: (context) => AlertDialog(
+        constraints: Style.dialogFixedConstraints,
+        title: const Text('播放地址'),
+        content: Column(
+          spacing: 20,
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            textField(
+              label: 'Video Url',
+              initialValue: videoUrl,
+              onChanged: (value) => videoUrl = value,
+            ),
+            textField(
+              label: 'Audio Url',
+              initialValue: audioUrl,
+              onChanged: (value) => audioUrl = value,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Get.back();
+              this.videoUrl = videoUrl;
+              this.audioUrl = audioUrl;
+              playerInit();
+            },
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @pragma('vm:notify-debugger-on-exception')
+  Future<void> onCast() async {
+    SmartDialog.showLoading();
+    final res = await VideoHttp.tvPlayUrl(
+      cid: cid.value,
+      objectId: epId ?? aid,
+      playurlType: epId != null ? 2 : 1,
+      qn: currentVideoQa.value?.code,
+    );
+    SmartDialog.dismiss();
+    if (res case Success(:final response)) {
+      final first = response.durl?.firstOrNull;
+      if (first == null || first.playUrls.isEmpty) {
+        SmartDialog.showToast('不支持投屏');
+        return;
+      }
+      final url = VideoUtils.getCdnUrl(first.playUrls);
+
+      String? title;
+      try {
+        if (isUgc) {
+          title = Get.find<UgcIntroController>(
+            tag: heroTag,
+          ).videoDetail.value.title;
+        } else {
+          title = Get.find<PgcIntroController>(
+            tag: heroTag,
+          ).videoDetail.value.title;
+        }
+      } catch (_) {}
+      if (kDebugMode) {
+        debugPrint(title);
+      }
+      Get.toNamed(
+        '/dlna',
+        parameters: {
+          'url': url,
+          'title': ?title,
+        },
+      );
+    } else {
+      res.toast();
+    }
+  }
+}
