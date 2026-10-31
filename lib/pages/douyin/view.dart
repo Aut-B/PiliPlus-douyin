@@ -1,211 +1,117 @@
-import 'dart:async';
-import 'dart:collection';
-import 'dart:convert';
-
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
-import 'package:PiliPlus/utils/storage.dart';
-import 'package:material_ui/material_ui.dart';
-import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:PiliPlus/pages/douyin/repo.dart';
+import 'package:PiliPlus/pages/douyin/web.dart';
+import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
+import 'package:material_ui/material_ui.dart';
 
-const _storageKey = 'douyinFavorites';
-
-const _desktopUserAgent =
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-    'AppleWebKit/537.36 (KHTML, like Gecko) '
-    'Chrome/131.0.0.0 Safari/537.36';
-
-/// Douyin favourites, scraped from the signed-in web page.
+/// 抖音 / TikTok 收藏列表。
 ///
-/// Douyin's web API needs `a_bogus` + UIFID, so a plain HTTP client is refused
-/// (`Blocked by ArgusSecurityPlugin`). Running the real page lets Douyin sign
-/// its own requests; we only read the JSON it gets back, which already
-/// contains playable URLs.
-class DouyinFavoritesPage extends StatefulWidget {
-  const DouyinFavoritesPage({super.key});
+/// 抓取本身在 [ShortVideoWebPage] 里做（网页登录 + 旁观接口返回），这里只负责
+/// 展示、播放和 WebDAV 同步。
+class ShortVideoFavoritesPage extends StatefulWidget {
+  const ShortVideoFavoritesPage({super.key, required this.platform});
+
+  final ShortVideoPlatform platform;
 
   @override
-  State<DouyinFavoritesPage> createState() => _DouyinFavoritesPageState();
+  State<ShortVideoFavoritesPage> createState() => _ShortVideoFavoritesPageState();
 }
 
-class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
-  InAppWebViewController? _web;
-  final List<DouyinVideo> _videos = [];
-
-  bool _showWeb = true;
-  bool _collecting = false;
+class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
+  final List<ShortVideo> _videos = [];
+  bool _syncing = false;
   String _status = '';
-  Timer? _timer;
-  int _idle = 0;
-  int _lastCount = 0;
-  DateTime? _startedAt;
+
+  ShortVideoPlatform get platform => widget.platform;
 
   @override
   void initState() {
     super.initState();
-    _load();
-    _showWeb = _videos.isEmpty;
+    _reload();
     _status = _videos.isEmpty
-        ? '在网页里登录抖音，然后点「开始抓取」'
-        : '已加载上次抓取的 ${_videos.length} 条';
+        ? '还没有抓取到收藏，点下面「打开网页」登录后抓取'
+        : '本地 ${_videos.length} 条';
+    WidgetsBinding.instance.addPostFrameCallback((_) => _autoSync());
   }
 
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  // MARK: - Storage
-
-  void _load() {
-    try {
-      final raw = GStorage.localCache.get(_storageKey, defaultValue: '');
-      if (raw is! String || raw.isEmpty) return;
-      final list = jsonDecode(raw);
-      if (list is! List) return;
+  void _reload() {
+    final stored = ShortVideoRepo.load(platform);
+    setState(() {
       _videos
         ..clear()
-        ..addAll(
-          list.whereType<Map>().map(
-            (e) => DouyinVideo.fromJson(e.cast<String, dynamic>()),
-          ),
-        );
-    } catch (_) {}
-  }
-
-  void _save() {
-    try {
-      GStorage.localCache.put(
-        _storageKey,
-        jsonEncode(_videos.map((e) => e.toJson()).toList()),
-      );
-    } catch (_) {}
-  }
-
-  // MARK: - Collecting
-
-  void _start() {
-    if (_collecting) return;
-    setState(() {
-      _collecting = true;
-      _idle = 0;
-      _lastCount = _videos.length;
-      _startedAt = DateTime.now();
-      _status = '正在抓取…如果一直没动静，请先在网页里登录抖音';
+        ..addAll(stored);
     });
-    _web?.evaluateJavascript(source: _driverJs);
-    _timer?.cancel();
-    _timer = Timer.periodic(
-      const Duration(milliseconds: 1500),
-      (_) => _tick(),
-    );
   }
 
-  void _stop([String? message]) {
-    _timer?.cancel();
-    _timer = null;
-    _web?.evaluateJavascript(
-      source:
-          'try{clearInterval(window.__kumoneDriver);'
-          'window.__kumoneDriver=null;}catch(e){}',
-    );
-    if (!mounted) return;
-    setState(() {
-      _collecting = false;
-      _status = message ?? '已抓取 ${_videos.length} 条';
-    });
-    _save();
+  Future<void> _autoSync() async {
+    if (!ShortVideoSync.configured) return;
+    await _sync(silent: true);
   }
 
-  void _tick() {
-    if (!_collecting) return;
-    _web?.evaluateJavascript(
-      source: 'window.scrollTo(0, document.body.scrollHeight);',
-    );
-    final startedAt = _startedAt;
-    if (startedAt != null &&
-        DateTime.now().difference(startedAt) > const Duration(minutes: 5)) {
-      _stop('抓取超时，已保留 ${_videos.length} 条');
+  Future<void> _sync({bool silent = false}) async {
+    if (_syncing) return;
+    if (!ShortVideoSync.configured) {
+      SmartDialog.showToast('还没配置 WebDAV：设置 → WebDAV 设置');
       return;
     }
-    if (_videos.length == _lastCount) {
-      _idle++;
-    } else {
-      _idle = 0;
-      _lastCount = _videos.length;
-    }
-    if (_idle >= 10) {
-      _stop('抓取完成，共 ${_videos.length} 条');
+    setState(() => _syncing = true);
+    try {
+      final count = await ShortVideoSync.synchronize();
+      _reload();
+      if (!mounted) return;
+      setState(() => _status = '已同步，共 $count 条');
+      if (!silent) SmartDialog.showToast('同步完成，共 $count 条');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = '同步失败：$e');
+      if (!silent) SmartDialog.showToast('同步失败: $e');
+    } finally {
+      if (mounted) setState(() => _syncing = false);
     }
   }
 
-  void _onPayload(List<dynamic> args) {
-    if (args.isEmpty) return;
-    final body = args.last.toString();
-    final parsed = DouyinParser.fromResponseBody(body);
-    if (parsed.isEmpty) return;
-
-    final indexById = <String, int>{
-      for (var i = 0; i < _videos.length; i++) _videos[i].id: i,
-    };
-    var changed = 0;
-    for (final video in parsed) {
-      final index = indexById[video.id];
-      if (index != null) {
-        // Play URLs are signed and expire; a re-scrape refreshes them instead
-        // of keeping the stale copy.
-        if (_videos[index].playUrl != video.playUrl) {
-          _videos[index] = video;
-          changed++;
-        }
-      } else {
-        _videos.add(video);
-        indexById[video.id] = _videos.length - 1;
-        changed++;
-      }
-    }
-    if (changed == 0) return;
-    setState(() => _status = '已抓取 ${_videos.length} 条…');
-    _save();
+  Future<void> _openWeb() async {
+    await Get.to(() => ShortVideoWebPage(platform: platform));
+    _reload();
+    if (!mounted) return;
+    setState(() => _status = '本地 ${_videos.length} 条');
+    await _sync(silent: true);
   }
-
-  // MARK: - Actions
 
   void _play(int index) {
     if (_videos.isEmpty) return;
-    Get.to(
-      () => DouyinPlayerPage(videos: List.of(_videos), index: index),
-    );
+    Get.to(() => ShortVideoPlayerPage(videos: List.of(_videos), index: index));
   }
 
-  void _playAll() {
-    if (_videos.isEmpty) return;
-    _play(0);
-  }
+  void _playAll() => _play(0);
 
   void _clear() {
     setState(() {
       _videos.clear();
       _status = '已清空，可重新抓取';
     });
-    _save();
+    ShortVideoRepo.save(platform, const []);
   }
-
-  // MARK: - UI
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('抖音收藏'),
+        title: Text(platform.title),
         actions: [
           IconButton(
-            tooltip: '重新加载网页',
-            onPressed: () => _web?.reload(),
-            icon: const Icon(Icons.refresh),
+            tooltip: 'WebDAV 同步',
+            onPressed: _syncing ? null : () => _sync(),
+            icon: _syncing
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.sync),
           ),
           IconButton(
             tooltip: '清空',
@@ -222,57 +128,47 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
       body: Column(
         children: [
           Expanded(
-            child: IndexedStack(
-              index: _showWeb || _videos.isEmpty ? 0 : 1,
-              children: [_buildWebView(), _buildList(theme)],
-            ),
+            child: _videos.isEmpty ? _empty(theme) : _list(theme),
           ),
-          _buildControlBar(theme),
+          _bottomBar(theme),
         ],
       ),
     );
   }
 
-  Widget _buildWebView() {
-    return InAppWebView(
-      initialUrlRequest: URLRequest(
-        url: WebUri('https://www.douyin.com/user/self?showTab=favorite_collection'),
-      ),
-      initialSettings: InAppWebViewSettings(
-        userAgent: _desktopUserAgent,
-        javaScriptEnabled: true,
-        mediaPlaybackRequiresUserGesture: false,
-        thirdPartyCookiesEnabled: true,
-        allowsInlineMediaPlayback: true,
-        useShouldOverrideUrlLoading: true,
-      ),
-      initialUserScripts: UnmodifiableListView<UserScript>([
-        UserScript(
-          source: _hookJs,
-          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-          forMainFrameOnly: false,
+  Widget _empty(ThemeData theme) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.video_library_outlined,
+              size: 44,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '还没有收藏',
+              style: theme.textTheme.titleMedium,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '点下面「打开网页」，在网页里登录 ${platform.album}，'
+              '然后点「开始抓取」，抓完回来自动带过来。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
         ),
-      ]),
-      onWebViewCreated: (controller) {
-        _web = controller;
-        controller.addJavaScriptHandler(
-          handlerName: 'douyin',
-          callback: _onPayload,
-        );
-      },
-      onLoadStop: (controller, url) {
-        if (_collecting) return;
-        if (_status.startsWith('正在打开')) {
-          setState(() => _status = '页面已加载：登录后点「开始抓取」');
-        }
-      },
+      ),
     );
   }
 
-  Widget _buildList(ThemeData theme) {
-    if (_videos.isEmpty) {
-      return const Center(child: Text('还没有抓取到收藏，去网页里登录后重试'));
-    }
+  Widget _list(ThemeData theme) {
     return ListView.builder(
       itemCount: _videos.length,
       itemBuilder: (context, index) {
@@ -301,7 +197,7 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
             overflow: TextOverflow.ellipsis,
           ),
           subtitle: Text(
-            '${video.author.isEmpty ? '抖音' : video.author} · ${video.durationText}',
+            '${video.author.isEmpty ? platform.album : video.author} · ${video.durationText}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),
@@ -311,7 +207,7 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
     );
   }
 
-  Widget _buildControlBar(ThemeData theme) {
+  Widget _bottomBar(ThemeData theme) {
     return SafeArea(
       top: false,
       child: Padding(
@@ -331,19 +227,15 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
               children: [
                 Expanded(
                   child: FilledButton.icon(
-                    onPressed: _collecting ? _stop : _start,
-                    icon: Icon(
-                      _collecting ? Icons.stop : Icons.download,
-                    ),
-                    label: Text(_collecting ? '停止抓取' : '开始抓取'),
+                    onPressed: _openWeb,
+                    icon: const Icon(Icons.public),
+                    label: const Text('打开网页 / 抓取'),
                   ),
                 ),
                 const SizedBox(width: 12),
                 OutlinedButton(
-                  onPressed: () {
-                    setState(() => _showWeb = !_showWeb);
-                  },
-                  child: Text(_showWeb ? '列表' : '网页'),
+                  onPressed: _videos.isEmpty ? null : _playAll,
+                  child: const Text('全部播放'),
                 ),
               ],
             ),
@@ -353,84 +245,3 @@ class _DouyinFavoritesPageState extends State<DouyinFavoritesPage> {
     );
   }
 }
-
-/// Wraps `fetch` / `XMLHttpRequest` so every Douyin web API response reaches
-/// the native side.
-const _hookJs = r'''
-(function () {
-  if (window.__kumoneDouyinHook) { return; }
-  window.__kumoneDouyinHook = true;
-
-  function post(url, text) {
-    try {
-      if (!text || text.length < 40) { return; }
-      if (text.indexOf('aweme_list') < 0 && text.indexOf('aweme_detail') < 0) { return; }
-      window.flutter_inappwebview.callHandler('douyin', String(url), text);
-    } catch (e) {}
-  }
-
-  var originalFetch = window.fetch;
-  if (originalFetch) {
-    window.fetch = function () {
-      var args = arguments;
-      var url = '';
-      try { url = (args[0] && args[0].url) ? args[0].url : args[0]; } catch (e) {}
-      var promise = originalFetch.apply(this, args);
-      try {
-        promise.then(function (response) {
-          try {
-            if (String(url).indexOf('/aweme/v1/web/') >= 0) {
-              response.clone().text().then(function (text) { post(url, text); }).catch(function () {});
-            }
-          } catch (e) {}
-        }).catch(function () {});
-      } catch (e) {}
-      return promise;
-    };
-  }
-
-  var open = XMLHttpRequest.prototype.open;
-  var send = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function (method, url) {
-    this.__kumoneURL = url;
-    return open.apply(this, arguments);
-  };
-  XMLHttpRequest.prototype.send = function () {
-    var xhr = this;
-    try {
-      xhr.addEventListener('load', function () {
-        try {
-          if (String(xhr.__kumoneURL).indexOf('/aweme/v1/web/') >= 0) {
-            post(xhr.__kumoneURL, xhr.responseText);
-          }
-        } catch (e) {}
-      });
-    } catch (e) {}
-    return send.apply(this, arguments);
-  };
-})();
-''';
-
-/// Clicks the 收藏 tab once, then keeps the page scrolled to the bottom so the
-/// list paginates.
-const _driverJs = r'''
-(function () {
-  if (window.__kumoneDriver) { return; }
-  window.__kumoneDriver = setInterval(function () {
-    try {
-      if (!window.__kumoneClickedTab) {
-        var nodes = document.querySelectorAll('div,span,a,li');
-        for (var i = 0; i < nodes.length; i++) {
-          var text = (nodes[i].textContent || '').trim();
-          if (text === '收藏' || text === '收藏夹') {
-            nodes[i].click();
-            window.__kumoneClickedTab = true;
-            break;
-          }
-        }
-      }
-      window.scrollTo(0, document.body.scrollHeight);
-    } catch (e) {}
-  }, 1200);
-})();
-''';

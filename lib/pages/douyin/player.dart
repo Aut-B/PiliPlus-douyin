@@ -6,27 +6,25 @@ import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
-const _douyinUserAgent =
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-    'AppleWebKit/537.36 (KHTML, like Gecko) '
-    'Chrome/131.0.0.0 Safari/537.36';
-
-/// Full-screen Douyin playback.
+/// 全屏播放抖音 / TikTok 收藏。
 ///
-/// Uses media_kit directly instead of the Bilibili video page: there is no
-/// aid/cid, no danmaku and no quality ladder — just one URL per video, plus the
-/// loop mode the user asked for.
-class DouyinPlayerPage extends StatefulWidget {
-  const DouyinPlayerPage({super.key, required this.videos, required this.index});
+/// 直接用 media_kit，而不是走 B 站视频页：这里没有 aid/cid、没有弹幕、没有
+/// 清晰度梯度，只有一条直链，加上用户要的单曲 / 列表循环。
+class ShortVideoPlayerPage extends StatefulWidget {
+  const ShortVideoPlayerPage({
+    super.key,
+    required this.videos,
+    required this.index,
+  });
 
-  final List<DouyinVideo> videos;
+  final List<ShortVideo> videos;
   final int index;
 
   @override
-  State<DouyinPlayerPage> createState() => _DouyinPlayerPageState();
+  State<ShortVideoPlayerPage> createState() => _ShortVideoPlayerPageState();
 }
 
-class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
+class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Player? _player;
   VideoController? _controller;
   StreamSubscription<bool>? _completedSub;
@@ -36,7 +34,10 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
   bool _singleLoop = false;
   bool _playing = false;
 
-  DouyinVideo get _current => widget.videos[_index];
+  ShortVideo get _current => widget.videos[_index];
+
+  ShortVideoPlatform get _platform =>
+      ShortVideoPlatform.fromId(_current.platform) ?? ShortVideoPlatform.douyin;
 
   @override
   void initState() {
@@ -57,8 +58,8 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
       return;
     }
     player.setMediaHeader(
-      userAgent: _douyinUserAgent,
-      referer: 'https://www.douyin.com/',
+      userAgent: _platform.userAgent,
+      referer: _platform.referer,
     );
     _playingSub = player.stream.playing.listen((value) {
       if (mounted) setState(() => _playing = value);
@@ -177,11 +178,13 @@ class _DouyinPlayerPageState extends State<DouyinPlayerPage> {
               ),
             ),
             if (!_playing && controller != null)
-              const Center(
-                child: Icon(
-                  Icons.play_circle_fill,
-                  size: 72,
-                  color: Colors.white70,
+              const IgnorePointer(
+                child: Center(
+                  child: Icon(
+                    Icons.play_circle_fill,
+                    size: 72,
+                    color: Colors.white70,
+                  ),
                 ),
               ),
             Positioned(
