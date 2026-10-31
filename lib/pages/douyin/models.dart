@@ -13,8 +13,14 @@ enum ShortVideoPlatform {
     referer: 'https://www.douyin.com/',
     userAgent:
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/131.0.0.0 Safari/537.36',
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+        'Version/17.4 Safari/605.1.15',
+    mobileUserAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+        'Version/15.0 Mobile/15E148 Safari/604.1',
+    loginUrl: 'https://sso.douyin.com/',
+    cookieDomainNeedle: 'douyin.com',
     tabTitles: ['收藏', '收藏夹'],
     markers: ['aweme_list', 'aweme_detail'],
   ),
@@ -28,6 +34,12 @@ enum ShortVideoPlatform {
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
         'AppleWebKit/605.1.15 (KHTML, like Gecko) '
         'Version/17.4 Safari/605.1.15',
+    mobileUserAgent:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) '
+        'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+        'Version/15.0 Mobile/15E148 Safari/604.1',
+    loginUrl: 'https://www.tiktok.com/login',
+    cookieDomainNeedle: 'tiktok.com',
     tabTitles: ['收藏', 'Favorites', 'Favorite'],
     markers: ['itemList', 'itemStruct', 'item_list'],
   );
@@ -39,6 +51,9 @@ enum ShortVideoPlatform {
     required this.homeUrl,
     required this.referer,
     required this.userAgent,
+    required this.mobileUserAgent,
+    required this.loginUrl,
+    required this.cookieDomainNeedle,
     required this.tabTitles,
     required this.markers,
   });
@@ -49,6 +64,11 @@ enum ShortVideoPlatform {
   final String homeUrl;
   final String referer;
   final String userAgent;
+  final String mobileUserAgent;
+
+  /// 站点自己的登录页（抖音是 sso.douyin.com）。
+  final String loginUrl;
+  final String cookieDomainNeedle;
   final List<String> tabTitles;
 
   /// 响应体里出现这些键才值得回传。

@@ -9,8 +9,9 @@ import 'package:material_ui/material_ui.dart';
 
 /// 全屏的抓取页：网页在这里登录、滚动，我们只旁观它拿到的 JSON。
 ///
-/// 单独一页（而不是塞进列表页的 IndexedStack）是刻意的：iOS 的
-/// `InAppWebView` 是 platform view，放在切换容器里容易被布局成 0 高度而白屏。
+/// 单独一页、而且 `InAppWebView` 直接做 `Scaffold.body`（拿到紧约束），是刻意的：
+/// iOS 上它是 platform view，放在 `Stack` / `IndexedStack` 这类给**松约束**的
+/// 容器里会被量成 0 高度，整页就只剩白屏。
 class ShortVideoWebPage extends StatefulWidget {
   const ShortVideoWebPage({super.key, required this.platform});
 
@@ -47,6 +48,58 @@ class _ShortVideoWebPageState extends State<ShortVideoWebPage> {
   void dispose() {
     _timer?.cancel();
     super.dispose();
+  }
+
+  InAppWebViewSettings _settings(String userAgent, {bool mobile = false}) =>
+      InAppWebViewSettings(
+        userAgent: userAgent,
+        javaScriptEnabled: true,
+        javaScriptCanOpenWindowsAutomatically: true,
+        mediaPlaybackRequiresUserGesture: false,
+        thirdPartyCookiesEnabled: true,
+        allowsInlineMediaPlayback: true,
+        preferredContentMode: mobile
+            ? UserPreferredContentMode.MOBILE
+            : UserPreferredContentMode.DESKTOP,
+        useShouldOverrideUrlLoading: true,
+      );
+
+  // MARK: - 导航
+
+  Future<void> _load(String url, String userAgent, {bool mobile = false}) async {
+    final uri = WebUri(url);
+    final controller = _web;
+    if (controller == null) return;
+    await controller.setSettings(
+      settings: _settings(userAgent, mobile: mobile),
+    );
+    await controller.loadUrl(urlRequest: URLRequest(url: uri));
+  }
+
+  /// 收藏页（桌面 UA）。
+  Future<void> _reload() async {
+    if (mounted) {
+      setState(() {
+        _status = '正在打开 ${platform.album} 收藏页…';
+        _progress = 0;
+      });
+    }
+    await _load(platform.homeUrl, platform.userAgent);
+  }
+
+  /// 站点首页：登录面板一般在这里弹出来。
+  Future<void> _openHome() async {
+    if (mounted) setState(() => _status = '正在打开 ${platform.album} 首页…');
+    await _load(platform.siteUrl, platform.userAgent);
+  }
+
+  /// 直接打开站点登录页：桌面版右上角「登录」按钮在某些 WebView 里点不动，
+  /// 跳登录页最省事；登录完 cookie 落在同一个域上，点刷新回收藏页即可。
+  Future<void> _openLogin() async {
+    if (mounted) {
+      setState(() => _status = '登录页：登录完成后点右上角刷新回收藏页');
+    }
+    await _load(platform.loginUrl, platform.userAgent);
   }
 
   // MARK: - 抓取
@@ -133,7 +186,9 @@ class _ShortVideoWebPageState extends State<ShortVideoWebPage> {
       }
     }
     if (changed == 0) return;
-    setState(() => _status = '已抓取 ${_videos.length} 条…');
+    if (mounted) {
+      setState(() => _status = '已抓取 ${_videos.length} 条…');
+    }
     _save();
   }
 
@@ -147,14 +202,17 @@ class _ShortVideoWebPageState extends State<ShortVideoWebPage> {
         actions: [
           IconButton(
             tooltip: '首页',
-            onPressed: () => _web?.loadUrl(
-              urlRequest: URLRequest(url: WebUri(platform.siteUrl)),
-            ),
+            onPressed: _openHome,
             icon: const Icon(Icons.home_outlined),
           ),
           IconButton(
-            tooltip: '重新加载',
-            onPressed: () => _web?.reload(),
+            tooltip: '登录页',
+            onPressed: _openLogin,
+            icon: const Icon(Icons.login),
+          ),
+          IconButton(
+            tooltip: '重新加载收藏页',
+            onPressed: _reload,
             icon: const Icon(Icons.refresh),
           ),
           TextButton(
@@ -162,21 +220,20 @@ class _ShortVideoWebPageState extends State<ShortVideoWebPage> {
             child: const Text('完成'),
           ),
         ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(2),
+          child: _progress > 0 && _progress < 1
+              ? LinearProgressIndicator(value: _progress, minHeight: 2)
+              : const SizedBox(height: 2),
+        ),
       ),
-      body: Stack(
-        children: [
-          InAppWebView(
+      // 直接作为 body，拿到紧约束；platform view 才不会缩成 0。
+      body: SafeArea(
+        top: false,
+        child: SizedBox.expand(
+          child: InAppWebView(
             initialUrlRequest: URLRequest(url: WebUri(platform.homeUrl)),
-            initialSettings: InAppWebViewSettings(
-              userAgent: platform.userAgent,
-              javaScriptEnabled: true,
-              javaScriptCanOpenWindowsAutomatically: true,
-              mediaPlaybackRequiresUserGesture: false,
-              thirdPartyCookiesEnabled: true,
-              allowsInlineMediaPlayback: true,
-              preferredContentMode: UserPreferredContentMode.DESKTOP,
-              useShouldOverrideUrlLoading: true,
-            ),
+            initialSettings: _settings(platform.userAgent),
             initialUserScripts: UnmodifiableListView<UserScript>([
               UserScript(
                 source: _hookJs(platform),
@@ -210,28 +267,16 @@ class _ShortVideoWebPageState extends State<ShortVideoWebPage> {
               setState(() => _status = '网页加载失败：${error.description}');
             },
           ),
-          if (_progress > 0 && _progress < 1)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: LinearProgressIndicator(value: _progress),
-            ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _controlBar(),
-          ),
-        ],
+        ),
       ),
+      bottomNavigationBar: _controlBar(),
     );
   }
 
   Widget _controlBar() {
     final theme = Theme.of(context);
     return Material(
-      color: theme.colorScheme.surface.withValues(alpha: 0.94),
+      color: theme.colorScheme.surface,
       child: SafeArea(
         top: false,
         child: Padding(
