@@ -141,9 +141,21 @@ final class ShortVideoWebViewController: UIViewController {
   private var hookInstalled = false
   private var pendingStart = false
   private var didFinishLoading = false
+  private var reloadingForCollect = false
   private var popup: ShortVideoPopupController?
   private var lastPopupURL = ""
   private var lastPopupAt = Date.distantPast
+
+  static func armedHookScript(hookScript: String) -> String {
+    """
+    (function () {
+      var armed = false;
+      try { armed = window.localStorage.getItem('__kumoneArm') === '1'; } catch (e) {}
+      if (!armed) { return; }
+      \(hookScript)
+    })();
+    """
+  }
 
   /// 常驻的极轻量脚本：只接管 `window.open`。
   static let popupBridgeScript = """
@@ -229,6 +241,17 @@ final class ShortVideoWebViewController: UIViewController {
         source: ShortVideoWebViewController.popupBridgeScript,
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
+      )
+    )
+    // 只有点「开始抓取」之后（localStorage 标记为 1）才会真正装监听：
+    // 接口请求必须发生在监听装好之后，否则页面早就把收藏拉完了，一段都收不到。
+    configuration.userContentController.addUserScript(
+      WKUserScript(
+        source: ShortVideoWebViewController.armedHookScript(
+          hookScript: args["hookScript"] as? String ?? ""
+        ),
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
       )
     )
 
@@ -401,11 +424,18 @@ final class ShortVideoWebViewController: UIViewController {
     idleRounds = 0
     lastCount = received
     startedAt = Date()
-    setStatus("正在抓取…如果一直没动静，请先在网页里登录")
-    installHook { [weak self] in
+    received = 0
+    setStatus("正在抓取…正在重新加载页面，让收藏接口重新请求一次")
+    // 接口请求必须发生在监听装好之后。以前在加载完的页面上补装监听，
+    // 页面早把收藏拉过了，于是永远收到 0 段——TikTok 收藏页是整页渲染，
+    // 切 tab 也不会再发请求，一条都抓不到。现在：置标记 → reload →
+    // documentStart 按标记自动装监听 → 页面自己重新请求。
+    let js = "try{localStorage.setItem('__kumoneArm','1');}catch(e){}"
+    webView.evaluateJavaScript(js) { [weak self] _, _ in
       guard let self else { return }
-      self.webView.evaluateJavaScript(self.driverScript)
-      self.startTimer()
+      self.hookInstalled = true
+      self.reloadingForCollect = true
+      self.webView.reload()
     }
   }
 
@@ -424,7 +454,8 @@ final class ShortVideoWebViewController: UIViewController {
     startButton.title = "开始抓取"
     stopTimer()
     webView.evaluateJavaScript(
-      "try{clearInterval(window.__kumoneDriver);window.__kumoneDriver=null;}catch(e){}"
+      "try{clearInterval(window.__kumoneDriver);window.__kumoneDriver=null;"
+      + "localStorage.setItem('__kumoneArm','0');}catch(e){}"
     )
     setStatus(message ?? "已停止，收到 \(received) 段数据")
   }
@@ -513,6 +544,12 @@ extension ShortVideoWebViewController: WKNavigationDelegate {
     if pendingStart {
       pendingStart = false
       beginCollecting()
+      return
+    }
+    if reloadingForCollect {
+      reloadingForCollect = false
+      webView.evaluateJavaScript(driverScript)
+      startTimer()
       return
     }
     if !collecting {

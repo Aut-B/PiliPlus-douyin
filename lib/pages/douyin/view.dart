@@ -1,5 +1,6 @@
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -26,6 +27,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   /// 原生一共回传了多少段响应（不等于视频条数）。
   int _rawCount = 0;
+
+  /// 多选：全选 / 播放所选。
+  bool _selecting = false;
+  final Set<String> _selected = {};
 
   ShortVideoPlatform get platform => widget.platform;
 
@@ -141,7 +146,57 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   void _play(int index) {
     if (_videos.isEmpty) return;
-    Get.to(() => ShortVideoPlayerPage(videos: List.of(_videos), index: index));
+    Get.to(
+      () => ShortVideoPlayerPage(
+        queue: _videos.map(QueueEntry.fromShortVideo).toList(),
+        index: index,
+      ),
+    );
+  }
+
+  /// 只播选中的这些（顺序按列表顺序）。
+  void _playSelected() {
+    if (_selected.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    final queue = _videos.where((e) => _selected.contains(e.key)).toList();
+    if (queue.isEmpty) return;
+    setState(() {
+      _selecting = false;
+      _selected.clear();
+    });
+    Get.to(
+      () => ShortVideoPlayerPage(
+        queue: queue.map(QueueEntry.fromShortVideo).toList(),
+        index: 0,
+      ),
+    );
+  }
+
+  void _toggleSelect(ShortVideo video) {
+    setState(() {
+      if (!_selected.remove(video.key)) _selected.add(video.key);
+    });
+  }
+
+  void _toggleSelectMode() {
+    setState(() {
+      _selecting = !_selecting;
+      if (!_selecting) _selected.clear();
+    });
+  }
+
+  void _selectAll() {
+    setState(() {
+      if (_selected.length == _videos.length) {
+        _selected.clear();
+      } else {
+        _selected
+          ..clear()
+          ..addAll(_videos.map((e) => e.key));
+      }
+    });
   }
 
   void _playAll() => _play(0);
@@ -176,6 +231,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             tooltip: '清空',
             onPressed: _videos.isEmpty ? null : _clear,
             icon: const Icon(Icons.delete_outline),
+          ),
+          IconButton(
+            tooltip: _selecting ? '退出多选' : '多选',
+            onPressed: _videos.isEmpty ? null : _toggleSelectMode,
+            icon: Icon(_selecting ? Icons.close : Icons.checklist),
           ),
           IconButton(
             tooltip: '全部播放',
@@ -241,24 +301,39 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
+        final checked = _selected.contains(video.key);
         return ListTile(
-          onTap: () => _play(index),
-          leading: ClipRRect(
-            borderRadius: BorderRadius.circular(6),
-            child: SizedBox(
-              width: 48,
-              height: 64,
-              child: video.cover.isEmpty
-                  ? Container(color: theme.dividerColor.withValues(alpha: 0.1))
-                  : Image.network(
-                      video.cover,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => Container(
-                        color: theme.dividerColor.withValues(alpha: 0.1),
-                      ),
-                    ),
-            ),
-          ),
+          onTap: () => _selecting ? _toggleSelect(video) : _play(index),
+          onLongPress: () {
+            if (!_selecting) setState(() => _selecting = true);
+            _toggleSelect(video);
+          },
+          selected: _selecting && checked,
+          leading: _selecting
+              ? Icon(
+                  checked
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  color: checked ? theme.colorScheme.primary : null,
+                )
+              : ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: SizedBox(
+                    width: 48,
+                    height: 64,
+                    child: video.cover.isEmpty
+                        ? Container(
+                            color: theme.dividerColor.withValues(alpha: 0.1),
+                          )
+                        : Image.network(
+                            video.cover,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => Container(
+                              color: theme.dividerColor.withValues(alpha: 0.1),
+                            ),
+                          ),
+                  ),
+                ),
           title: Text(
             video.title,
             maxLines: 2,
@@ -292,20 +367,43 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ),
             const SizedBox(height: 8),
             Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _openWeb,
-                    icon: const Icon(Icons.public),
-                    label: const Text('打开网页 / 抓取'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                OutlinedButton(
-                  onPressed: _videos.isEmpty ? null : _playAll,
-                  child: const Text('全部播放'),
-                ),
-              ],
+              children: _selecting
+                  ? [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _videos.isEmpty ? null : _selectAll,
+                          icon: const Icon(Icons.select_all),
+                          label: Text(
+                            _selected.length == _videos.length &&
+                                    _videos.isNotEmpty
+                                ? '取消全选'
+                                : '全选',
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _playSelected,
+                          icon: const Icon(Icons.playlist_play),
+                          label: Text('播放所选 ${_selected.length} 条'),
+                        ),
+                      ),
+                    ]
+                  : [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _openWeb,
+                          icon: const Icon(Icons.public),
+                          label: const Text('打开网页 / 抓取'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      OutlinedButton(
+                        onPressed: _videos.isEmpty ? null : _playAll,
+                        child: const Text('全部播放'),
+                      ),
+                    ],
             ),
           ],
         ),

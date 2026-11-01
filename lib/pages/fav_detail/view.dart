@@ -10,6 +10,8 @@ import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/models/common/fav_order_type.dart';
 import 'package:PiliPlus/models_new/fav/fav_detail/media.dart';
 import 'package:PiliPlus/models_new/fav/fav_folder/list.dart';
+import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/dynamics_repost/view.dart';
 import 'package:PiliPlus/pages/fav_detail/controller.dart';
 import 'package:PiliPlus/pages/fav_detail/widget/fav_video_card.dart';
@@ -325,6 +327,30 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
     ];
   }
 
+  /// 全选 / 勾选之后「播放」：把选中的 B 站视频排成队列，
+  /// 用短视频那套播放器连着播（队列里也能混进抖音 / TikTok）。
+  void _playSelected() {
+    final entries = <QueueEntry>[];
+    for (final item in _favDetailController.allChecked) {
+      final bvid = item.bvid;
+      if (bvid == null || bvid.isEmpty) continue;
+      entries.add(
+        QueueEntry.fromBili(
+          bvid: bvid,
+          title: item.title ?? '视频',
+          author: item.upper?.name ?? '',
+          cover: item.cover ?? '',
+          durationMs: (item.duration ?? 0) * 1000,
+        ),
+      );
+    }
+    if (entries.isEmpty) {
+      SmartDialog.showToast('选中的里面没有可播放的视频');
+      return;
+    }
+    _favDetailController.handleSelect();
+    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
+  }
   List<Widget> _selectActions(ThemeData theme) {
     final btnStyle = TextButton.styleFrom(visualDensity: .compact);
     final textStyle = TextStyle(color: theme.colorScheme.onSurfaceVariant);
@@ -333,6 +359,11 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
         style: btnStyle,
         onPressed: () => _favDetailController.handleSelect(checked: true),
         child: const Text('全选'),
+      TextButton(
+        style: btnStyle,
+        onPressed: _playSelected,
+        child: const Text('播放'),
+      ),
       ),
       TextButton(
         style: btnStyle,
