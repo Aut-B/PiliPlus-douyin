@@ -48,6 +48,7 @@ import 'package:PiliPlus/utils/image_utils.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/screen_wake_lock.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
@@ -76,7 +77,6 @@ import 'package:media_kit_video/media_kit_video.dart';
 import 'package:native_device_orientation/native_device_orientation.dart';
 import 'package:path/path.dart' as path;
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 typedef PlayCallback = Future<void>? Function();
@@ -2114,7 +2114,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _stopWakeLock() {
-    WakelockPlus.disable();
+    ScreenWakeLock.release(this);
     _updatePlaybackState(debugLabel: 'onVideoPaused');
   }
 
@@ -2140,7 +2140,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           playerStatus = .playing;
           _stopWakeLockTimer();
           _updatePlaybackState();
-          WakelockPlus.enable();
+          ScreenWakeLock.acquire(this);
           _syncIOSAutoEnterPip();
 
           if (_isAutoEnterPip) {
@@ -2826,7 +2826,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _positionListeners.clear();
     _statusListeners.clear();
     _stopWakeLockTimer();
-    WakelockPlus.disable();
+    ScreenWakeLock.release(this);
     if (kDebugMode) {
       debugPrint('dispose player');
     }

@@ -9,6 +9,7 @@ import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/services/service_locator.dart';
+import 'package:PiliPlus/utils/screen_wake_lock.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
@@ -19,7 +20,6 @@ import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// 播放顺序。
 enum ShortVideoLoopMode {
@@ -99,6 +99,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 「这条错误属于哪一条」，否则重试会重试到别的视频上。
   String? _openedKey;
 
+  /// 已经真正开起来的 key。[_openedKey] 在 `open()` 之前就写（用来认领错误），
+  /// 所以标题要跟它区分开，否则解析那几秒标题会先跳。
+  String? _playingKey;
+
   /// 每次 [_openIndex] 递增。
   ///
   /// 解析直链和 player.open 都是 await，期间用户再点一条，
@@ -142,6 +146,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   bool _dragOnProgress = false;
 
   QueueEntry get _current => _queue[_index];
+
+  /// 顶栏标题跟的是「画面上正在播的那条」，不是 [_index]。
+  /// [_index] 在解析还没回来时就跳过去了，而 TikTok 解析要好几秒，
+  /// 那几秒里画面还是上一条，标题却已经是下一条 —— 就是「标题和画面对不上」。
+  QueueEntry get _displayedEntry {
+    final key = _playingKey ?? _openedKey;
+    if (key != null) {
+      for (final entry in _queue) {
+        if (entry.key == key) return entry;
+      }
+    }
+    return _current;
+  }
+
+  int get _displayedIndex {
+    final key = _playingKey ?? _openedKey;
+    if (key != null) {
+      final index = _queue.indexWhere((entry) => entry.key == key);
+      if (index >= 0) return index;
+    }
+    return _index;
+  }
 
   /// 按视频自己的比例显示，横屏的就铺成横向，竖屏的就铺成竖向。
   double get _aspectRatio {
@@ -204,10 +230,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
     _playingSub = player.stream.playing.listen((value) {
       if (value) {
-        WakelockPlus.enable();
+        ScreenWakeLock.acquire(this);
         unawaited(_setAudioSession(true));
       } else {
-        WakelockPlus.disable();
+        ScreenWakeLock.release(this);
       }
       if (mounted) setState(() => _playing = value);
     });
@@ -466,6 +492,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _openLock = opened.then((_) {}, onError: (_) {});
     await opened;
     if (token != _openToken || !mounted) return;
+    _playingKey = entry.key;
     await player.setRate(_speed);
     if (token != _openToken || !mounted) return;
     _syncVideoSize();
@@ -981,7 +1008,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _controller?.setPictureInPicture(false);
     }
     _player?.dispose();
-    WakelockPlus.disable();
+    ScreenWakeLock.release(this);
     ScreenBrightnessPlatform.instance.resetApplicationScreenBrightness();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     // 退出这一页后把方向交还给 App（Info.plist 里允许的就是这三个）。
@@ -1071,13 +1098,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    _current.title,
+                    _displayedEntry.title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Colors.white, fontSize: 15),
                   ),
                   Text(
-                    '${_index + 1}/${_queue.length} · ${_current.author}'
+                    '${_displayedIndex + 1}/${_queue.length}'
+                    ' · ${_displayedEntry.author}'
                     '${_cached ? ' · 已缓存' : ''}'
                     '${pending > 0 ? ' · 插队 $pending' : ''}',
                     maxLines: 1,
