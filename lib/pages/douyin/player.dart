@@ -1742,8 +1742,33 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
     return '$value';
   }
 
+  /// 「上一次后台窗口期」的读数。卡帧只发生在这一段，而面板只能在回到前台后读，
+  /// 所以结论优先用它判定。
   String get _verdict {
     if (_data.isEmpty) return '正在读取…（原生侧还没建小窗控制器）';
+    final bgSeconds = _num(_data['bgSeconds']);
+    if (bgSeconds >= 1.5) {
+      final secs = bgSeconds.toStringAsFixed(1);
+      final enq = _num(_data['bgEnqueuedDelta']);
+      final same = _num(_data['bgSameFrameDelta']);
+      final moved = _num(_data['bgPositionDelta']);
+      final starts = _num(_data['bgStartCallsDelta']);
+      final didStart = _num(_data['bgDidStartDelta']);
+      if (starts > 0 && didStart < 1) {
+        return '上次后台 $secs 秒：发起 ${starts.round()} 次小窗，didStart 一次没来';
+      }
+      if (enq < 2) {
+        return '上次后台 $secs 秒：一帧都没进图层（+${enq.round()}）';
+      }
+      if (same >= enq * 0.8) {
+        return '上次后台 $secs 秒：入队 +${enq.round()} 帧但内容没变 —— 卡在渲染';
+      }
+      if (moved < bgSeconds * 0.3) {
+        return '上次后台 $secs 秒：帧在送（+${enq.round()}）但进度不走 —— 卡在解码';
+      }
+      return '上次后台 $secs 秒：入队 +${enq.round()}、内容在变、进度 +${moved.toStringAsFixed(1)} 秒'
+          ' —— 问题在图层/小窗那一环';
+    }
     if (_data['showing'] != true) return '小窗没在显示：先按 Home 让它自动进小窗';
     if (_noFrameSeconds >= 1.5) {
       return '帧没送进小窗：累计 ${_noFrameSeconds.round()} 秒';
@@ -1755,7 +1780,21 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
   }
 
   Color get _verdictColor {
-    if (_data.isEmpty || _data['showing'] != true) return Colors.orangeAccent;
+    if (_data.isEmpty) return Colors.orangeAccent;
+    final bgSeconds = _num(_data['bgSeconds']);
+    if (bgSeconds >= 1.5) {
+      final enq = _num(_data['bgEnqueuedDelta']);
+      final same = _num(_data['bgSameFrameDelta']);
+      final moved = _num(_data['bgPositionDelta']);
+      final starts = _num(_data['bgStartCallsDelta']);
+      final didStart = _num(_data['bgDidStartDelta']);
+      final bad = enq < 2 ||
+          same >= enq * 0.8 ||
+          moved < bgSeconds * 0.3 ||
+          (starts > 0 && didStart < 1);
+      return bad ? Colors.redAccent : Colors.orangeAccent;
+    }
+    if (_data['showing'] != true) return Colors.orangeAccent;
     if (_noFrameSeconds >= 1.5 || _sourceStoppedSeconds >= 1.5) {
       return Colors.redAccent;
     }
@@ -1763,6 +1802,12 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
   }
 
   List<List<String>> get _rows => [
+        ['上次后台(秒)', _num(_data['bgSeconds']).toStringAsFixed(1)],
+        ['后台入队', _text(_data['bgEnqueuedDelta'])],
+        ['后台同帧', _text(_data['bgSameFrameDelta'])],
+        ['后台进度', _text(_data['bgPositionDelta'])],
+        ['后台didStart', _text(_data['bgDidStartDelta'])],
+        ['后台启动调用', _text(_data['bgStartCallsDelta'])],
         ['小窗显示', _text(_data['showing'])],
         ['已武装', _text(_data['armed'])],
         ['系统允许', _text(_data['possible'])],
@@ -1788,6 +1833,14 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['进度(秒)', _text(_data['position'])],
         ['时间轴速率', _text(_data['timebaseRate'])],
         ['窗口尺寸', _text(_data['windowBounds'])],
+        ['didStart/Stop', '${_text(_data['didStart'])}/${_text(_data['didStop'])}'],
+        ['校正尝试/命中',
+          '${_text(_data['reconcileTry'])}/${_text(_data['reconcileHit'])}'],
+        ['启动调用/失败',
+          '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
+        ['同帧', _text(_data['sameFrame'])],
+        ['后台/前台入队',
+          '${_text(_data['bgEnqueued'])}/${_text(_data['fgEnqueued'])}'],
       ];
 
   String get _plainText {
