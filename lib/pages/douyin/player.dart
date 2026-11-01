@@ -92,7 +92,22 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   bool _fill = false;
   bool _landscape = false;
   bool _showControls = true;
-  int _epoch = 0;
+
+  /// 真正开着的那一条的 key。
+  ///
+  /// [_index] 会先于开播就跳到下一条，播放错误回来时只能靠它认领
+  /// 「这条错误属于哪一条」，否则重试会重试到别的视频上。
+  String? _openedKey;
+
+  /// 每次 [_openIndex] 递增。
+  ///
+  /// 解析直链和 player.open 都是 await，期间用户再点一条，
+  /// 先发起、后回来的那次必须自己作废——否则标题已经跳了、画面还是上一条。
+  int _openToken = 0;
+
+  /// player.open 串行化：两次换源交叉会把上一条的画面和这一条的音频拼在一起。
+  Future<void> _openLock = Future<void>.value();
+
   int _skipped = 0;
   int _videoWidth = 0;
   int _videoHeight = 0;
@@ -411,11 +426,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 抖音 / TikTok 的直链会过期，B 站还要先把 cid 和 playurl 要回来，
   /// 所以统一交给 resolveQueueEntry，解析不出来就自动跳下一条。
   Future<void> _openIndex(int index, {bool resetRetry = true}) async {
+    final token = ++_openToken;
     final entry = _queue[index];
     if (resetRetry) _retryStage = 0;
-    // 换源要换一代画面：media_kit 重开之后纹理 id 会变，
-    // 不重建这一块就会出现「只有声音没有画面」。
-    _epoch++;
     _position = Duration.zero;
     _duration = Duration.zero;
     _seekPreview = null;
@@ -424,6 +437,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     var media = _resolved[entry.key];
     if (media == null) {
       media = await _resolve(entry);
+      // 这次解析回来时已经过期了：用户又点了一条，交给新的那次。
+      if (token != _openToken || !mounted) return;
       if (media == null) {
         _skipBroken(index);
         return;
@@ -431,7 +446,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _resolved[entry.key] = media;
     }
     final player = _player;
-    if (player == null || !mounted) return;
+    if (player == null || !mounted || token != _openToken) return;
+    final url = media.url;
     final headers = <String, String>{};
     if (media.cookie.isNotEmpty) headers['Cookie'] = media.cookie;
     player.setMediaHeader(
@@ -439,18 +455,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       referer: media.referer,
       headers: headers,
     );
-    await player.open(Media(media.url), play: true);
+    _openedKey = entry.key;
+    final opened = _openLock.then((_) async {
+      if (token != _openToken || !mounted) return;
+      await player.open(Media(url), play: true);
+    });
+    _openLock = opened.then((_) {}, onError: (_) {});
+    await opened;
+    if (token != _openToken || !mounted) return;
     await player.setRate(_speed);
+    if (token != _openToken || !mounted) return;
     _syncVideoSize();
-    if (_pipActive) {
-      final controller = _controller;
-      if (controller != null) {
-        unawaited(
-          Future<void>.sync(
-            () => controller.preparePictureInPictureForNewMedia(),
-          ).catchError((_) {}),
-        );
-      }
+    // 换源后小窗的时间轴还停在上一条的进度上，必须清一次，
+    // 否则新视频的第一帧顶在旧时间轴上，小窗就停在那一帧不动。
+    // 没进小窗时这是空操作，所以不按 _pipActive 判断——自动进小窗时
+    // Dart 侧可能收不到 start 事件，按它判断就漏掉了。
+    final controller = _controller;
+    if (controller != null) {
+      unawaited(
+        Future<void>.sync(
+          () => controller.preparePictureInPictureForNewMedia(),
+        ).catchError((_) {}),
+      );
     }
   }
 
@@ -525,12 +551,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_busy) return;
     _busy = true;
     try {
-      final entry = _current;
+      // 错误可能来自上一条（换源那一瞬间），按真正开着的那条认领，
+      // 别拿 _index 去重试——那已经是下一条了。
+      final opened = _openedKey;
+      final found = opened == null
+          ? -1
+          : _queue.indexWhere((e) => e.key == opened);
+      final index = found >= 0 ? found : _index;
+      final entry = _queue[index];
       if (_retryStage == 0) {
         _retryStage = 1;
         _resolved.remove(entry.key);
         _showToast('换备用地址重试');
-        await _openIndex(_index, resetRetry: false);
+        await _openIndex(index, resetRetry: false);
         return;
       }
       if (_retryStage == 1 && entry.short != null) {
@@ -539,7 +572,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         return;
       }
       _showToast('播放失败：$message');
-      _skipBroken(_index);
+      _skipBroken(index);
     } finally {
       _busy = false;
     }
@@ -769,7 +802,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   void _cycleMode() {
     setState(() => _mode = _mode.next);
-    _showToast(_mode.label);
+    // 不用 SnackBar：它从底部弹出来，正好盖住这一排按钮，
+    // 连点两下就点不到了。改成画面中间的提示。
+    _flashHint(_mode.label);
   }
 
   void _cycleSpeed() {
@@ -777,7 +812,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final next = speeds[(speeds.indexOf(_speed) + 1) % speeds.length];
     setState(() => _speed = next);
     _player?.setRate(next);
-    _showToast('${next}x');
+    _flashHint('${next}x');
   }
 
   /// 双击画面：暂停 / 继续。
@@ -1204,10 +1239,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                   onPressed: () => _jump(1),
                   icon: const Icon(Icons.skip_next, color: Colors.white),
                 ),
-                IconButton(
+                TextButton.icon(
                   onPressed: _cycleMode,
-                  tooltip: _mode.label,
-                  icon: Icon(_mode.icon, color: Colors.white),
+                  icon: Icon(_mode.icon, color: Colors.white, size: 18),
+                  label: Text(
+                    _mode.label,
+                    style: const TextStyle(color: Colors.white, fontSize: 11),
+                  ),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
                 TextButton(
                   onPressed: _cycleSpeed,
@@ -1233,8 +1277,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   Widget _videoView(VideoController controller) {
+    // key 不能跟着换条走：media_kit 的纹理 id 在整个 VideoController
+    // 生命周期里是固定的，换源只 resize + render。每换一条就把这一块
+    // 整个重建，6S 上会连带把喂进小窗的那条链路卡住（小窗停在一帧）。
     final video = SimpleVideo(
-      key: ValueKey(_epoch),
+      key: const ValueKey('short-video-surface'),
       controller: controller,
       fill: Colors.black,
       aspectRatio: _aspectRatio,
