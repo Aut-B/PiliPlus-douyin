@@ -359,11 +359,11 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
         style: btnStyle,
         onPressed: () => _favDetailController.handleSelect(checked: true),
         child: const Text('全选'),
+      ),
       TextButton(
         style: btnStyle,
         onPressed: _playSelected,
         child: const Text('播放'),
-      ),
       ),
       TextButton(
         style: btnStyle,
