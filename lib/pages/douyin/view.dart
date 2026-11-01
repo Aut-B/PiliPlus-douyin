@@ -1,3 +1,4 @@
+import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
@@ -224,27 +225,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   /// 删一条：本地列表 + 删除墓碑 + 本地缓存文件。
   Future<void> _deleteOne(ShortVideo video) async {
-    final confirmed = await Get.dialog<bool>(
-      AlertDialog(
-        title: const Text('删除这条收藏？'),
-        content: Text(
-          '${video.title}\n\n'
-          '只删本机这一条，本地缓存文件也一起删掉；'
-          '下次同步时远端那份也会被排除。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Get.back(result: false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Get.back(result: true),
-            child: const Text('删除'),
-          ),
-        ],
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: const Text('删除这条收藏？'),
+      content: Text(
+        '${video.title}\n\n'
+        '只删本机这一条，本地缓存文件也一起删掉；'
+        '下次同步时远端那份也会被排除。',
       ),
     );
-    if (confirmed != true || !mounted) return;
+    if (!confirmed || !mounted) return;
     setState(() {
       _videos.removeWhere((e) => e.key == video.key);
       _selected.remove(video.key);
@@ -263,23 +253,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       return;
     }
     final targets = _videos.where((e) => _selected.contains(e.key)).toList();
-    final confirmed = await Get.dialog<bool>(
-      AlertDialog(
-        title: Text('删除所选的 ${targets.length} 条？'),
-        content: const Text('本地缓存文件会一起删掉，下次同步时远端那份也会被排除。'),
-        actions: [
-          TextButton(
-            onPressed: () => Get.back(result: false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Get.back(result: true),
-            child: const Text('删除'),
-          ),
-        ],
-      ),
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: Text('删除所选的 ${targets.length} 条？'),
+      content: const Text('本地缓存文件会一起删掉，下次同步时远端那份也会被排除。'),
     );
-    if (confirmed != true || !mounted) return;
+    if (!confirmed || !mounted) return;
     setState(() {
       _videos.removeWhere((e) => _selected.contains(e.key));
       _status = '已删除 ${targets.length} 条，本地 ${_videos.length} 条';
@@ -293,7 +272,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     }
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
-
   /// 插到「下一首播放」：正在播的 B 站 / 抖音队列播完这一条就接上它。
   void _queueNext(Iterable<ShortVideo> videos) {
     final entries = videos.map(QueueEntry.fromShortVideo);
