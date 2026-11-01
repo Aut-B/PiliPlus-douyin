@@ -12,7 +12,7 @@ import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
-    show DeviceOrientation, SystemChrome, SystemUiMode;
+    show Clipboard, ClipboardData, DeviceOrientation, SystemChrome, SystemUiMode;
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
@@ -115,7 +115,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// iOS 画中画：系统判定不支持时把按钮藏起来。
   bool _pipSupported = true;
   bool _pipActive = false;
-  bool _pipDebug = false;
 
   /// 正在把当前这条整条下到本地（顶栏转圈 + 百分比）。
   bool _downloading = false;
@@ -318,21 +317,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
   }
 
-  /// 长按画中画按钮：把小窗里的诊断读数打开 / 关掉。
+  /// 小窗诊断面板。
   ///
-  /// 打开后读数会直接画进小窗画面里：数字还在涨 = 帧送到了、卡在别处；
-  /// 数字也定住 = 帧根本没出（进程被挂起 / mpv 停了）。
-  Future<void> _togglePipDebug() async {
+  /// 原生侧一直有诊断快照（`PictureInPictureDiagnostics`），但以前只有「画进小窗画面」
+  /// 这一条路：字小，而且必须先进小窗才看得见，等于拿不到。这里把它拉回页面，
+  /// 大字号、自己刷新、能一键复制。
+  ///
+  /// 排障用法：打开面板 → 按 Home 让它自动进小窗 → 等它卡住 → 切回来读结论那一行。
+  Future<void> _openPipDiagnostics() async {
     final controller = _controller;
-    if (controller == null) return;
-    final next = !_pipDebug;
-    setState(() => _pipDebug = next);
-    try {
-      await controller.setPictureInPictureDebugOverlay(next);
-      _showToast(next ? '小窗诊断读数已开（出帧/入队/位置）' : '小窗诊断读数已关');
-    } catch (e) {
-      _showToast('诊断开关失败：$e');
+    if (controller == null) {
+      _showToast('播放器还没准备好');
+      return;
     }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1C1C1E),
+      builder: (_) => _PipDiagnosticsSheet(controller: controller),
+    );
   }
 
   /// 播放队列面板：看得到「我在第几条」，也能当场增删、调顺序。
@@ -1128,11 +1131,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               ),
             ),
             if (Platform.isIOS && _pipSupported)
+              IconButton(
+                onPressed: _openPipDiagnostics,
+                tooltip: '小窗诊断读数',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+                icon: const Icon(
+                  Icons.monitor_heart_outlined,
+                  color: Colors.white,
+                ),
+              ),
+            if (Platform.isIOS && _pipSupported)
+              // 长按不要挂 Tooltip：Tooltip 自己会吃长按（这正是之前「长按只弹提示、
+              // 读数永远打不开」的原因）。现在长按直接打开诊断面板。
               GestureDetector(
-                onLongPress: _togglePipDebug,
+                onLongPress: _openPipDiagnostics,
                 child: IconButton(
                   onPressed: _togglePip,
-                  tooltip: _pipActive ? '退出画中画' : '画中画（长按：诊断读数）',
                   icon: Icon(
                     _pipActive
                         ? Icons.picture_in_picture_alt
@@ -1613,6 +1629,309 @@ class _QueueSheetState extends State<_QueueSheet> {
                     ),
                   );
                 },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+/// 小窗诊断面板。
+///
+/// 原生侧本来就有 `PictureInPictureDiagnostics` 快照，但以前只有「画进小窗画面」
+/// 这一条路：字小、还必须先进小窗才看得见，等于拿不到。这里把它拉回页面，
+/// 大字号、自己刷新、能一键复制。
+///
+/// 排障用法：打开面板 → 按 Home 让视频自动进小窗 → 等它卡住 → 切回来读结论那行。
+class _PipDiagnosticsSheet extends StatefulWidget {
+  const _PipDiagnosticsSheet({required this.controller});
+
+  final VideoController controller;
+
+  @override
+  State<_PipDiagnosticsSheet> createState() => _PipDiagnosticsSheetState();
+}
+
+class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
+  Timer? _timer;
+  Timer? _copiedTimer;
+  bool _busy = false;
+  bool _copied = false;
+  bool _inWindow = false;
+  String? _error;
+  Map<String, Object?> _data = const <String, Object?>{};
+
+  DateTime? _lastAt;
+  double _lastPosition = -1;
+  double _lastEnqueued = -1;
+
+  /// 累计「小窗在显示、进度在走、但一帧都没进图层」的时长。
+  double _noFrameSeconds = 0;
+
+  /// 累计「小窗在显示、连播放进度都不走了」的时长。
+  double _sourceStoppedSeconds = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick();
+    _timer = Timer.periodic(const Duration(milliseconds: 700), (_) => _tick());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _copiedTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _tick() async {
+    if (_busy) return;
+    _busy = true;
+    try {
+      final data = await widget.controller.pictureInPictureDiagnostics();
+      if (!mounted) return;
+      _accumulate(data);
+      setState(() {
+        _data = data;
+        _error = null;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      _busy = false;
+    }
+  }
+
+  /// 两次采样之间「进度走没走、帧进没进图层」，累积成两个秒数。
+  void _accumulate(Map<String, Object?> data) {
+    final now = DateTime.now();
+    final position = _num(data['position']);
+    final enqueued = _num(data['enqueued']);
+    final showing = data['showing'] == true;
+    final last = _lastAt;
+    if (last != null && showing && position >= 0 && _lastPosition >= 0) {
+      final dt = now.difference(last).inMilliseconds / 1000.0;
+      if (dt > 0.05) {
+        final moved = position - _lastPosition;
+        if (moved < dt * 0.3) {
+          _sourceStoppedSeconds += dt;
+        } else if (enqueued == _lastEnqueued) {
+          _noFrameSeconds += dt;
+        }
+      }
+    }
+    _lastAt = now;
+    _lastPosition = position;
+    _lastEnqueued = enqueued;
+  }
+
+  static double _num(Object? value) {
+    if (value is num) return value.toDouble();
+    return -1;
+  }
+
+  static String _text(Object? value) {
+    if (value == null) return '-';
+    if (value is bool) return value ? '是' : '否';
+    if (value is num) {
+      final d = value.toDouble();
+      return d == d.roundToDouble() ? d.round().toString() : d.toStringAsFixed(2);
+    }
+    return '$value';
+  }
+
+  String get _verdict {
+    if (_data.isEmpty) return '正在读取…（原生侧还没建小窗控制器）';
+    if (_data['showing'] != true) return '小窗没在显示：先按 Home 让它自动进小窗';
+    if (_noFrameSeconds >= 1.5) {
+      return '帧没送进小窗：累计 ${_noFrameSeconds.round()} 秒';
+    }
+    if (_sourceStoppedSeconds >= 1.5) {
+      return '播放源停了：累计 ${_sourceStoppedSeconds.round()} 秒';
+    }
+    return '画面在出帧';
+  }
+
+  Color get _verdictColor {
+    if (_data.isEmpty || _data['showing'] != true) return Colors.orangeAccent;
+    if (_noFrameSeconds >= 1.5 || _sourceStoppedSeconds >= 1.5) {
+      return Colors.redAccent;
+    }
+    return Colors.lightGreenAccent;
+  }
+
+  List<List<String>> get _rows => [
+        ['小窗显示', _text(_data['showing'])],
+        ['已武装', _text(_data['armed'])],
+        ['系统允许', _text(_data['possible'])],
+        ['小窗已显示(秒)', _text(_data['sinceShow'])],
+        ['入队成功', _text(_data['enqueued'])],
+        ['入队尝试', _text(_data['attempt'])],
+        ['未就绪', _text(_data['notReady'])],
+        ['未武装', _text(_data['notArmed'])],
+        ['限流', _text(_data['throttled'])],
+        ['拷贝失败', _text(_data['copyNil'])],
+        ['补帧恢复', _text(_data['stallRecover'])],
+        ['渲染为空', _text(_data['renderNil'])],
+        ['恢复刷新', _text(_data['resumeFlush'])],
+        ['保活定时器', _text(_data['timerTicks'])],
+        ['图层可写', _text(_data['layerReady'])],
+        ['图层隐藏', _text(_data['layerHidden'])],
+        ['图层状态', _text(_data['layerStatus'])],
+        ['画面源在窗口', _text(_data['hostAttached'])],
+        ['App 状态', _text(_data['appState'])],
+        ['音频会话', _text(_data['audioActive'])],
+        ['音频被占', _text(_data['audioOtherPlaying'])],
+        ['暂停', _text(_data['paused'])],
+        ['进度(秒)', _text(_data['position'])],
+        ['时间轴速率', _text(_data['timebaseRate'])],
+        ['窗口尺寸', _text(_data['windowBounds'])],
+      ];
+
+  String get _plainText {
+    final lines = <String>['结论：$_verdict'];
+    for (final row in _rows) {
+      lines.add('${row[0]}: ${row[1]}');
+    }
+    if (_error != null) lines.add('读取失败：$_error');
+    return lines.join('\n');
+  }
+
+  Future<void> _copy() async {
+    try {
+      await Clipboard.setData(ClipboardData(text: _plainText));
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+      return;
+    }
+    if (!mounted) return;
+    _copiedTimer?.cancel();
+    setState(() => _copied = true);
+    _copiedTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _copied = false);
+    });
+  }
+
+  Future<void> _toggleInWindow() async {
+    final next = !_inWindow;
+    try {
+      await widget.controller.setPictureInPictureDebugOverlay(next);
+      if (mounted) setState(() => _inWindow = next);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Text(
+                  '小窗诊断',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: _copy,
+                  child: Text(
+                    _copied ? '已复制' : '复制读数',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _toggleInWindow,
+                  child: Text(
+                    _inWindow ? '不画进小窗' : '画进小窗',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: _inWindow ? Colors.lightGreenAccent : null,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => Navigator.of(context).maybePop(),
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.close, color: Colors.white70, size: 20),
+                ),
+              ],
+            ),
+            const Text(
+              '打开这个面板 → 按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论',
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white10,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _verdict,
+                style: TextStyle(
+                  color: _verdictColor,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final row in _rows)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 3),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                row[0],
+                                style: const TextStyle(
+                                  color: Colors.white54,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              row[1],
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    if (_error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          '读取失败：$_error',
+                          style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
           ],
