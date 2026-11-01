@@ -180,7 +180,9 @@ class ShortVideo {
       desc: '${json['desc'] ?? ''}',
       author: '${json['author'] ?? ''}',
       cover: '${json['cover'] ?? ''}',
-      durationMs: _int(json['durationMS']) ?? 0,
+      durationMs: json['durationMS'] is num
+          ? (json['durationMS'] as num).toInt()
+          : int.tryParse('${json['durationMS'] ?? ''}') ?? 0,
       playUrl: playUrl,
       videoId: '${json['videoID'] ?? json['videoId'] ?? ''}',
       updatedAt: (json['updatedAt'] as num?)?.toDouble() ?? 0,
