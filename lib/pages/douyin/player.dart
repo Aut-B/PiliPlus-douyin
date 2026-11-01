@@ -736,6 +736,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _showToast('${next}x');
   }
 
+  /// 双击画面：暂停 / 继续。
+  ///
+  /// 和站内播放器一致：单击呼出控制条，双击直接暂停或继续，
+  /// 不用去够底下那个按钮（单手看竖屏视频时尤其顺手）。
+  void _togglePlayPause() {
+    final player = _player;
+    if (player == null) return;
+    final willPause = _playing;
+    player.playOrPause();
+    _flashHint(willPause ? '暂停' : '播放');
+    if (!_showControls) setState(() => _showControls = true);
+    _scheduleHide();
+  }
+
   void _toggleControls() {
     setState(() => _showControls = !_showControls);
     if (_showControls) _scheduleHide();
@@ -908,6 +922,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: _toggleControls,
+            onDoubleTap: _togglePlayPause,
             onVerticalDragStart: _onVerticalStart,
             onVerticalDragUpdate: _onVerticalUpdate,
             onHorizontalDragStart: _onHorizontalStart,
