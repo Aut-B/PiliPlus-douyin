@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
+import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:flutter/services.dart'
     show DeviceOrientation, SystemChrome, SystemUiMode;
@@ -242,6 +243,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (mounted) setState(() => _pipActive = false);
       _showToast('画中画启动失败：$e');
     }
+  }
+
+  /// 播放页里直接把抖音 / TikTok 的视频插到「下一首」。
+  ///
+  /// 收藏列表那边也能加插队，但那样得先退出播放页——播放器就没了。
+  /// 所以播放页自己也留了一个入口。
+  Future<void> _openQueuePicker() async {
+    final all = ShortVideoRepo.loadAll();
+    if (all.isEmpty) {
+      _showToast('还没有抓到抖音 / TikTok 收藏');
+      return;
+    }
+    final picked = await showModalBottomSheet<ShortVideo>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1C1C1E),
+      builder: (context) => _QueuePickerSheet(videos: all),
+    );
+    if (picked == null || !mounted) return;
+    final entry = QueueEntry.fromShortVideo(picked);
+    if (entry.key == _current.key) {
+      _showToast('正在播的就是这条');
+      return;
+    }
+    _queue.insert(_index + 1, entry);
+    setState(() {});
+    _showToast('已插到下一首：${picked.title}');
   }
 
   /// 打开第 index 条。
@@ -750,6 +778,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               ),
             ),
             IconButton(
+              onPressed: _openQueuePicker,
+              tooltip: '插到下一首播放',
+              icon: const Icon(Icons.playlist_add, color: Colors.white),
+            ),
+            IconButton(
               onPressed: () => setState(() => _fill = !_fill),
               tooltip: _fill ? '适应屏幕' : '铺满屏幕',
               icon: Icon(
@@ -917,5 +950,139 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       );
     }
     return Center(child: AspectRatio(aspectRatio: _aspectRatio, child: video));
+  }
+}
+
+/// 播放页里挑一条抖音 / TikTok 视频插到「下一首」。
+class _QueuePickerSheet extends StatefulWidget {
+  const _QueuePickerSheet({required this.videos});
+
+  final List<ShortVideo> videos;
+
+  @override
+  State<_QueuePickerSheet> createState() => _QueuePickerSheetState();
+}
+
+class _QueuePickerSheetState extends State<_QueuePickerSheet> {
+  String _platform = 'douyin';
+
+  @override
+  Widget build(BuildContext context) {
+    final items = widget.videos.where((e) => e.platform == _platform).toList();
+    return SafeArea(
+      top: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * 0.6,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      '插到下一首播放',
+                      style: TextStyle(color: Colors.white, fontSize: 16),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close, color: Colors.white70),
+                  ),
+                ],
+              ),
+            ),
+            Row(
+              children: [
+                _tab('douyin', '抖音'),
+                _tab('tiktok', 'TikTok'),
+                const Spacer(),
+                Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Text(
+                    '${items.length} 条',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Flexible(
+              child: items.isEmpty
+                  ? const Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        '这个平台还没有收藏',
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    )
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: items.length,
+                      itemBuilder: (context, index) {
+                        final video = items[index];
+                        return ListTile(
+                          dense: true,
+                          leading: ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: SizedBox(
+                              width: 36,
+                              height: 48,
+                              child: video.cover.isEmpty
+                                  ? const ColoredBox(color: Colors.black26)
+                                  : Image.network(
+                                      video.cover,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, _, _) =>
+                                          const ColoredBox(color: Colors.black26),
+                                    ),
+                            ),
+                          ),
+                          title: Text(
+                            video.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
+                          ),
+                          subtitle: Text(
+                            video.durationText,
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 11,
+                            ),
+                          ),
+                          trailing: const Icon(
+                            Icons.playlist_add,
+                            color: Colors.white70,
+                          ),
+                          onTap: () => Navigator.of(context).pop(video),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tab(String id, String label) {
+    final active = _platform == id;
+    return TextButton(
+      onPressed: () => setState(() => _platform = id),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: active ? Colors.white : Colors.white54,
+          fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+        ),
+      ),
+    );
   }
 }
