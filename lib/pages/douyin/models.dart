@@ -240,9 +240,14 @@ abstract final class ShortVideoParser {
     Map<String, dynamic> item,
     ShortVideoPlatform platform,
   ) {
-    final id = '${item['aweme_id'] ?? item['id'] ?? ''}';
+    // 有的接口把条目包一层：{ "itemStruct": { ... } }（App 端格式）。
+    final nested = item['itemStruct'];
+    final source = nested is Map ? nested.cast<String, dynamic>() : item;
+
+    final id =
+        '${source['aweme_id'] ?? source['id'] ?? item['aweme_id'] ?? item['id'] ?? ''}';
     if (id.isEmpty) return null;
-    final video = item['video'];
+    final video = source['video'] ?? item['video'];
     if (video is! Map) return null;
     final videoMap = video.cast<String, dynamic>();
 
@@ -274,18 +279,20 @@ abstract final class ShortVideoParser {
         durationMs = (_int(videoMap['duration']) ?? 0) * 1000;
         cover =
             _string(videoMap['cover']) ??
+            _urlFromMap(videoMap['cover']) ??
             _string(videoMap['originCover']) ??
+            _urlFromMap(videoMap['originCover']) ??
             _firstUrl(videoMap, const ['cover', 'origin_cover']) ??
             '';
     }
 
     if (playUrl == null || playUrl.isEmpty) return null;
 
-    final author = item['author'];
+    final author = source['author'];
     return ShortVideo(
       id: id,
       platform: platform.id,
-      desc: _string(item['desc']) ?? '',
+      desc: _string(source['desc']) ?? _string(item['desc']) ?? '',
       author: author is Map
           ? (_string(author['nickname']) ?? _string(author['uniqueId']) ?? '')
           : '',
@@ -314,10 +321,19 @@ abstract final class ShortVideoParser {
   }
 
   static String? _tiktokPlayUrl(Map<String, dynamic> video) {
-    final direct = _string(video['playAddr']);
-    if (direct != null && direct.isNotEmpty) return direct;
-    final download = _string(video['downloadAddr']);
-    if (download != null && download.isNotEmpty) return download;
+    // 网页接口是字符串，App 接口是 { "UrlList": [...] }，两种都认。
+    for (final key in const [
+      'playAddr',
+      'downloadAddr',
+      'play_addr',
+      'download_addr',
+    ]) {
+      final entry = video[key];
+      final direct = _string(entry);
+      if (direct != null && direct.isNotEmpty) return direct;
+      final fromMap = _urlFromMap(entry);
+      if (fromMap != null) return fromMap;
+    }
     final bitrates = video['bitrateInfo'];
     if (bitrates is List) {
       for (final entry in bitrates) {
@@ -335,6 +351,19 @@ abstract final class ShortVideoParser {
       }
     }
     return _firstUrl(video, const ['play_addr', 'download_addr']);
+  }
+
+  /// `{ "UrlList": [...] }` / `{ "url_list": [...] }`
+  static String? _urlFromMap(Object? entry) {
+    if (entry is! Map) return null;
+    for (final key in const ['UrlList', 'url_list', 'urlList']) {
+      final urls = entry[key];
+      if (urls is! List) continue;
+      for (final url in urls) {
+        if (url is String && url.isNotEmpty) return url;
+      }
+    }
+    return null;
   }
 
   static String? _firstUrl(Map<String, dynamic> container, List<String> keys) {

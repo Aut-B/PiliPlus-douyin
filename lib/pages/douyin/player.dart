@@ -1,16 +1,35 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:flutter/services.dart'
+    show DeviceOrientation, SystemChrome;
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
+/// 播放顺序。
+enum ShortVideoLoopMode {
+  listLoop('列表循环', Icons.repeat),
+  singleLoop('单曲循环', Icons.repeat_one),
+  sequential('顺序播放', Icons.playlist_play),
+  shuffle('随机播放', Icons.shuffle);
+
+  const ShortVideoLoopMode(this.label, this.icon);
+
+  final String label;
+  final IconData icon;
+
+  ShortVideoLoopMode get next =>
+      ShortVideoLoopMode.values[(index + 1) % ShortVideoLoopMode.values.length];
+}
+
 /// 全屏播放抖音 / TikTok 收藏。
 ///
 /// 直接用 media_kit，而不是走 B 站视频页：这里没有 aid/cid、没有弹幕、没有
-/// 清晰度梯度，只有一条直链，加上用户要的单曲 / 列表循环。
+/// 清晰度梯度，只有一条直链，加上用户要的列表循环 / 单曲循环 / 顺序 / 随机。
 class ShortVideoPlayerPage extends StatefulWidget {
   const ShortVideoPlayerPage({
     super.key,
@@ -31,23 +50,42 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<String>? _errorSub;
+  StreamSubscription<int>? _widthSub;
+  StreamSubscription<int>? _heightSub;
 
   /// 已经探测过的播放地址（按 `platform:id` 缓存）。
   final Map<String, String> _resolved = {};
 
   late int _index;
-  bool _singleLoop = false;
+  ShortVideoLoopMode _mode = ShortVideoLoopMode.listLoop;
   bool _playing = false;
+  bool _retried = false;
+  int _videoWidth = 0;
+  int _videoHeight = 0;
 
   ShortVideo get _current => widget.videos[_index];
 
   ShortVideoPlatform get _platform =>
       ShortVideoPlatform.fromId(_current.platform) ?? ShortVideoPlatform.douyin;
 
+  /// 按视频自己的比例显示，横屏的就铺成横向，竖屏的就铺成竖向——不再强行 9:16。
+  double get _aspectRatio {
+    if (_videoWidth > 0 && _videoHeight > 0) {
+      return _videoWidth / _videoHeight;
+    }
+    return 9 / 16;
+  }
+
   @override
   void initState() {
     super.initState();
     _index = widget.index.clamp(0, widget.videos.length - 1);
+    // 竖屏视频很多，但也有横屏的；这一页允许横过来。
+    SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     _init();
   }
 
@@ -74,7 +112,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     });
     _errorSub = player.stream.error.listen((message) {
       if (!mounted || message.isEmpty) return;
-      _showToast('播放失败：$message');
+      _onPlaybackError(message);
+    });
+    _widthSub = player.stream.width.listen((value) {
+      if (mounted && value > 0) setState(() => _videoWidth = value);
+    });
+    _heightSub = player.stream.height.listen((value) {
+      if (mounted && value > 0) setState(() => _videoHeight = value);
     });
     setState(() {
       _player = player;
@@ -90,6 +134,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 不通再退回抓到的直链。
   Future<void> _openIndex(int index) async {
     final video = widget.videos[index];
+    _retried = false;
     var url = _resolved[video.key];
     if (url == null) {
       // 刚抓下来的签名直链最稳、也没有探测延迟；超过 30 分钟（放久了，
@@ -132,15 +177,51 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
   }
 
-  void _onCompleted() {
-    if (!mounted) return;
-    if (_singleLoop) {
+  /// 播不动先换另一个地址再试一次（长期地址 ⇄ 抓到的直链）。
+  void _onPlaybackError(String message) {
+    final video = _current;
+    final resolved = _resolved[video.key];
+    if (!_retried && resolved != null && resolved != video.playUrl) {
+      _retried = true;
+      _resolved[video.key] = video.playUrl;
+      _showToast('换备用地址重试');
       _openIndex(_index);
       return;
     }
-    final next = (_index + 1) % widget.videos.length;
-    setState(() => _index = next);
-    _openIndex(next);
+    _showToast('播放失败：$message');
+  }
+
+  void _onCompleted() {
+    if (!mounted) return;
+    switch (_mode) {
+      case ShortVideoLoopMode.singleLoop:
+        _openIndex(_index);
+      case ShortVideoLoopMode.sequential:
+        if (_index + 1 >= widget.videos.length) {
+          _showToast('已经是最后一条');
+          return;
+        }
+        setState(() => _index += 1);
+        _openIndex(_index);
+      case ShortVideoLoopMode.shuffle:
+        final next = _randomIndex();
+        setState(() => _index = next);
+        _openIndex(next);
+      case ShortVideoLoopMode.listLoop:
+        final next = (_index + 1) % widget.videos.length;
+        setState(() => _index = next);
+        _openIndex(next);
+    }
+  }
+
+  int _randomIndex() {
+    if (widget.videos.length <= 1) return _index;
+    final random = Random();
+    var next = _index;
+    while (next == _index) {
+      next = random.nextInt(widget.videos.length);
+    }
+    return next;
   }
 
   Future<void> _jump(int delta) async {
@@ -150,9 +231,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     await _openIndex(next);
   }
 
-  void _toggleLoop() {
-    setState(() => _singleLoop = !_singleLoop);
-    _showToast(_singleLoop ? '单个循环' : '列表循环');
+  void _cycleMode() {
+    setState(() => _mode = _mode.next);
+    _showToast(_mode.label);
   }
 
   void _showToast(String text) {
@@ -172,7 +253,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _completedSub?.cancel();
     _playingSub?.cancel();
     _errorSub?.cancel();
+    _widthSub?.cancel();
+    _heightSub?.cancel();
     _player?.dispose();
+    // 退出这一页后把方向交还给 App（Info.plist 里允许的就是这三个）。
+    SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     super.dispose();
   }
 
@@ -200,10 +290,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             else
               Center(
                 child: AspectRatio(
-                  aspectRatio: 9 / 16,
+                  aspectRatio: _aspectRatio,
                   child: SimpleVideo(
                     controller: controller,
                     fill: Colors.black,
+                    aspectRatio: _aspectRatio,
                   ),
                 ),
               ),
@@ -226,12 +317,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     ),
                   ),
                   IconButton(
-                    onPressed: _toggleLoop,
-                    tooltip: _singleLoop ? '单个循环' : '列表循环',
-                    icon: Icon(
-                      _singleLoop ? Icons.repeat_one : Icons.repeat,
-                      color: Colors.white,
-                    ),
+                    onPressed: _cycleMode,
+                    tooltip: _mode.label,
+                    icon: Icon(_mode.icon, color: Colors.white),
                   ),
                 ],
               ),
@@ -269,6 +357,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                       _roundButton(
                         icon: Icons.keyboard_arrow_down,
                         onTap: () => _jump(1),
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        _mode.label,
+                        style: const TextStyle(
+                          color: Colors.white54,
+                          fontSize: 12,
+                        ),
                       ),
                       const Spacer(),
                       Text(

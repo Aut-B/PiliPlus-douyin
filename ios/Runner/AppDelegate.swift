@@ -288,7 +288,7 @@ final class ShortVideoWebViewController: UIViewController {
 
   @objc private func toggleCollecting() {
     if collecting {
-      stopCollecting(message: "已停止，收到 \(received) 条")
+      stopCollecting(message: "已停止，收到 \(received) 段数据")
     } else {
       startCollecting()
     }
@@ -369,7 +369,7 @@ final class ShortVideoWebViewController: UIViewController {
     webView.evaluateJavaScript(
       "try{clearInterval(window.__kumoneDriver);window.__kumoneDriver=null;}catch(e){}"
     )
-    setStatus(message ?? "已抓取 \(received) 条")
+    setStatus(message ?? "已停止，收到 \(received) 段数据")
   }
 
   private func startTimer() {
@@ -388,7 +388,7 @@ final class ShortVideoWebViewController: UIViewController {
     guard collecting else { return }
     webView.evaluateJavaScript("window.scrollTo(0, document.body.scrollHeight);")
     if Date().timeIntervalSince(startedAt) > 300 {
-      stopCollecting(message: "抓取超时，已保留 \(received) 条")
+      stopCollecting(message: "抓取超时，收到 \(received) 段数据")
       return
     }
     if received == lastCount {
@@ -398,7 +398,7 @@ final class ShortVideoWebViewController: UIViewController {
       lastCount = received
     }
     if idleRounds >= 10 {
-      stopCollecting(message: "抓取完成，共 \(received) 条")
+      stopCollecting(message: "抓取完成，收到 \(received) 段数据")
     }
   }
 
@@ -419,7 +419,7 @@ extension ShortVideoWebViewController: WKScriptMessageHandler {
     received += 1
     emit("payload", ["body": body])
     if collecting {
-      statusLabel.text = "已抓取 \(received) 条…"
+      statusLabel.text = "收到 \(received) 段数据…"
     }
   }
 }

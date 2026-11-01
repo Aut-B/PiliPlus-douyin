@@ -24,6 +24,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   bool _syncing = false;
   String _status = '';
 
+  /// 原生一共回传了多少段响应（不等于视频条数）。
+  int _rawCount = 0;
+
   ShortVideoPlatform get platform => widget.platform;
 
   @override
@@ -73,6 +76,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   Future<void> _openWeb() async {
+    _rawCount = 0;
     ShortVideoWeb.onPayload = _ingest;
     ShortVideoWeb.onStatus = (text) {
       if (mounted) setState(() => _status = text);
@@ -92,8 +96,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   void _ingest(String body) {
+    _rawCount++;
     final parsed = ShortVideoParser.fromResponseBody(body, platform);
-    if (parsed.isEmpty) return;
+    if (parsed.isEmpty) {
+      if (mounted) {
+        setState(
+          () => _status = '收到 $_rawCount 段数据，解析出 0 条（字段可能变了）',
+        );
+      }
+      return;
+    }
 
     final indexById = <String, int>{
       for (var i = 0; i < _videos.length; i++) _videos[i].id: i,
