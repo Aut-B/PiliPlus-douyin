@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
+import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
@@ -99,6 +100,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// iOS 画中画：系统判定不支持时把按钮藏起来。
   bool _pipSupported = true;
   bool _pipActive = false;
+  bool _pipDebug = false;
 
   /// 正在把当前这条整条下到本地（顶栏转圈 + 百分比）。
   bool _downloading = false;
@@ -165,16 +167,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     // 老机型（6S 这类 2GB）上把解码缓冲压到最小：抖音 / TikTok 都是十几秒的
     // 短片段，缓冲再大也没用，只会把进程内存顶到被系统杀掉的边缘。
     await ShortVideoPerf.ensureProbed();
+    // 先把音频会话切成「播放」类，再让 mpv 起音频输出：
+    // 顺序反了的话 mpv 的 AO 会挂在 ambient 上，后台直接没声、进程被挂起。
+    unawaited(_setAudioSession(true));
     final lowMemory = ShortVideoPerf.lowMemory;
     final player = await Player.create(
       configuration: PlayerConfiguration(
         options: {
           'autoplay': 'yes',
           if (lowMemory) ...{
-            'cache': 'no',
-            'demuxer-max-bytes': '16MiB',
+            'demuxer-max-bytes': '24MiB',
             'demuxer-max-back-bytes': '4MiB',
-            'video-sync': 'audio',
           },
         },
       ),
@@ -188,6 +191,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _playingSub = player.stream.playing.listen((value) {
       if (value) {
         WakelockPlus.enable();
+        unawaited(_setAudioSession(true));
       } else {
         WakelockPlus.disable();
       }
@@ -248,6 +252,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       switch (event) {
         case 'start':
           setState(() => _pipActive = true);
+          // 小窗弹出正是系统开始接管渲染的时刻，会话若被抢占过就再扶一次。
+          unawaited(_setAudioSession(true));
         case 'restore':
         case 'stop':
           setState(() => _pipActive = false);
@@ -294,6 +300,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     } catch (e) {
       if (mounted) setState(() => _pipActive = false);
       _showToast('画中画启动失败：$e');
+    }
+  }
+
+  /// 长按画中画按钮：把小窗里的诊断读数打开 / 关掉。
+  ///
+  /// 打开后读数会直接画进小窗画面里：数字还在涨 = 帧送到了、卡在别处；
+  /// 数字也定住 = 帧根本没出（进程被挂起 / mpv 停了）。
+  Future<void> _togglePipDebug() async {
+    final controller = _controller;
+    if (controller == null) return;
+    final next = !_pipDebug;
+    setState(() => _pipDebug = next);
+    try {
+      await controller.setPictureInPictureDebugOverlay(next);
+      _showToast(next ? '小窗诊断读数已开（出帧/入队/位置）' : '小窗诊断读数已关');
+    } catch (e) {
+      _showToast('诊断开关失败：$e');
     }
   }
 
@@ -597,6 +620,27 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
   }
 
+  /// 我们有没有把音频会话打开（退出时只关自己开的）。
+  bool _audioActive = false;
+
+  /// 打开 / 关闭播放类音频会话。
+  ///
+  /// 这一步不能省：站内播放器在 `play()` 里会调 `audioSessionHandler.setActive(true)`，
+  /// 短视频页以前没调，App 用的还是插件默认的 ambient 类别——退到后台后系统不给
+  /// 后台音频，进程很快被挂起，mpv 不再出帧，画中画小窗就只剩反复重发的那一帧。
+  /// 6S 上尤其明显（内存小，挂起得更快）；B 站小窗没问题正是因为它走了这条路径。
+  Future<void> _setAudioSession(bool active) async {
+    if (active == _audioActive) return;
+    final handler = audioSessionHandler;
+    if (handler == null) return;
+    _audioActive = active;
+    try {
+      await handler.setActive(active);
+    } catch (_) {
+      _audioActive = !active;
+    }
+  }
+
   /// 把当前这条整条下到本地。
   ///
   /// TikTok 的直链一次一换，每次播放都要重新探测，慢得让人等不住；抖音换个
@@ -893,6 +937,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _ticker?.cancel();
     _hideTimer?.cancel();
     _hintTimer?.cancel();
+    unawaited(_setAudioSession(false));
     if (_pipActive) {
       // 小窗还开着就退出这一页：先收小窗，再把播放器交还。
       _controller?.setPictureInPicture(false);
@@ -1048,14 +1093,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               ),
             ),
             if (Platform.isIOS && _pipSupported)
-              IconButton(
-                onPressed: _togglePip,
-                tooltip: _pipActive ? '退出画中画' : '画中画',
-                icon: Icon(
-                  _pipActive
-                      ? Icons.picture_in_picture_alt
-                      : Icons.picture_in_picture_outlined,
-                  color: Colors.white,
+              GestureDetector(
+                onLongPress: _togglePipDebug,
+                child: IconButton(
+                  onPressed: _togglePip,
+                  tooltip: _pipActive ? '退出画中画' : '画中画（长按：诊断读数）',
+                  icon: Icon(
+                    _pipActive
+                        ? Icons.picture_in_picture_alt
+                        : Icons.picture_in_picture_outlined,
+                    color: Colors.white,
+                  ),
                 ),
               ),
           ],
