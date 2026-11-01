@@ -50,8 +50,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<String>? _errorSub;
-  StreamSubscription<int>? _widthSub;
-  StreamSubscription<int>? _heightSub;
 
   /// 已经探测过的播放地址（按 `platform:id` 缓存）。
   final Map<String, String> _resolved = {};
@@ -114,12 +112,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (!mounted || message.isEmpty) return;
       _onPlaybackError(message);
     });
-    _widthSub = player.stream.width.listen((value) {
-      if (mounted && value > 0) setState(() => _videoWidth = value);
-    });
-    _heightSub = player.stream.height.listen((value) {
-      if (mounted && value > 0) setState(() => _videoHeight = value);
-    });
+
     setState(() {
       _player = player;
       _controller = controller;
@@ -150,6 +143,34 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _resolved[video.key] = url;
     }
     await _player?.open(Media(url), play: true);
+    _syncVideoSize();
+  }
+
+  /// 这个 fork 的 `PlayerStream` 没有 width/height，只能从 `state` 上取；
+  /// 换源之后要等几百毫秒才有值，所以轮询几次。
+  void _syncVideoSize() {
+    var tries = 0;
+    Future.doWhile(() async {
+      if (!mounted) return false;
+      final player = _player;
+      if (player != null) {
+        final w = player.state.width;
+        final h = player.state.height;
+        if (w > 0 && h > 0) {
+          if (w != _videoWidth || h != _videoHeight) {
+            setState(() {
+              _videoWidth = w;
+              _videoHeight = h;
+            });
+          }
+          return false;
+        }
+      }
+      tries++;
+      if (tries > 40) return false;
+      await Future.delayed(const Duration(milliseconds: 250));
+      return true;
+    });
   }
 
   /// 只取两个字节确认能播，别把整段视频拉下来。
@@ -253,8 +274,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _completedSub?.cancel();
     _playingSub?.cancel();
     _errorSub?.cancel();
-    _widthSub?.cancel();
-    _heightSub?.cancel();
     _player?.dispose();
     // 退出这一页后把方向交还给 App（Info.plist 里允许的就是这三个）。
     SystemChrome.setPreferredOrientations(const [
