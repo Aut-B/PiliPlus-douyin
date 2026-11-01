@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io' show File, Platform;
 import 'dart:math';
 
+import 'package:PiliPlus/build_config.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/perf.dart';
@@ -328,13 +329,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         if (mounted) setState(() => _pipActive = false);
         return;
       }
+      // 每次都重新问系统：视频还没起播时 `isPictureInPictureSupported` 会返回
+      // false，把 `_pipSupported` 钉死会让右上角图标一起消失。
       final supported = await controller.isPictureInPictureSupported();
       if (!mounted) return;
       if (!supported) {
         setState(() => _pipSupported = false);
-        _showToast('当前机型不支持画中画（系统判定）');
+        _showToast('系统说这台机器现在不能画中画；诊断入口还在，长按画面可打开');
         return;
       }
+      if (!_pipSupported) setState(() => _pipSupported = true);
       await controller.setPictureInPicture(true);
       if (mounted) setState(() => _pipActive = true);
     } catch (e) {
@@ -372,6 +376,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       backgroundColor: const Color(0xFF1C1C1E),
       builder: (_) => _QueueSheet(
         queue: _queue,
+        onDiagnostics: () {
+          Navigator.of(context).pop();
+          _openPipDiagnostics();
+        },
         currentKey: () => _current.key,
         onPlay: _jumpTo,
         onRemove: _removeAt,
@@ -1033,6 +1041,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             behavior: HitTestBehavior.opaque,
             onTap: _toggleControls,
             onDoubleTap: _togglePlayPause,
+            // 兜底入口：找不到右上角那个心率图标时，长按画面 1 秒也能拉出诊断面板。
+            onLongPress: _openPipDiagnostics,
             onVerticalDragStart: _onVerticalStart,
             onVerticalDragUpdate: _onVerticalUpdate,
             onHorizontalDragStart: _onHorizontalStart,
@@ -1158,10 +1168,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 color: Colors.white,
               ),
             ),
-            if (Platform.isIOS && _pipSupported)
+            if (Platform.isIOS)
               IconButton(
                 onPressed: _openPipDiagnostics,
-                tooltip: '小窗诊断读数',
+                tooltip: '小窗诊断读数（长按画面也能打开）',
                 visualDensity: VisualDensity.compact,
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
@@ -1170,7 +1180,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                   color: Colors.white,
                 ),
               ),
-            if (Platform.isIOS && _pipSupported)
+            if (Platform.isIOS)
               // 长按不要挂 Tooltip：Tooltip 自己会吃长按（这正是之前「长按只弹提示、
               // 读数永远打不开」的原因）。现在长按直接打开诊断面板。
               GestureDetector(
@@ -1181,7 +1191,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     _pipActive
                         ? Icons.picture_in_picture_alt
                         : Icons.picture_in_picture_outlined,
-                    color: Colors.white,
+                    // 系统说不能画中画时压暗，但按钮留着——否则两个图标一起消失，
+                    // 用户就再也找不到诊断入口了。
+                    color: _pipActive || _pipSupported
+                        ? Colors.white
+                        : Colors.white38,
                   ),
                 ),
               ),
@@ -1488,6 +1502,7 @@ class _QueuePickerSheetState extends State<_QueuePickerSheet> {
 class _QueueSheet extends StatefulWidget {
   const _QueueSheet({
     required this.queue,
+    required this.onDiagnostics,
     required this.currentKey,
     required this.onPlay,
     required this.onRemove,
@@ -1496,6 +1511,7 @@ class _QueueSheet extends StatefulWidget {
   });
 
   final List<QueueEntry> queue;
+  final VoidCallback onDiagnostics;
   final String Function() currentKey;
   final void Function(int index) onPlay;
   final void Function(int index) onRemove;
@@ -1549,6 +1565,11 @@ class _QueueSheetState extends State<_QueueSheet> {
                         fontSize: 16,
                       ),
                     ),
+                  ),
+                  _mini(
+                    Icons.monitor_heart_outlined,
+                    widget.onDiagnostics,
+                    tip: '小窗诊断读数',
                   ),
                   _mini(
                     Icons.playlist_add,
@@ -1872,7 +1893,10 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
       ];
 
   String get _plainText {
-    final lines = <String>['结论：$_verdict'];
+    final lines = <String>[
+      '结论：$_verdict',
+      '版本：${BuildConfig.versionName}(${BuildConfig.versionCode})',
+    ];
     for (final row in _rows) {
       lines.add('${row[0]}: ${row[1]}');
     }
@@ -1916,12 +1940,17 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
           children: [
             Row(
               children: [
-                const Text(
-                  '小窗诊断',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
+                Flexible(
+                  child: Text(
+                    '小窗诊断 · ${BuildConfig.versionName}'
+                    '(${BuildConfig.versionCode})',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
                 const Spacer(),
@@ -1950,7 +1979,8 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
               ],
             ),
             const Text(
-              '打开这个面板 → 按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论',
+              '入口：右上角心率图标 / 长按画面 1 秒 / 播放队列右上角。'
+              '进来后按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论',
               style: TextStyle(color: Colors.white38, fontSize: 11),
             ),
             const SizedBox(height: 8),
