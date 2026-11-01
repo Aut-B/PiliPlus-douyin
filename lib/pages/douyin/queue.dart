@@ -71,6 +71,7 @@ class QueueMedia {
     required this.userAgent,
     required this.referer,
     this.isLocal = false,
+    this.cookie = '',
   });
 
   /// 可能是普通 http 地址、本地文件路径，也可能是 media_kit 的 `edl://`
@@ -81,6 +82,9 @@ class QueueMedia {
 
   /// 本地缓存文件：播放器直接开文件，不再走网络。
   final bool isLocal;
+
+  /// 网页那套 cookie（CDN 会按会话校验，TikTok 不带就是 403）。
+  final String cookie;
 }
 
 /// 「下一首播放」的临时插队队列。
@@ -125,9 +129,12 @@ const tiktokAppUserAgent =
     'Chrome/99.0.4844.88 Mobile Safari/537.36';
 
 /// 把一个条目解析成可播放地址。失败返回 null（播放器会跳到下一条）。
-Future<QueueMedia?> resolveQueueEntry(QueueEntry entry) async {
+Future<QueueMedia?> resolveQueueEntry(
+  QueueEntry entry, {
+  String cookie = '',
+}) async {
   if (entry.short case final video?) {
-    return _resolveShortVideo(video);
+    return _resolveShortVideo(video, cookie);
   }
   if (entry.bvid case final bvid?) {
     return _resolveBili(bvid);
@@ -139,13 +146,13 @@ Future<QueueMedia?> resolveQueueEntry(QueueEntry entry) async {
 ///
 /// TikTok 的长期地址只认 App UA（见 [tiktokAppUserAgent]），所以探成功之后
 /// 播放也必须带同一个 UA，否则「探通了、播不了」。
-Future<QueueMedia?> _resolveShortVideo(ShortVideo video) async {
+Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
   final platform =
       ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
   final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
   if (!fresh) {
-    final stable = await _probeStable(video, platform);
+    final stable = await _probeStable(video, platform, cookie);
     if (stable != null) {
       return QueueMedia(
         url: stable,
@@ -153,6 +160,7 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video) async {
             ? tiktokAppUserAgent
             : platform.userAgent,
         referer: platform.referer,
+        cookie: cookie,
       );
     }
   }
@@ -161,9 +169,10 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video) async {
       url: video.playUrl,
       userAgent: platform.userAgent,
       referer: platform.referer,
+      cookie: cookie,
     );
   }
-  final stable = await _probeStable(video, platform);
+  final stable = await _probeStable(video, platform, cookie);
   if (stable == null) return null;
   return QueueMedia(
     url: stable,
@@ -171,6 +180,7 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video) async {
         ? tiktokAppUserAgent
         : platform.userAgent,
     referer: platform.referer,
+    cookie: cookie,
   );
 }
 
@@ -195,24 +205,36 @@ List<String> stableUrls(ShortVideo video) {
   ];
 }
 
-Future<String?> _probeStable(ShortVideo video, ShortVideoPlatform platform) async {
+Future<String?> _probeStable(
+  ShortVideo video,
+  ShortVideoPlatform platform,
+  String cookie,
+) async {
   final userAgent = platform == ShortVideoPlatform.tiktok
       ? tiktokAppUserAgent
       : platform.userAgent;
   for (final url in stableUrls(video)) {
-    if (await _probe(url, userAgent, platform.referer)) return url;
+    if (await _probe(url, userAgent, platform.referer, cookie)) return url;
   }
   return null;
 }
 
 /// 只取两个字节确认能播，别把整段视频拉下来。
-Future<bool> _probe(String url, String userAgent, String referer) async {
+Future<bool> _probe(
+  String url,
+  String userAgent,
+  String referer,
+  String cookie,
+) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
   try {
     final request = await client.getUrl(Uri.parse(url));
     request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
     request.headers.set(HttpHeaders.userAgentHeader, userAgent);
     request.headers.set(HttpHeaders.refererHeader, referer);
+    if (cookie.isNotEmpty) {
+      request.headers.set(HttpHeaders.cookieHeader, cookie);
+    }
     final response = await request.close().timeout(const Duration(seconds: 6));
     final mime = response.headers.contentType?.mimeType ?? '';
     final ok =

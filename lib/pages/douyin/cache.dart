@@ -3,12 +3,24 @@ import 'dart:io';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 
+/// 一次缓存下载的结果。[path] 有值表示成功，否则 [error] 说明卡在哪一步。
+class ShortVideoDownload {
+  const ShortVideoDownload({this.path, this.error});
+
+  final String? path;
+  final String? error;
+
+  bool get ok => path != null;
+}
+
 /// 短视频的本地媒体缓存。
 ///
-/// 抖音 / TikTok 网页里抄到的直链是签名地址，一是会过期，二是 TikTok 的 CDN
-/// 对「非浏览器」的取流（media_kit 走的 libmpv）经常整条拒掉——表现就是每条都
-/// 要「换地址重试」还播不出来。这里用 Dart 自己的 HttpClient（带网页那套 UA /
-/// Referer）把整条视频下到本地再播，和 Kumone 里「TikTok 走缓存」是同一条路。
+/// 抖音 / TikTok 网页里抄到的直链是签名地址，一是会过期，二是 CDN 会按网页
+/// 会话校验（TikTok 尤其严）。Kumone 那边用 URLSession 下载，天然和 WKWebView
+/// 共用 cookie，所以下得动；Dart 的 HttpClient 是独立 cookie 罐，一个都不带，
+/// 结果就是「缓存中 0% → 直链和缓存都失败了」。
+///
+/// 所以这里必须显式带上网页的 cookie（见 ShortVideoWeb.cookieHeader）。
 abstract final class ShortVideoMediaCache {
   static Directory? _dir;
 
@@ -18,9 +30,7 @@ abstract final class ShortVideoMediaCache {
   static Future<Directory> _ensureDir() async {
     final cached = _dir;
     if (cached != null && await cached.exists()) return cached;
-    final dir = Directory(
-      '$tmpDirPath${Platform.pathSeparator}short_video',
-    );
+    final dir = Directory('$tmpDirPath${Platform.pathSeparator}short_video');
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
@@ -30,7 +40,9 @@ abstract final class ShortVideoMediaCache {
   static Future<File> _fileFor(ShortVideo video) async {
     final dir = await _ensureDir();
     final safeId = video.id.replaceAll(RegExp(r'[^0-9A-Za-z_-]'), '_');
-    return File('${dir.path}${Platform.pathSeparator}${video.platform}_$safeId.mp4');
+    return File(
+      '${dir.path}${Platform.pathSeparator}${video.platform}_$safeId.mp4',
+    );
   }
 
   /// 已经有完整文件就返回路径，否则 null。
@@ -48,64 +60,101 @@ abstract final class ShortVideoMediaCache {
     }
   }
 
-  /// 下载到本地；成功返回文件路径，全部地址都失败返回 null。
-  ///
-  /// [urls] 按顺序试，前一个失败换下一个。[onProgress] 传 0~1，用来在播放页
-  /// 显示「缓存中 42%」。
-  static Future<String?> download(
+  /// 下载到本地。[urls] 按顺序试，前一个失败换下一个。
+  static Future<ShortVideoDownload> download(
     ShortVideo video, {
     required List<String> urls,
     required String userAgent,
     required String referer,
+    String cookie = '',
+    String appUserAgent = '',
     void Function(double progress)? onProgress,
   }) async {
     final key = '${video.platform}:${video.id}';
-    if (_inFlight.contains(key)) return localPath(video);
+    if (_inFlight.contains(key)) {
+      final existing = await localPath(video);
+      return ShortVideoDownload(
+        path: existing,
+        error: existing == null ? '这条正在下载' : null,
+      );
+    }
     _inFlight.add(key);
     try {
       final existing = await localPath(video);
-      if (existing != null) return existing;
+      if (existing != null) return ShortVideoDownload(path: existing);
       final target = await _fileFor(video);
+      final errors = <String>[];
       for (final url in urls) {
         if (url.isEmpty) continue;
-        final ok = await _fetch(
+        final error = await _fetch(
           url,
           target,
-          userAgent: userAgent,
+          userAgent: _uaFor(url, userAgent, appUserAgent),
           referer: referer,
+          cookie: cookie,
           onProgress: onProgress,
         );
-        if (ok) return target.path;
+        if (error == null) return ShortVideoDownload(path: target.path);
+        errors.add('${_hostOf(url)}: $error');
       }
-      return null;
+      return ShortVideoDownload(
+        error: errors.isEmpty ? '没有可用的地址' : errors.join(' / '),
+      );
     } finally {
       _inFlight.remove(key);
     }
   }
 
-  static Future<bool> _fetch(
+  /// 长期地址（tiktokv.com）只认 App 的 UA，签名直链则要用网页 UA。
+  static String _uaFor(String url, String webUa, String appUa) {
+    if (appUa.isEmpty) return webUa;
+    final host = _hostOf(url).toLowerCase();
+    if (host.contains('tiktokv.com') || host.contains('snssdk.com')) {
+      return appUa;
+    }
+    return webUa;
+  }
+
+  static String _hostOf(String url) {
+    try {
+      return Uri.parse(url).host;
+    } catch (_) {
+      return url;
+    }
+  }
+
+  /// 成功返回 null，失败返回原因。
+  static Future<String?> _fetch(
     String url,
     File target, {
     required String userAgent,
     required String referer,
+    required String cookie,
     void Function(double progress)? onProgress,
   }) async {
     final part = File('${target.path}.part');
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8)
+      ..maxConnectionsPerHost = 4;
     IOSink? sink;
     try {
       final request = await client.getUrl(Uri.parse(url));
       request.headers.set(HttpHeaders.userAgentHeader, userAgent);
       request.headers.set(HttpHeaders.refererHeader, referer);
-      final response = await request.close().timeout(const Duration(seconds: 12));
+      if (cookie.isNotEmpty) {
+        request.headers.set(HttpHeaders.cookieHeader, cookie);
+      }
+      final response = await request.close().timeout(
+        const Duration(seconds: 15),
+      );
       if (response.statusCode != 200 && response.statusCode != 206) {
         await response.drain<void>();
-        return false;
+        return 'HTTP ${response.statusCode}';
       }
       final mime = response.headers.contentType?.mimeType ?? '';
       if (mime.contains('html')) {
         await response.drain<void>();
-        return false;
+        return '返回的是网页不是视频';
       }
       final total = response.contentLength;
       var received = 0;
@@ -121,18 +170,23 @@ abstract final class ShortVideoMediaCache {
       sink = null;
       if (received <= 0) {
         if (await part.exists()) await part.delete();
-        return false;
+        return '下载到 0 字节';
       }
       if (await target.exists()) await target.delete();
       await part.rename(target.path);
       onProgress?.call(1);
-      return true;
-    } catch (_) {
-      return false;
-    } finally {
+      return null;
+    } catch (e) {
       try {
         await sink?.close();
       } catch (_) {}
+      if (await part.exists()) {
+        try {
+          await part.delete();
+        } catch (_) {}
+      }
+      return '$e';
+    } finally {
       client.close(force: true);
     }
   }

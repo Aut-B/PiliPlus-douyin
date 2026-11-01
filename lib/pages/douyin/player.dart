@@ -6,6 +6,7 @@ import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
+import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
@@ -16,6 +17,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// 播放顺序。
 enum ShortVideoLoopMode {
@@ -82,6 +84,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   /// 正在处理一次播放错误（一次 open 会连报好几条）。
   bool _busy = false;
+
+  /// 这一条已经判过「播完」，避免 ticker 和 completed 双触发。
+  bool _completionFired = false;
   bool _fill = false;
   bool _landscape = false;
   bool _showControls = true;
@@ -161,6 +166,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
 
     _playingSub = player.stream.playing.listen((value) {
+      if (value) {
+        WakelockPlus.enable();
+      } else {
+        WakelockPlus.disable();
+      }
       if (mounted) setState(() => _playing = value);
     });
     _completedSub = player.stream.completed.listen((completed) {
@@ -177,7 +187,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (current == null || !mounted) return;
       final position = current.state.position;
       final duration = current.state.duration;
+      // 播到末尾自己判一次：media_kit 的 completed 在换源 / 小窗之后并不总触发，
+      // 只靠它的话「自动连播」和「下一首」就是死的。
+      if (duration > Duration.zero &&
+          position > Duration.zero &&
+          duration - position <= const Duration(milliseconds: 500) &&
+          !_completionFired) {
+        _onCompleted();
+      }
+      // 真的播起来了才算这条没问题，别再在 open() 之后立刻清跳数。
+      if (position > const Duration(seconds: 2)) _skipped = 0;
       if (position == _position && duration == _duration) return;
+      if (_pipActive) {
+        // 小窗里不需要 Flutter 重绘，少给 6S 这类老机器添负担。
+        _position = position;
+        _duration = duration;
+        return;
+      }
       setState(() {
         _position = position;
         _duration = duration;
@@ -291,6 +317,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _position = Duration.zero;
     _duration = Duration.zero;
     _seekPreview = null;
+    _completionFired = false;
     var media = _resolved[entry.key];
     if (media == null) {
       media = await _resolve(entry);
@@ -302,13 +329,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
     final player = _player;
     if (player == null || !mounted) return;
+    final headers = <String, String>{};
+    if (media.cookie.isNotEmpty) headers['Cookie'] = media.cookie;
     player.setMediaHeader(
       userAgent: media.userAgent,
       referer: media.referer,
+      headers: headers,
     );
     await player.open(Media(media.url), play: true);
     await player.setRate(_speed);
-    _skipped = 0;
     _syncVideoSize();
     if (_pipActive) {
       final controller = _controller;
@@ -325,21 +354,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 本地已经有缓存就直接播本地（TikTok 基本都走这条）。
   Future<QueueMedia?> _resolve(QueueEntry entry) async {
     final video = entry.short;
-    if (video != null) {
-      final local = await ShortVideoMediaCache.localPath(video);
-      if (local != null) {
-        final platform =
-            ShortVideoPlatform.fromId(video.platform) ??
-            ShortVideoPlatform.douyin;
-        return QueueMedia(
-          url: local,
-          userAgent: platform.userAgent,
-          referer: platform.referer,
-          isLocal: true,
-        );
-      }
+    if (video == null) return resolveQueueEntry(entry);
+    final platform =
+        ShortVideoPlatform.fromId(video.platform) ??
+        ShortVideoPlatform.douyin;
+    final local = await ShortVideoMediaCache.localPath(video);
+    if (local != null) {
+      return QueueMedia(
+        url: local,
+        userAgent: platform.userAgent,
+        referer: platform.referer,
+        isLocal: true,
+      );
     }
-    return resolveQueueEntry(entry);
+    // CDN 会按网页会话校验，cookie 必须跟着走。
+    final cookie = await ShortVideoWeb.cookieHeader(
+      platform.cookieDomainNeedle,
+    );
+    return resolveQueueEntry(entry, cookie: cookie);
   }
 
   /// 解析不出来就跳下一条；连跳一圈还不行就停下来说清楚。
@@ -430,11 +462,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     ];
     if (!mounted) return;
     setState(() => _hint = '缓存中 0%');
-    final path = await ShortVideoMediaCache.download(
+    final cookie = await ShortVideoWeb.cookieHeader(
+      platform.cookieDomainNeedle,
+    );
+    if (!mounted) return;
+    final result = await ShortVideoMediaCache.download(
       video,
       urls: urls,
       userAgent: platform.userAgent,
       referer: platform.referer,
+      cookie: cookie,
+      appUserAgent: platform == ShortVideoPlatform.tiktok
+          ? tiktokAppUserAgent
+          : '',
       onProgress: (progress) {
         if (!mounted) return;
         final percent = (progress * 100).round();
@@ -444,8 +484,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
     if (!mounted) return;
     setState(() => _hint = null);
+    final path = result.path;
     if (path == null) {
-      _showToast('直链和缓存都失败了');
+      _showToast('缓存失败：${result.error ?? '未知原因'}');
       _skipBroken(_index);
       return;
     }
@@ -461,7 +502,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   void _onCompleted() {
-    if (!mounted) return;
+    if (!mounted || _completionFired) return;
+    _completionFired = true;
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
     switch (_mode) {
@@ -680,6 +722,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _controller?.setPictureInPicture(false);
     }
     _player?.dispose();
+    WakelockPlus.disable();
     ScreenBrightnessPlatform.instance.resetApplicationScreenBrightness();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     // 退出这一页后把方向交还给 App（Info.plist 里允许的就是这三个）。

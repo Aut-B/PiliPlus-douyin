@@ -11,6 +11,7 @@ import 'package:PiliPlus/models/common/fav_order_type.dart';
 import 'package:PiliPlus/models_new/fav/fav_detail/media.dart';
 import 'package:PiliPlus/models_new/fav/fav_folder/list.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/dynamics_repost/view.dart';
 import 'package:PiliPlus/pages/fav_detail/controller.dart';
@@ -358,6 +359,38 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
     SmartDialog.showToast('已加入下一首播放（待播 ${QueueBus.pending} 条）');
   }
 
+  /// 把选中的 B 站视频加进「播放列表」——那份列表里抖音 / TikTok 也在，
+  /// 三个收藏夹靠它互通。
+  void _addSelectedToPlaylist() {
+    final items = <PlaylistItem>[];
+    for (final item in _favDetailController.allChecked) {
+      final bvid = item.bvid;
+      if (bvid == null || bvid.isEmpty) continue;
+      items.add(
+        PlaylistItem.fromBili(
+          bvid: bvid,
+          title: item.title ?? '视频',
+          author: item.upper?.name ?? '',
+          cover: item.cover ?? '',
+          durationMs: (item.duration ?? 0) * 1000,
+        ),
+      );
+    }
+    if (items.isEmpty) {
+      SmartDialog.showToast('选中的里面没有可播放的视频');
+      return;
+    }
+    final added = ShortVideoPlaylistRepo.add(items);
+    if (added == 0) {
+      SmartDialog.showToast('这些已经在播放列表里了');
+      return;
+    }
+    _favDetailController.handleSelect();
+    SmartDialog.showToast(
+      '已加入播放列表（共 ${ShortVideoPlaylistRepo.length} 条）',
+    );
+  }
+
   List<QueueEntry> _checkedEntries() {
     final entries = <QueueEntry>[];
     for (final item in _favDetailController.allChecked) {
@@ -393,6 +426,11 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
         style: btnStyle,
         onPressed: _queueSelectedNext,
         child: const Text('下一首'),
+      ),
+      TextButton(
+        style: btnStyle,
+        onPressed: _addSelectedToPlaylist,
+        child: const Text('列表'),
       ),
       TextButton(
         style: btnStyle,

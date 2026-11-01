@@ -70,6 +70,24 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
     case "stop":
       webController?.stopCollecting()
       result(nil)
+    case "cookies":
+      // 抖音 / TikTok 的 CDN 会按网页会话校验：Kumone 用 URLSession 下载时
+      // 自动带上了 WKWebView 存在 HTTPCookieStorage 里的 cookie，而 Dart 的
+      // HttpClient 是独立 cookie 罐，一个都不带——这就是「Kumone 下得动、
+      // PiliPlus 0%」的根因。这里把网页的 cookie 交出去。
+      let needle = (call.arguments as? [String: Any])?["domain"] as? String ?? ""
+      WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+        let list: [[String: String]] = cookies.compactMap { cookie in
+          if !needle.isEmpty, !cookie.domain.contains(needle) { return nil }
+          return [
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+          ]
+        }
+        DispatchQueue.main.async { result(list) }
+      }
     default:
       result(FlutterMethodNotImplemented)
     }

@@ -2,6 +2,7 @@ import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
@@ -284,6 +285,28 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     setState(() {});
   }
 
+  /// 加进「播放列表」（B 站 / 抖音 / TikTok 混在一起播的那份）。
+  void _addToPlaylist(Iterable<ShortVideo> videos) {
+    final added = ShortVideoPlaylistRepo.add(
+      videos.map(PlaylistItem.fromShortVideo),
+    );
+    if (added == 0) {
+      SmartDialog.showToast('这些已经在播放列表里了');
+      return;
+    }
+    SmartDialog.showToast(
+      '已加入播放列表（共 ${ShortVideoPlaylistRepo.length} 条）',
+    );
+  }
+
+  void _addSelectedToPlaylist() {
+    if (_selected.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    _addToPlaylist(_videos.where((e) => _selected.contains(e.key)));
+  }
+
   void _queueSelectedNext() {
     if (_selected.isEmpty) {
       SmartDialog.showToast('先选几条');
@@ -299,6 +322,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       appBar: AppBar(
         title: Text(platform.title),
         actions: [
+          IconButton(
+            tooltip: '播放列表',
+            onPressed: () => Get.to(() => const ShortVideoPlaylistPage()),
+            icon: const Icon(Icons.queue_music),
+          ),
           IconButton(
             tooltip: 'WebDAV 同步',
             onPressed: _syncing ? null : () => _sync(),
@@ -436,6 +464,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   _play(index);
                 case 'next':
                   _queueNext([video]);
+                case 'playlist':
+                  _addToPlaylist([video]);
                 case 'delete':
                   _deleteOne(video);
               }
@@ -443,6 +473,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             itemBuilder: (context) => const [
               PopupMenuItem(value: 'play', child: Text('播放')),
               PopupMenuItem(value: 'next', child: Text('下一首播放')),
+              PopupMenuItem(value: 'playlist', child: Text('加入播放列表')),
               PopupMenuItem(value: 'delete', child: Text('删除（含缓存）')),
             ],
           ),
@@ -490,6 +521,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                     onPressed: _selected.isEmpty ? null : _queueSelectedNext,
                     icon: const Icon(Icons.queue_play_next),
                     label: Text('下一首 ${_selected.length} 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selected.isEmpty
+                        ? null
+                        : _addSelectedToPlaylist,
+                    icon: const Icon(Icons.playlist_add),
+                    label: Text('加入列表 ${_selected.length} 条'),
                   ),
                   OutlinedButton.icon(
                     onPressed: _selected.isEmpty ? null : _deleteSelected,

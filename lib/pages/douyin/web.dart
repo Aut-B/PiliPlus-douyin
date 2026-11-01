@@ -57,6 +57,51 @@ abstract final class ShortVideoWeb {
     });
   }
 
+  /// 网页那套 cookie。
+  ///
+  /// 抖音 / TikTok 的 CDN 会按网页会话校验（TikTok 尤其明显）；Kumone 那边用
+  /// URLSession 下载，天然和 WKWebView 共用 cookie，所以下得动。Dart 的
+  /// HttpClient 是独立 cookie 罐，不带就是 403 / 0 字节——这里把网页的 cookie
+  /// 取过来手动带上。
+  static final Map<String, String> _cookieCache = {};
+  static final Map<String, DateTime> _cookieAt = {};
+
+  static Future<String> cookieHeader(String domain) async {
+    if (domain.isEmpty) return '';
+    final at = _cookieAt[domain];
+    if (at != null &&
+        DateTime.now().difference(at) < const Duration(minutes: 5)) {
+      return _cookieCache[domain] ?? '';
+    }
+    _ensureHandler();
+    try {
+      final list = await _channel.invokeMethod<List<dynamic>>('cookies', {
+        'domain': domain,
+      });
+      if (list == null) return '';
+      final byName = <String, String>{};
+      for (final entry in list) {
+        if (entry is! Map) continue;
+        final name = '${entry['name'] ?? ''}';
+        final value = '${entry['value'] ?? ''}';
+        if (name.isEmpty) continue;
+        byName[name] = value;
+      }
+      final header = byName.entries
+          .map((e) => '${e.key}=${e.value}')
+          .join('; ');
+      _cookieCache[domain] = header;
+      _cookieAt[domain] = DateTime.now();
+      return header;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static void clearCookieCache() {
+    _cookieCache.clear();
+    _cookieAt.clear();
+  }
   static Future<void> start() => _channel.invokeMethod('start');
 
   static Future<void> stop() => _channel.invokeMethod('stop');
