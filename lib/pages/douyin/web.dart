@@ -57,6 +57,19 @@ abstract final class ShortVideoWeb {
     });
   }
 
+  /// 设备物理内存（字节）。取不到返回 0。
+  ///
+  /// 用来决定要不要走「低内存」那套保守策略（见 ShortVideoPerf）。
+  static Future<int> deviceMemory() async {
+    _ensureHandler();
+    try {
+      final bytes = await _channel.invokeMethod<int>('deviceMemory');
+      return bytes ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
   /// 网页那套 cookie。
   ///
   /// 抖音 / TikTok 的 CDN 会按网页会话校验（TikTok 尤其明显）；Kumone 那边用

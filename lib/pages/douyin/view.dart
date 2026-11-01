@@ -35,12 +35,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   bool _selecting = false;
   final Set<String> _selected = {};
 
+  /// 正在把选中的条目下到本地。
+  bool _caching = false;
+
+  /// 本地缓存目录占用（字节）。
+  int _cacheBytes = 0;
+
   ShortVideoPlatform get platform => widget.platform;
 
   @override
   void initState() {
     super.initState();
     _reload();
+    _refreshCacheSize();
     _status = _videos.isEmpty
         ? '还没有抓取到收藏，点下面「打开网页」登录后抓取'
         : '本地 ${_videos.length} 条';
@@ -273,6 +280,108 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     }
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
+  /// 刷新本地缓存占用。
+  Future<void> _refreshCacheSize() async {
+    final bytes = await ShortVideoMediaCache.size();
+    if (!mounted || bytes == _cacheBytes) return;
+    setState(() => _cacheBytes = bytes);
+  }
+
+  /// 清空短视频缓存目录。
+  Future<void> _clearCache() async {
+    final confirmed = await showConfirmDialog(
+      context: context,
+      title: const Text('清空本地缓存？'),
+      content: Text(
+        '会删掉已经下到本机的 ${_fmtBytes(_cacheBytes)} 视频文件。'
+        '收藏列表和 WebDAV 上的记录不受影响，下次播放会重新下载。',
+      ),
+    );
+    if (!confirmed || !mounted) return;
+    await ShortVideoMediaCache.clear();
+    await _refreshCacheSize();
+    if (mounted) SmartDialog.showToast('缓存已清空');
+  }
+
+  /// 把选中的条目整条下到本地。
+  ///
+  /// 串行下载：低内存机型上并发下载会直接把进程顶掉，CDN 也会限速。
+  /// 下过一次之后播放直接读文件，不再反复探测直链。
+  Future<void> _cacheVideos(List<ShortVideo> videos) async {
+    if (videos.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    if (_caching) {
+      SmartDialog.showToast('正在缓存中');
+      return;
+    }
+    setState(() => _caching = true);
+    var ok = 0;
+    var skipped = 0;
+    final failures = <String>[];
+    final cookie = await ShortVideoWeb.cookieHeader(
+      platform.cookieDomainNeedle,
+    );
+    for (var i = 0; i < videos.length; i++) {
+      if (!mounted) break;
+      final video = videos[i];
+      final existing = await ShortVideoMediaCache.localPath(video);
+      if (existing != null) {
+        skipped++;
+        continue;
+      }
+      setState(
+        () => _status = '缓存中 ${i + 1}/${videos.length}：${video.title}',
+      );
+      final urls = <String>[
+        if (video.playUrl.isNotEmpty) video.playUrl,
+        ...stableUrls(video),
+      ];
+      final result = await ShortVideoMediaCache.download(
+        video,
+        urls: urls,
+        userAgent: platform.userAgent,
+        referer: platform.referer,
+        cookie: cookie,
+        appUserAgent: platform == ShortVideoPlatform.tiktok
+            ? tiktokAppUserAgent
+            : '',
+      );
+      if (result.ok) {
+        ok++;
+      } else {
+        failures.add('${video.title}（${result.error}）');
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _caching = false;
+      _status = '缓存完成：新增 $ok 条'
+          '${skipped > 0 ? '，已有 $skipped 条' : ''}'
+          '${failures.isEmpty ? '' : '，失败 ${failures.length} 条'}';
+    });
+    await _refreshCacheSize();
+    if (failures.isNotEmpty) {
+      SmartDialog.showToast('失败：${failures.first}');
+    }
+  }
+
+  void _cacheSelected() {
+    if (_selected.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    _cacheVideos(_videos.where((e) => _selected.contains(e.key)).toList());
+  }
+
+  static String _fmtBytes(int bytes) {
+    if (bytes <= 0) return '0 MB';
+    final mb = bytes / 1024 / 1024;
+    if (mb >= 1024) return '${(mb / 1024).toStringAsFixed(1)} GB';
+    return '${mb.toStringAsFixed(mb >= 10 ? 0 : 1)} MB';
+  }
+
   /// 插到「下一首播放」：正在播的 B 站 / 抖音队列播完这一条就接上它。
   void _queueNext(Iterable<ShortVideo> videos) {
     final entries = videos.map(QueueEntry.fromShortVideo);
@@ -439,6 +548,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                         : Image.network(
                             video.cover,
                             fit: BoxFit.cover,
+                            cacheWidth: 180,
                             errorBuilder: (_, _, _) => Container(
                               color: theme.dividerColor.withValues(alpha: 0.1),
                             ),
@@ -466,6 +576,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   _queueNext([video]);
                 case 'playlist':
                   _addToPlaylist([video]);
+                case 'cache':
+                  _cacheVideos([video]);
                 case 'delete':
                   _deleteOne(video);
               }
@@ -474,6 +586,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               PopupMenuItem(value: 'play', child: Text('播放')),
               PopupMenuItem(value: 'next', child: Text('下一首播放')),
               PopupMenuItem(value: 'playlist', child: Text('加入播放列表')),
+              PopupMenuItem(value: 'cache', child: Text('缓存到本地')),
               PopupMenuItem(value: 'delete', child: Text('删除（含缓存）')),
             ],
           ),
@@ -491,11 +604,29 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(
-              _status,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _status,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                if (_cacheBytes > 0)
+                  TextButton(
+                    onPressed: _caching ? null : _clearCache,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    child: Text(
+                      '缓存 ${_fmtBytes(_cacheBytes)}',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(height: 8),
             if (_selecting)
@@ -528,6 +659,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                         : _addSelectedToPlaylist,
                     icon: const Icon(Icons.playlist_add),
                     label: Text('加入列表 ${_selected.length} 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selected.isEmpty || _caching
+                        ? null
+                        : _cacheSelected,
+                    icon: const Icon(Icons.download_for_offline_outlined),
+                    label: Text('缓存 ${_selected.length} 条'),
                   ),
                   OutlinedButton.icon(
                     onPressed: _selected.isEmpty ? null : _deleteSelected,

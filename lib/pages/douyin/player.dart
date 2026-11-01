@@ -1,9 +1,10 @@
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 import 'dart:math';
 
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
@@ -99,6 +100,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   bool _pipSupported = true;
   bool _pipActive = false;
 
+  /// 正在把当前这条整条下到本地（顶栏转圈 + 百分比）。
+  bool _downloading = false;
+  double _downloadProgress = 0;
+
+  /// 当前这条本地已经有完整缓存。
+  bool _cached = false;
+
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   Duration? _seekPreview;
@@ -154,9 +162,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   Future<void> _init() async {
+    // 老机型（6S 这类 2GB）上把解码缓冲压到最小：抖音 / TikTok 都是十几秒的
+    // 短片段，缓冲再大也没用，只会把进程内存顶到被系统杀掉的边缘。
+    await ShortVideoPerf.ensureProbed();
+    final lowMemory = ShortVideoPerf.lowMemory;
     final player = await Player.create(
-      configuration: const PlayerConfiguration(
-        options: {'autoplay': 'yes'},
+      configuration: PlayerConfiguration(
+        options: {
+          'autoplay': 'yes',
+          if (lowMemory) ...{
+            'cache': 'no',
+            'demuxer-max-bytes': '16MiB',
+            'demuxer-max-back-bytes': '4MiB',
+            'video-sync': 'audio',
+          },
+        },
       ),
     );
     final controller = await VideoController.create(player);
@@ -277,6 +297,65 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
   }
 
+  /// 播放队列面板：看得到「我在第几条」，也能当场增删、调顺序。
+  Future<void> _openQueueSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1C1C1E),
+      builder: (_) => _QueueSheet(
+        queue: _queue,
+        currentKey: () => _current.key,
+        onPlay: _jumpTo,
+        onRemove: _removeAt,
+        onMove: _move,
+        onAdd: () {
+          Navigator.of(context).pop();
+          _openQueuePicker();
+        },
+      ),
+    );
+  }
+
+  /// 跳到第 index 条。
+  Future<void> _jumpTo(int index) async {
+    if (index < 0 || index >= _queue.length || index == _index) return;
+    setState(() => _index = index);
+    await _openIndex(index);
+  }
+
+  /// 从队列里删一条。删掉正在播的那条就顺延到下一条。
+  void _removeAt(int index) {
+    if (index < 0 || index >= _queue.length) return;
+    if (_queue.length <= 1) {
+      _showToast('队列里只剩这一条了');
+      return;
+    }
+    final playing = _current.key;
+    setState(() {
+      _queue.removeAt(index);
+      final next = _queue.indexWhere((e) => e.key == playing);
+      _index = next >= 0 ? next : _index.clamp(0, _queue.length - 1);
+    });
+    if (!_queue.any((e) => e.key == playing)) {
+      // 正在播的那条被删了：接着播现在落在 _index 上的这条。
+      _openIndex(_index);
+    }
+  }
+
+  /// 调整顺序（上移 / 下移）。当前播放的那条跟着走，不会串台。
+  void _move(int from, int to) {
+    if (from < 0 || from >= _queue.length) return;
+    if (to < 0 || to >= _queue.length) return;
+    final playing = _current.key;
+    setState(() {
+      final entry = _queue.removeAt(from);
+      _queue.insert(to, entry);
+      final next = _queue.indexWhere((e) => e.key == playing);
+      if (next >= 0) _index = next;
+    });
+  }
+
   /// 播放页里直接把抖音 / TikTok 的视频插到「下一首」。
   ///
   /// 收藏列表那边也能加插队，但那样得先退出播放页——播放器就没了。
@@ -318,6 +397,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _duration = Duration.zero;
     _seekPreview = null;
     _completionFired = false;
+    _syncCachedState();
     var media = _resolved[entry.key];
     if (media == null) {
       media = await _resolve(entry);
@@ -499,6 +579,88 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
     _showToast('已缓存到本地，重新播放');
     await _openIndex(_index, resetRetry: false);
+  }
+
+  /// 刷新「当前这条有没有本地缓存」，顶栏据此显示已缓存。
+  void _syncCachedState() {
+    final video = _current.short;
+    if (video == null) {
+      if (_cached) setState(() => _cached = false);
+      return;
+    }
+    unawaited(
+      ShortVideoMediaCache.localPath(video).then((path) {
+        if (!mounted) return;
+        final value = path != null;
+        if (value != _cached) setState(() => _cached = value);
+      }),
+    );
+  }
+
+  /// 把当前这条整条下到本地。
+  ///
+  /// TikTok 的直链一次一换，每次播放都要重新探测，慢得让人等不住；抖音换个
+  /// 网络也会变。下成本地文件之后，播放、连播、小窗都直接读文件，跟在线一样
+  /// 快——6S 这种小内存机器尤其吃这一套。
+  Future<void> _downloadCurrent() async {
+    final entry = _current;
+    final video = entry.short;
+    if (video == null) {
+      _showToast('B 站视频请在视频页缓存');
+      return;
+    }
+    if (_downloading) return;
+    final platform =
+        ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
+    setState(() {
+      _downloading = true;
+      _downloadProgress = 0;
+    });
+    final cookie = await ShortVideoWeb.cookieHeader(platform.cookieDomainNeedle);
+    final urls = <String>[
+      if (video.playUrl.isNotEmpty) video.playUrl,
+      ...stableUrls(video),
+    ];
+    final result = await ShortVideoMediaCache.download(
+      video,
+      urls: urls,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      cookie: cookie,
+      appUserAgent:
+          platform == ShortVideoPlatform.tiktok ? tiktokAppUserAgent : '',
+      onProgress: (progress) {
+        if (!mounted) return;
+        setState(() => _downloadProgress = progress);
+      },
+    );
+    if (!mounted) return;
+    setState(() => _downloading = false);
+    final path = result.path;
+    if (path == null) {
+      _showToast('缓存失败：${result.error ?? '未知原因'}');
+      return;
+    }
+    final size = await _sizeText(path);
+    if (!mounted) return;
+    setState(() => _cached = true);
+    _resolved[entry.key] = QueueMedia(
+      url: path,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      isLocal: true,
+    );
+    _showToast('已缓存到本地（$size）');
+  }
+
+  static Future<String> _sizeText(String path) async {
+    try {
+      final bytes = await File(path).length();
+      final mb = bytes / 1024 / 1024;
+      return '${mb.toStringAsFixed(1)} MB';
+    } catch (_) {
+      return '完成';
+    }
   }
 
   void _onCompleted() {
@@ -818,6 +980,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                   ),
                   Text(
                     '${_index + 1}/${_queue.length} · ${_current.author}'
+                    '${_cached ? ' · 已缓存' : ''}'
                     '${pending > 0 ? ' · 插队 $pending' : ''}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -827,9 +990,39 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               ),
             ),
             IconButton(
-              onPressed: _openQueuePicker,
-              tooltip: '插到下一首播放',
-              icon: const Icon(Icons.playlist_add, color: Colors.white),
+              onPressed: _downloading ? null : _downloadCurrent,
+              tooltip: _downloading
+                  ? '缓存中 ${(_downloadProgress * 100).round()}%'
+                  : (_cached ? '已缓存（点按重新缓存）' : '缓存到本地'),
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+              icon: _downloading
+                  ? SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        value: _downloadProgress > 0
+                            ? _downloadProgress
+                            : null,
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : Icon(
+                      _cached
+                          ? Icons.download_done
+                          : Icons.download_for_offline_outlined,
+                      color: Colors.white,
+                    ),
+            ),
+            IconButton(
+              onPressed: _openQueueSheet,
+              tooltip: '播放队列',
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+              icon: const Icon(Icons.queue_music, color: Colors.white),
             ),
             IconButton(
               onPressed: () => setState(() => _fill = !_fill),
@@ -1085,6 +1278,7 @@ class _QueuePickerSheetState extends State<_QueuePickerSheet> {
                                   : Image.network(
                                       video.cover,
                                       fit: BoxFit.cover,
+                                      cacheWidth: 180,
                                       errorBuilder: (_, _, _) =>
                                           const ColoredBox(color: Colors.black26),
                                     ),
@@ -1130,6 +1324,188 @@ class _QueuePickerSheetState extends State<_QueuePickerSheet> {
         style: TextStyle(
           color: active ? Colors.white : Colors.white54,
           fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+        ),
+      ),
+    );
+  }
+}
+
+/// 播放队列面板：看得到「我在第几条」，也能当场增删、调顺序。
+class _QueueSheet extends StatefulWidget {
+  const _QueueSheet({
+    required this.queue,
+    required this.currentKey,
+    required this.onPlay,
+    required this.onRemove,
+    required this.onMove,
+    required this.onAdd,
+  });
+
+  final List<QueueEntry> queue;
+  final String Function() currentKey;
+  final void Function(int index) onPlay;
+  final void Function(int index) onRemove;
+  final void Function(int from, int to) onMove;
+  final VoidCallback onAdd;
+
+  @override
+  State<_QueueSheet> createState() => _QueueSheetState();
+}
+
+class _QueueSheetState extends State<_QueueSheet> {
+  String _tag(QueueEntry entry) {
+    if (entry.isBili) return 'B站';
+    return entry.short?.platform == 'tiktok' ? 'TikTok' : '抖音';
+  }
+
+  Widget _mini(IconData icon, VoidCallback? onTap, {String? tip}) {
+    return IconButton(
+      onPressed: onTap,
+      tooltip: tip,
+      icon: Icon(icon, size: 18),
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+      color: Colors.white70,
+      disabledColor: Colors.white24,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final current = widget.currentKey();
+    return SafeArea(
+      top: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * 0.72,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 6, 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '播放队列 ${widget.queue.length} 条',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ),
+                  _mini(
+                    Icons.playlist_add,
+                    widget.onAdd,
+                    tip: '加入抖音 / TikTok 视频',
+                  ),
+                  _mini(
+                    Icons.close,
+                    () => Navigator.of(context).pop(),
+                    tip: '关闭',
+                  ),
+                ],
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '点一条直接跳过去；↑↓ 调顺序，✕ 移出队列',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: widget.queue.length,
+                itemBuilder: (context, index) {
+                  final entry = widget.queue[index];
+                  final active = entry.key == current;
+                  return Container(
+                    color: active ? Colors.white12 : Colors.transparent,
+                    child: ListTile(
+                      dense: true,
+                      onTap: () {
+                        widget.onPlay(index);
+                        Navigator.of(context).pop();
+                      },
+                      leading: SizedBox(
+                        width: 26,
+                        child: Center(
+                          child: Text(
+                            active ? '▶' : '${index + 1}',
+                            style: TextStyle(
+                              color: active
+                                  ? Colors.lightGreenAccent
+                                  : Colors.white38,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        entry.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: active ? Colors.white : Colors.white70,
+                          fontSize: 13,
+                          fontWeight: active ? FontWeight.w600 : null,
+                        ),
+                      ),
+                      subtitle: Text(
+                        '${_tag(entry)} · ${entry.durationText}'
+                        '${active ? ' · 正在播放' : ''}',
+                        style: TextStyle(
+                          color: active
+                              ? Colors.lightGreenAccent
+                              : Colors.white38,
+                          fontSize: 11,
+                        ),
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _mini(
+                            Icons.keyboard_arrow_up,
+                            index == 0
+                                ? null
+                                : () {
+                                    widget.onMove(index, index - 1);
+                                    setState(() {});
+                                  },
+                          ),
+                          _mini(
+                            Icons.keyboard_arrow_down,
+                            index >= widget.queue.length - 1
+                                ? null
+                                : () {
+                                    widget.onMove(index, index + 1);
+                                    setState(() {});
+                                  },
+                          ),
+                          _mini(
+                            Icons.close,
+                            widget.queue.length <= 1
+                                ? null
+                                : () {
+                                    widget.onRemove(index);
+                                    setState(() {});
+                                  },
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
         ),
       ),
     );

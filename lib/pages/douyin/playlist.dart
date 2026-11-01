@@ -230,6 +230,17 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
     _reload();
   }
 
+  /// 上移 / 下移。顺序就是播放顺序，所以这里直接改存储。
+  void _move(int from, int to) {
+    if (from < 0 || from >= _items.length) return;
+    if (to < 0 || to >= _items.length) return;
+    final next = List<PlaylistItem>.of(_items);
+    final item = next.removeAt(from);
+    next.insert(to, item);
+    ShortVideoPlaylistRepo.save(next);
+    setState(() => _items = next);
+  }
+
   Future<void> _clear() async {
     if (_items.isEmpty) return;
     ShortVideoPlaylistRepo.clear();
@@ -271,6 +282,7 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
                           : Image.network(
                               item.cover,
                               fit: BoxFit.cover,
+                              cacheWidth: 180,
                               errorBuilder: (_, _, _) => Container(
                                 color: theme.dividerColor.withValues(
                                   alpha: 0.1,
@@ -290,10 +302,47 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  trailing: IconButton(
-                    tooltip: '移出播放列表',
-                    onPressed: () => _remove(item),
-                    icon: const Icon(Icons.remove_circle_outline),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: '上移',
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 34,
+                          minHeight: 34,
+                        ),
+                        onPressed: index == 0
+                            ? null
+                            : () => _move(index, index - 1),
+                        icon: const Icon(Icons.keyboard_arrow_up, size: 18),
+                      ),
+                      IconButton(
+                        tooltip: '下移',
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 34,
+                          minHeight: 34,
+                        ),
+                        onPressed: index >= _items.length - 1
+                            ? null
+                            : () => _move(index, index + 1),
+                        icon: const Icon(Icons.keyboard_arrow_down, size: 18),
+                      ),
+                      IconButton(
+                        tooltip: '移出播放列表',
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 34,
+                          minHeight: 34,
+                        ),
+                        onPressed: () => _remove(item),
+                        icon: const Icon(Icons.remove_circle_outline, size: 18),
+                      ),
+                    ],
                   ),
                 );
               },

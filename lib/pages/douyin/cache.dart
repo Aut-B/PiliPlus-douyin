@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 
 /// 一次缓存下载的结果。[path] 有值表示成功，否则 [error] 说明卡在哪一步。
@@ -70,6 +72,30 @@ abstract final class ShortVideoMediaCache {
     String appUserAgent = '',
     void Function(double progress)? onProgress,
   }) async {
+    // 串行下载：低内存机型上并发下载会把进程顶掉，CDN 也会限速。
+    return _serialized(
+      () => _download(
+        video,
+        urls: urls,
+        userAgent: userAgent,
+        referer: referer,
+        cookie: cookie,
+        appUserAgent: appUserAgent,
+        onProgress: onProgress,
+      ),
+    );
+  }
+
+  static Future<ShortVideoDownload> _download(
+    ShortVideo video, {
+    required List<String> urls,
+    required String userAgent,
+    required String referer,
+    String cookie = '',
+    String appUserAgent = '',
+    void Function(double progress)? onProgress,
+  }) async {
+    await ShortVideoPerf.ensureProbed();
     final key = '${video.platform}:${video.id}';
     if (_inFlight.contains(key)) {
       final existing = await localPath(video);
@@ -94,7 +120,10 @@ abstract final class ShortVideoMediaCache {
           cookie: cookie,
           onProgress: onProgress,
         );
-        if (error == null) return ShortVideoDownload(path: target.path);
+        if (error == null) {
+          unawaited(_prune());
+          return ShortVideoDownload(path: target.path);
+        }
         errors.add('${_hostOf(url)}: $error');
       }
       return ShortVideoDownload(
@@ -189,6 +218,51 @@ abstract final class ShortVideoMediaCache {
     } finally {
       client.close(force: true);
     }
+  }
+
+  /// 全局串行闸门：一次只跑一条下载。
+  static Future<void> _gate = Future<void>.value();
+
+  static Future<T> _serialized<T>(Future<T> Function() action) async {
+    final previous = _gate;
+    final done = Completer<void>();
+    _gate = done.future;
+    try {
+      await previous;
+      return await action();
+    } finally {
+      done.complete();
+    }
+  }
+
+  /// 超过上限就把最旧的删掉（低内存机型上限更小）。
+  static Future<void> _prune() async {
+    try {
+      final limit = ShortVideoPerf.cacheLimitBytes;
+      final dir = await _ensureDir();
+      if (!await dir.exists()) return;
+      final entries = <({File file, DateTime at, int size})>[];
+      var total = 0;
+      await for (final entity in dir.list()) {
+        if (entity is! File) continue;
+        if (entity.path.endsWith('.part')) continue;
+        try {
+          final size = await entity.length();
+          final at = await entity.lastModified();
+          total += size;
+          entries.add((file: entity, at: at, size: size));
+        } catch (_) {}
+      }
+      if (total <= limit) return;
+      entries.sort((a, b) => a.at.compareTo(b.at));
+      for (final entry in entries) {
+        if (total <= limit) break;
+        try {
+          await entry.file.delete();
+          total -= entry.size;
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   /// 删掉这一条的缓存（收藏里删条目时一并调）。

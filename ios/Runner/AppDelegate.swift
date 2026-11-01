@@ -88,6 +88,10 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
         }
         DispatchQueue.main.async { result(list) }
       }
+    case "deviceMemory":
+      // 设备物理内存（字节）。Dart 侧据此决定短视频走不走「低内存」那套策略
+      // （串行下载、缓存上限更小、解码缓冲压到最低）——6S 这类 2GB 机器顶不住。
+      result(Int(ProcessInfo.processInfo.physicalMemory))
     default:
       result(FlutterMethodNotImplemented)
     }
