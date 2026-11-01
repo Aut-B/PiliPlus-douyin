@@ -1,3 +1,4 @@
+import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
@@ -140,6 +141,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       }
     }
     if (changed == 0) return;
+    // 重新抓到了就撤掉删除墓碑，让它重新回到列表。
+    ShortVideoRepo.unmarkDeleted(platform, parsed.map((e) => e.key));
     ShortVideoRepo.save(platform, _videos);
     if (mounted) setState(() => _status = '已抓取 ${_videos.length} 条');
   }
@@ -201,12 +204,114 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   void _playAll() => _play(0);
 
-  void _clear() {
+  Future<void> _clear() async {
+    final keys = _videos.map((e) => e.key).toList();
+    final videos = List<ShortVideo>.of(_videos);
     setState(() {
       _videos.clear();
+      _selected.clear();
+      _selecting = false;
       _status = '已清空，可重新抓取';
     });
     ShortVideoRepo.save(platform, const []);
+    // 留墓碑：否则下一次同步会把这些条目从远端并回来。
+    ShortVideoRepo.markDeleted(platform, keys);
+    for (final video in videos) {
+      await ShortVideoMediaCache.remove(video);
+    }
+    if (ShortVideoSync.configured) await _sync(silent: true);
+  }
+
+  /// 删一条：本地列表 + 删除墓碑 + 本地缓存文件。
+  Future<void> _deleteOne(ShortVideo video) async {
+    final confirmed = await Get.dialog<bool>(
+      AlertDialog(
+        title: const Text('删除这条收藏？'),
+        content: Text(
+          '${video.title}\n\n'
+          '只删本机这一条，本地缓存文件也一起删掉；'
+          '下次同步时远端那份也会被排除。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Get.back(result: false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Get.back(result: true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() {
+      _videos.removeWhere((e) => e.key == video.key);
+      _selected.remove(video.key);
+      _status = '已删除 1 条，本地 ${_videos.length} 条';
+    });
+    ShortVideoRepo.save(platform, _videos);
+    ShortVideoRepo.markDeleted(platform, [video.key]);
+    await ShortVideoMediaCache.remove(video);
+    if (ShortVideoSync.configured) await _sync(silent: true);
+  }
+
+  /// 多选删除。
+  Future<void> _deleteSelected() async {
+    if (_selected.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    final targets = _videos.where((e) => _selected.contains(e.key)).toList();
+    final confirmed = await Get.dialog<bool>(
+      AlertDialog(
+        title: Text('删除所选的 ${targets.length} 条？'),
+        content: const Text('本地缓存文件会一起删掉，下次同步时远端那份也会被排除。'),
+        actions: [
+          TextButton(
+            onPressed: () => Get.back(result: false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Get.back(result: true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() {
+      _videos.removeWhere((e) => _selected.contains(e.key));
+      _status = '已删除 ${targets.length} 条，本地 ${_videos.length} 条';
+      _selected.clear();
+      _selecting = false;
+    });
+    ShortVideoRepo.save(platform, _videos);
+    ShortVideoRepo.markDeleted(platform, targets.map((e) => e.key));
+    for (final video in targets) {
+      await ShortVideoMediaCache.remove(video);
+    }
+    if (ShortVideoSync.configured) await _sync(silent: true);
+  }
+
+  /// 插到「下一首播放」：正在播的 B 站 / 抖音队列播完这一条就接上它。
+  void _queueNext(Iterable<ShortVideo> videos) {
+    final entries = videos.map(QueueEntry.fromShortVideo);
+    final added = QueueBus.addNext(entries);
+    if (added == 0) {
+      SmartDialog.showToast('这些已经在下一首队列里了');
+      return;
+    }
+    SmartDialog.showToast('已加入下一首播放（待播 ${QueueBus.pending} 条）');
+    setState(() {});
+  }
+
+  void _queueSelectedNext() {
+    if (_selected.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    _queueNext(_videos.where((e) => _selected.contains(e.key)));
   }
 
   @override
@@ -344,7 +449,25 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),
-          trailing: const Icon(Icons.play_circle_outline),
+          trailing: PopupMenuButton<String>(
+            tooltip: '更多',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              switch (value) {
+                case 'play':
+                  _play(index);
+                case 'next':
+                  _queueNext([video]);
+                case 'delete':
+                  _deleteOne(video);
+              }
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'play', child: Text('播放')),
+              PopupMenuItem(value: 'next', child: Text('下一首播放')),
+              PopupMenuItem(value: 'delete', child: Text('删除（含缓存）')),
+            ],
+          ),
         );
       },
     );
@@ -366,45 +489,54 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               ),
             ),
             const SizedBox(height: 8),
-            Row(
-              children: _selecting
-                  ? [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _videos.isEmpty ? null : _selectAll,
-                          icon: const Icon(Icons.select_all),
-                          label: Text(
-                            _selected.length == _videos.length &&
-                                    _videos.isNotEmpty
-                                ? '取消全选'
-                                : '全选',
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: FilledButton.icon(
-                          onPressed: _playSelected,
-                          icon: const Icon(Icons.playlist_play),
-                          label: Text('播放所选 ${_selected.length} 条'),
-                        ),
-                      ),
-                    ]
-                  : [
-                      Expanded(
-                        child: FilledButton.icon(
-                          onPressed: _openWeb,
-                          icon: const Icon(Icons.public),
-                          label: const Text('打开网页 / 抓取'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      OutlinedButton(
-                        onPressed: _videos.isEmpty ? null : _playAll,
-                        child: const Text('全部播放'),
-                      ),
-                    ],
-            ),
+            if (_selecting)
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _videos.isEmpty ? null : _selectAll,
+                    icon: const Icon(Icons.select_all),
+                    label: Text(
+                      _selected.length == _videos.length && _videos.isNotEmpty
+                          ? '取消全选'
+                          : '全选',
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: _playSelected,
+                    icon: const Icon(Icons.playlist_play),
+                    label: Text('播放所选 ${_selected.length} 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selected.isEmpty ? null : _queueSelectedNext,
+                    icon: const Icon(Icons.queue_play_next),
+                    label: Text('下一首 ${_selected.length} 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selected.isEmpty ? null : _deleteSelected,
+                    icon: const Icon(Icons.delete_outline),
+                    label: Text('删除 ${_selected.length} 条'),
+                  ),
+                ],
+              )
+            else
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _openWeb,
+                      icon: const Icon(Icons.public),
+                      label: const Text('打开网页 / 抓取'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  OutlinedButton(
+                    onPressed: _videos.isEmpty ? null : _playAll,
+                    child: const Text('全部播放'),
+                  ),
+                ],
+              ),
           ],
         ),
       ),

@@ -330,6 +330,35 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
   /// 全选 / 勾选之后「播放」：把选中的 B 站视频排成队列，
   /// 用短视频那套播放器连着播（队列里也能混进抖音 / TikTok）。
   void _playSelected() {
+    final entries = _checkedEntries();
+    if (entries.isEmpty) {
+      SmartDialog.showToast('选中的里面没有可播放的视频');
+      return;
+    }
+    _favDetailController.handleSelect();
+    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
+  }
+
+  /// 把选中的 B 站视频插到「下一首播放」。
+  ///
+  /// 正在播的队列可能是抖音 / TikTok 的收藏——插队队列是全局的，
+  /// 播完当前这条就接上这里的 B 站视频。
+  void _queueSelectedNext() {
+    final entries = _checkedEntries();
+    if (entries.isEmpty) {
+      SmartDialog.showToast('选中的里面没有可播放的视频');
+      return;
+    }
+    final added = QueueBus.addNext(entries);
+    if (added == 0) {
+      SmartDialog.showToast('这些已经在下一首队列里了');
+      return;
+    }
+    _favDetailController.handleSelect();
+    SmartDialog.showToast('已加入下一首播放（待播 ${QueueBus.pending} 条）');
+  }
+
+  List<QueueEntry> _checkedEntries() {
     final entries = <QueueEntry>[];
     for (final item in _favDetailController.allChecked) {
       final bvid = item.bvid;
@@ -344,12 +373,7 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
         ),
       );
     }
-    if (entries.isEmpty) {
-      SmartDialog.showToast('选中的里面没有可播放的视频');
-      return;
-    }
-    _favDetailController.handleSelect();
-    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
+    return entries;
   }
   List<Widget> _selectActions(ThemeData theme) {
     final btnStyle = TextButton.styleFrom(visualDensity: .compact);
@@ -364,6 +388,11 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
         style: btnStyle,
         onPressed: _playSelected,
         child: const Text('播放'),
+      ),
+      TextButton(
+        style: btnStyle,
+        onPressed: _queueSelectedNext,
+        child: const Text('下一首'),
       ),
       TextButton(
         style: btnStyle,

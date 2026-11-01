@@ -1,6 +1,5 @@
 import 'dart:io';
 
-
 import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
@@ -71,30 +70,64 @@ class QueueMedia {
     required this.url,
     required this.userAgent,
     required this.referer,
+    this.isLocal = false,
   });
 
-  /// 可能是普通 http 地址，也可能是 media_kit 的 `edl://`（B 站双流）。
+  /// 可能是普通 http 地址、本地文件路径，也可能是 media_kit 的 `edl://`
+  /// （B 站双流）。
   final String url;
   final String userAgent;
   final String referer;
+
+  /// 本地缓存文件：播放器直接开文件，不再走网络。
+  final bool isLocal;
+}
+
+/// 「下一首播放」的临时插队队列。
+///
+/// 播放页里排的是它自己那份队列（B 站收藏、抖音收藏各一份），两边互不相识。
+/// 用户要的是「播着 B 站收藏，把抖音里那几条插到下一首」——所以插队条目放在
+/// 这里，任何播放页在「上一条播完」时都先来这里取一条。
+abstract final class QueueBus {
+  static final List<QueueEntry> _next = [];
+
+  /// 已排队的条数（界面上给个反馈）。
+  static int get pending => _next.length;
+
+  static List<QueueEntry> get pendingEntries => List.unmodifiable(_next);
+
+  /// 插到队尾；重复的（同一条视频已经在队里）不重复加。
+  static int addNext(Iterable<QueueEntry> entries) {
+    var added = 0;
+    for (final entry in entries) {
+      if (_next.any((e) => e.key == entry.key)) continue;
+      _next.add(entry);
+      added++;
+    }
+    return added;
+  }
+
+  static QueueEntry? takeNext() => _next.isEmpty ? null : _next.removeAt(0);
+
+  static void clear() => _next.clear();
 }
 
 const _biliUserAgent =
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
     'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15';
 
+/// TikTok 的 `aweme/v1/play/` 只认 App 的 UA，桌面 Safari 的 UA 会被直接拒掉，
+/// 探出来全是 403——同步过来的 TikTok 一条都播不了就是这个原因。
+const tiktokAppUserAgent =
+    'com.zhiliaoapp.musically/2022803040 (Linux; U; Android 12; en; '
+    'Pixel 6; Build/SQ3A.220705.004;tt-ok/3.12.13.4-tiktok) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 '
+    'Chrome/99.0.4844.88 Mobile Safari/537.36';
+
 /// 把一个条目解析成可播放地址。失败返回 null（播放器会跳到下一条）。
 Future<QueueMedia?> resolveQueueEntry(QueueEntry entry) async {
   if (entry.short case final video?) {
-    final url = await _resolveShortVideo(video);
-    if (url == null || url.isEmpty) return null;
-    final platform =
-        ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
-    return QueueMedia(
-      url: url,
-      userAgent: platform.userAgent,
-      referer: platform.referer,
-    );
+    return _resolveShortVideo(video);
   }
   if (entry.bvid case final bvid?) {
     return _resolveBili(bvid);
@@ -103,27 +136,83 @@ Future<QueueMedia?> resolveQueueEntry(QueueEntry entry) async {
 }
 
 /// 抖音 / TikTok：30 分钟内的签名直链直接用，过期的先探长期地址。
-Future<String?> _resolveShortVideo(ShortVideo video) async {
+///
+/// TikTok 的长期地址只认 App UA（见 [tiktokAppUserAgent]），所以探成功之后
+/// 播放也必须带同一个 UA，否则「探通了、播不了」。
+Future<QueueMedia?> _resolveShortVideo(ShortVideo video) async {
+  final platform =
+      ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
   final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
   if (!fresh) {
-    final stable = video.stableUrl;
-    if (stable != null && await _probe(stable, video)) return stable;
+    final stable = await _probeStable(video, platform);
+    if (stable != null) {
+      return QueueMedia(
+        url: stable,
+        userAgent: platform == ShortVideoPlatform.tiktok
+            ? tiktokAppUserAgent
+            : platform.userAgent,
+        referer: platform.referer,
+      );
+    }
   }
-  if (video.playUrl.isNotEmpty) return video.playUrl;
-  return video.stableUrl;
+  if (video.playUrl.isNotEmpty) {
+    return QueueMedia(
+      url: video.playUrl,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+    );
+  }
+  final stable = await _probeStable(video, platform);
+  if (stable == null) return null;
+  return QueueMedia(
+    url: stable,
+    userAgent: platform == ShortVideoPlatform.tiktok
+        ? tiktokAppUserAgent
+        : platform.userAgent,
+    referer: platform.referer,
+  );
+}
+
+/// 老播放接口，多个域名各试一次（TikTok 单域名经常整片 403）。
+List<String> stableUrls(ShortVideo video) {
+  if (video.videoId.isEmpty) return const [];
+  final encoded = Uri.encodeComponent(video.videoId);
+  final hosts = video.platform == 'tiktok'
+      ? const [
+          'https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
+          'https://api19-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
+          'https://api22-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
+          'https://api-h2.tiktokv.com/aweme/v1/play/',
+          'https://api.tiktokv.com/aweme/v1/play/',
+        ]
+      : const [
+          'https://www.iesdouyin.com/aweme/v1/play/',
+          'https://aweme.snssdk.com/aweme/v1/play/',
+        ];
+  return [
+    for (final host in hosts) '$host?video_id=$encoded&ratio=720p&line=0',
+  ];
+}
+
+Future<String?> _probeStable(ShortVideo video, ShortVideoPlatform platform) async {
+  final userAgent = platform == ShortVideoPlatform.tiktok
+      ? tiktokAppUserAgent
+      : platform.userAgent;
+  for (final url in stableUrls(video)) {
+    if (await _probe(url, userAgent, platform.referer)) return url;
+  }
+  return null;
 }
 
 /// 只取两个字节确认能播，别把整段视频拉下来。
-Future<bool> _probe(String url, ShortVideo video) async {
-  final platform =
-      ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
+Future<bool> _probe(String url, String userAgent, String referer) async {
   final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
   try {
     final request = await client.getUrl(Uri.parse(url));
     request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
-    request.headers.set(HttpHeaders.userAgentHeader, platform.userAgent);
-    request.headers.set(HttpHeaders.refererHeader, platform.referer);
+    request.headers.set(HttpHeaders.userAgentHeader, userAgent);
+    request.headers.set(HttpHeaders.refererHeader, referer);
     final response = await request.close().timeout(const Duration(seconds: 6));
     final mime = response.headers.contentType?.mimeType ?? '';
     final ok =

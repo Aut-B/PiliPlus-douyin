@@ -63,6 +63,55 @@ abstract final class ShortVideoRepo {
     for (final platform in ShortVideoPlatform.values) ...load(platform),
   ];
 
+  // MARK: - 删除墓碑
+  //
+  // 同步是「本地 + 远端取并集」，删掉的条目下一次同步就会从远端回来。
+  // 所以删一条要留个墓碑，合并时按墓碑过滤，再把过滤后的结果推上去。
+
+  static String _deletedKey(ShortVideoPlatform platform) =>
+      'shortVideoDeleted_${platform.id}';
+
+  static Set<String> loadDeleted(ShortVideoPlatform platform) {
+    try {
+      final Object? raw = GStorage.localCache.get(
+        _deletedKey(platform),
+        defaultValue: '',
+      );
+      if (raw is! String || raw.isEmpty) return <String>{};
+      final Object? decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return decoded.whereType<String>().toSet();
+      }
+    } catch (_) {}
+    return <String>{};
+  }
+
+  static Set<String> loadAllDeleted() => {
+    for (final platform in ShortVideoPlatform.values)
+      ...loadDeleted(platform),
+  };
+
+  static void markDeleted(ShortVideoPlatform platform, Iterable<String> keys) {
+    final deleted = loadDeleted(platform)..addAll(keys);
+    try {
+      GStorage.localCache.put(
+        _deletedKey(platform),
+        jsonEncode(deleted.toList()),
+      );
+    } catch (_) {}
+  }
+
+  /// 重新抓到了这条：墓碑撤掉，让它重新进列表。
+  static void unmarkDeleted(ShortVideoPlatform platform, Iterable<String> keys) {
+    final deleted = loadDeleted(platform)..removeAll(keys);
+    try {
+      GStorage.localCache.put(
+        _deletedKey(platform),
+        jsonEncode(deleted.toList()),
+      );
+    } catch (_) {}
+  }
+
   /// 按平台分桶写回，返回每个平台实际落库的条数。
   static Map<String, int> saveAll(List<ShortVideo> all) {
     final written = <String, int>{};
@@ -180,10 +229,11 @@ abstract final class ShortVideoSync {
       return const ShortVideoSyncResult(douyin: 0, tiktok: 0, remote: -1);
     }
     final remote = await pull();
+    final deleted = ShortVideoRepo.loadAllDeleted();
     final merged = mergeShortVideos(
       ShortVideoRepo.loadAll(),
       remote?.items ?? const [],
-    );
+    ).where((e) => !deleted.contains(e.key)).toList();
     final written = ShortVideoRepo.saveAll(merged);
     await push(
       ShortVideoSyncDocument(

@@ -1,7 +1,11 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:math';
 
+import 'package:PiliPlus/pages/douyin/cache.dart';
+import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
+import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:flutter/services.dart'
     show DeviceOrientation, SystemChrome, SystemUiMode;
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -27,11 +31,14 @@ enum ShortVideoLoopMode {
       ShortVideoLoopMode.values[(index + 1) % ShortVideoLoopMode.values.length];
 }
 
-/// 全屏播放抖音 / TikTok 收藏。
+/// 全屏播放抖音 / TikTok / B 站收藏。
 ///
 /// 只有一条直链，没有 aid/cid、没有弹幕、没有清晰度梯度，所以不走 B 站视频页。
 /// 但交互按 B 站播放器那套做：进度条可拖、点一下暂停/呼出控制条、
 /// 左边上下滑调亮度、右边上下滑调音量、左右滑拖动进度。
+///
+/// iOS 上还接了系统级画中画（`VideoController.setPictureInPicture`），
+/// 和站内视频页用的是同一套原生实现。
 class ShortVideoPlayerPage extends StatefulWidget {
   const ShortVideoPlayerPage({
     super.key,
@@ -53,16 +60,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   StreamSubscription<bool>? _completedSub;
   StreamSubscription<bool>? _playingSub;
   StreamSubscription<String>? _errorSub;
+  StreamSubscription<String>? _pipEventSub;
+  StreamSubscription<String>? _pipErrorSub;
   Timer? _ticker;
   Timer? _hideTimer;
 
   /// 已经解析过的播放地址（按条目 key 缓存）。
   final Map<String, QueueMedia> _resolved = {};
 
+  /// 可变的那一份队列：播到一半可以被 [QueueBus] 插队。
+  late final List<QueueEntry> _queue = List<QueueEntry>.of(widget.queue);
+
   late int _index;
   ShortVideoLoopMode _mode = ShortVideoLoopMode.listLoop;
   bool _playing = false;
-  bool _retried = false;
+
+  /// 这一条已经重试到第几步：0 直链、1 备用地址、2 本地缓存。
+  int _retryStage = 0;
+
+  /// 正在处理一次播放错误（一次 open 会连报好几条）。
+  bool _busy = false;
   bool _fill = false;
   bool _landscape = false;
   bool _showControls = true;
@@ -70,6 +87,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   int _skipped = 0;
   int _videoWidth = 0;
   int _videoHeight = 0;
+
+  /// iOS 画中画：系统判定不支持时把按钮藏起来。
+  bool _pipSupported = true;
+  bool _pipActive = false;
 
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
@@ -79,7 +100,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   double _brightness = -1;
   double _speed = 1;
 
-  /// 手势过程中显示的小提示（亮度 / 音量 / 快进）。
+  /// 手势过程中显示的小提示（亮度 / 音量 / 快进 / 缓存进度）。
   String? _hint;
   Timer? _hintTimer;
 
@@ -89,7 +110,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Duration _dragTarget = Duration.zero;
   bool _dragOnProgress = false;
 
-  QueueEntry get _current => widget.queue[_index];
+  QueueEntry get _current => _queue[_index];
 
   /// 按视频自己的比例显示，横屏的就铺成横向，竖屏的就铺成竖向。
   double get _aspectRatio {
@@ -104,7 +125,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   void initState() {
     super.initState();
-    _index = widget.index.clamp(0, widget.queue.length - 1);
+    _index = widget.index.clamp(0, _queue.length - 1);
     SystemChrome.setPreferredOrientations(const [
       DeviceOrientation.portraitUp,
       DeviceOrientation.landscapeLeft,
@@ -165,17 +186,71 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _player = player;
       _controller = controller;
     });
+    _listenPip(controller);
     await _openIndex(_index);
     _scheduleHide();
+  }
+
+  // MARK: - 画中画（iOS 系统级）
+
+  void _listenPip(VideoController controller) {
+    if (!Platform.isIOS) return;
+    _pipEventSub ??= PictureInPicture.events.listen((event) {
+      if (!mounted) return;
+      switch (event) {
+        case 'start':
+          setState(() => _pipActive = true);
+        case 'restore':
+        case 'stop':
+          setState(() => _pipActive = false);
+      }
+    });
+    _pipErrorSub ??= PictureInPicture.errors.listen((message) {
+      if (!mounted) return;
+      setState(() => _pipActive = false);
+      _showToast(message);
+    });
+    // 「后台画中画」开关开着时，划回主屏幕自动弹小窗。
+    if (Pref.autoPiP) {
+      unawaited(
+        Future<void>.sync(
+          () => controller.setAutoEnterPictureInPicture(true),
+        ).catchError((_) {}),
+      );
+    }
+  }
+
+  Future<void> _togglePip() async {
+    final controller = _controller;
+    if (controller == null || !Platform.isIOS) return;
+    try {
+      if (_pipActive) {
+        await controller.setPictureInPicture(false);
+        if (mounted) setState(() => _pipActive = false);
+        return;
+      }
+      final supported = await controller.isPictureInPictureSupported();
+      if (!mounted) return;
+      if (!supported) {
+        setState(() => _pipSupported = false);
+        _showToast('当前机型不支持画中画（系统判定）');
+        return;
+      }
+      await controller.setPictureInPicture(true);
+      if (mounted) setState(() => _pipActive = true);
+    } catch (e) {
+      if (mounted) setState(() => _pipActive = false);
+      _showToast('画中画启动失败：$e');
+    }
   }
 
   /// 打开第 index 条。
   ///
   /// 抖音 / TikTok 的直链会过期，B 站还要先把 cid 和 playurl 要回来，
   /// 所以统一交给 resolveQueueEntry，解析不出来就自动跳下一条。
-  Future<void> _openIndex(int index) async {
-    final entry = widget.queue[index];
-    _retried = false;
+  Future<void> _openIndex(int index, {bool resetRetry = true}) async {
+    final entry = _queue[index];
+    if (resetRetry) _retryStage = 0;
     // 换源要换一代画面：media_kit 重开之后纹理 id 会变，
     // 不重建这一块就会出现「只有声音没有画面」。
     _epoch++;
@@ -184,7 +259,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _seekPreview = null;
     var media = _resolved[entry.key];
     if (media == null) {
-      media = await resolveQueueEntry(entry);
+      media = await _resolve(entry);
       if (media == null) {
         _skipBroken(index);
         return;
@@ -201,20 +276,51 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     await player.setRate(_speed);
     _skipped = 0;
     _syncVideoSize();
+    if (_pipActive) {
+      final controller = _controller;
+      if (controller != null) {
+        unawaited(
+          Future<void>.sync(
+            () => controller.preparePictureInPictureForNewMedia(),
+          ).catchError((_) {}),
+        );
+      }
+    }
+  }
+
+  /// 本地已经有缓存就直接播本地（TikTok 基本都走这条）。
+  Future<QueueMedia?> _resolve(QueueEntry entry) async {
+    final video = entry.short;
+    if (video != null) {
+      final local = await ShortVideoMediaCache.localPath(video);
+      if (local != null) {
+        final platform =
+            ShortVideoPlatform.fromId(video.platform) ??
+            ShortVideoPlatform.douyin;
+        return QueueMedia(
+          url: local,
+          userAgent: platform.userAgent,
+          referer: platform.referer,
+          isLocal: true,
+        );
+      }
+    }
+    return resolveQueueEntry(entry);
   }
 
   /// 解析不出来就跳下一条；连跳一圈还不行就停下来说清楚。
   void _skipBroken(int index) {
-    if (widget.queue.length <= 1 || _skipped >= widget.queue.length) {
+    if (_queue.length <= 1 || _skipped >= _queue.length) {
       _showToast('这条播不了');
       return;
     }
     _skipped++;
-    final next = (index + 1) % widget.queue.length;
+    final next = (index + 1) % _queue.length;
     if (!mounted) return;
     setState(() => _index = next);
     _openIndex(next);
   }
+
   /// 这个 fork 的 `PlayerStream` 没有 width/height，只能从 `state` 上取；
   /// 换源之后要等几百毫秒才有值，所以轮询几次。
   void _syncVideoSize() {
@@ -242,26 +348,93 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     });
   }
 
-  /// 播不动就清掉缓存重新解析一次（长期地址 ⇄ 抓到的直链），还不行就跳下一条。
-  void _onPlaybackError(String message) {
-    if (!_retried) {
-      _retried = true;
-      _resolved.remove(_current.key);
-      _showToast('换备用地址重试');
-      _openIndex(_index);
+  /// 播不动就分三级退：换备用地址 → 缓存到本地 → 跳下一条。
+  ///
+  /// media_kit 一次 open 往往会连报好几条 error，所以这里串行化：
+  /// 处理期间再来的错误直接丢掉，否则会一路退到「缓存」和「跳下一条」。
+  Future<void> _onPlaybackError(String message) async {
+    if (_busy) return;
+    _busy = true;
+    try {
+      final entry = _current;
+      if (_retryStage == 0) {
+        _retryStage = 1;
+        _resolved.remove(entry.key);
+        _showToast('换备用地址重试');
+        await _openIndex(_index, resetRetry: false);
+        return;
+      }
+      if (_retryStage == 1 && entry.short != null) {
+        _retryStage = 2;
+        await _cacheAndPlay(entry);
+        return;
+      }
+      _showToast('播放失败：$message');
+      _skipBroken(_index);
+    } finally {
+      _busy = false;
+    }
+  }
+  /// 直链怎么都播不了：用 HttpClient 整条下下来再播（TikTok 的老毛病）。
+  Future<void> _cacheAndPlay(QueueEntry entry) async {
+    final video = entry.short;
+    if (video == null) {
+      _skipBroken(_index);
       return;
     }
-    _showToast('播放失败：$message');
-    _skipBroken(_index);
+    // 本地文件也播不了 → 别再循环下载，直接跳。
+    if (await ShortVideoMediaCache.localPath(video) != null) {
+      _showToast('缓存文件也播不了');
+      _skipBroken(_index);
+      return;
+    }
+    final platform =
+        ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
+    final urls = <String>[
+      if (video.playUrl.isNotEmpty) video.playUrl,
+      ...stableUrls(video),
+    ];
+    if (!mounted) return;
+    setState(() => _hint = '缓存中 0%');
+    final path = await ShortVideoMediaCache.download(
+      video,
+      urls: urls,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      onProgress: (progress) {
+        if (!mounted) return;
+        final percent = (progress * 100).round();
+        if (_hint == '缓存中 $percent%') return;
+        setState(() => _hint = '缓存中 $percent%');
+      },
+    );
+    if (!mounted) return;
+    setState(() => _hint = null);
+    if (path == null) {
+      _showToast('直链和缓存都失败了');
+      _skipBroken(_index);
+      return;
+    }
+    _retryStage = 0;
+    _resolved[entry.key] = QueueMedia(
+      url: path,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      isLocal: true,
+    );
+    _showToast('已缓存到本地，重新播放');
+    await _openIndex(_index, resetRetry: false);
   }
 
   void _onCompleted() {
     if (!mounted) return;
+    // 「下一首播放」插队优先于本页的播放顺序。
+    if (_playInjectedNext()) return;
     switch (_mode) {
       case ShortVideoLoopMode.singleLoop:
         _openIndex(_index);
       case ShortVideoLoopMode.sequential:
-        if (_index + 1 >= widget.queue.length) {
+        if (_index + 1 >= _queue.length) {
           _showToast('已经是最后一条');
           return;
         }
@@ -272,25 +445,39 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         setState(() => _index = next);
         _openIndex(next);
       case ShortVideoLoopMode.listLoop:
-        final next = (_index + 1) % widget.queue.length;
+        final next = (_index + 1) % _queue.length;
         setState(() => _index = next);
         _openIndex(next);
     }
   }
 
+  /// 从 [QueueBus] 取一条插到当前条目后面。取到了返回 true。
+  bool _playInjectedNext() {
+    final injected = QueueBus.takeNext();
+    if (injected == null) return false;
+    if (injected.key == _current.key) {
+      // 正在播的那条又被排进来了，顺延到下一条。
+      return _playInjectedNext();
+    }
+    _queue.insert(_index + 1, injected);
+    setState(() => _index += 1);
+    _openIndex(_index);
+    return true;
+  }
+
   int _randomIndex() {
-    if (widget.queue.length <= 1) return _index;
+    if (_queue.length <= 1) return _index;
     final random = Random();
     var next = _index;
     while (next == _index) {
-      next = random.nextInt(widget.queue.length);
+      next = random.nextInt(_queue.length);
     }
     return next;
   }
 
   Future<void> _jump(int delta) async {
     final next = _index + delta;
-    if (next < 0 || next >= widget.queue.length) {
+    if (next < 0 || next >= _queue.length) {
       _showToast(delta > 0 ? '已经是最后一条' : '已经是第一条');
       return;
     }
@@ -425,7 +612,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       ..showSnackBar(
         SnackBar(
           content: Text(text),
-          duration: const Duration(milliseconds: 900),
+          duration: const Duration(milliseconds: 1200),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -449,9 +636,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _completedSub?.cancel();
     _playingSub?.cancel();
     _errorSub?.cancel();
+    _pipEventSub?.cancel();
+    _pipErrorSub?.cancel();
     _ticker?.cancel();
     _hideTimer?.cancel();
     _hintTimer?.cancel();
+    if (_pipActive) {
+      // 小窗还开着就退出这一页：先收小窗，再把播放器交还。
+      _controller?.setPictureInPicture(false);
+    }
     _player?.dispose();
     ScreenBrightnessPlatform.instance.resetApplicationScreenBrightness();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -510,6 +703,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   Widget _topBar() {
+    final pending = QueueBus.pending;
     return Positioned(
       top: 0,
       left: 0,
@@ -546,7 +740,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     style: const TextStyle(color: Colors.white, fontSize: 15),
                   ),
                   Text(
-                    '${_index + 1}/${widget.queue.length} · ${_current.author}',
+                    '${_index + 1}/${_queue.length} · ${_current.author}'
+                    '${pending > 0 ? ' · 插队 $pending' : ''}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Colors.white70, fontSize: 11),
@@ -562,6 +757,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 color: Colors.white,
               ),
             ),
+            if (Platform.isIOS && _pipSupported)
+              IconButton(
+                onPressed: _togglePip,
+                tooltip: _pipActive ? '退出画中画' : '画中画',
+                icon: Icon(
+                  _pipActive
+                      ? Icons.picture_in_picture_alt
+                      : Icons.picture_in_picture_outlined,
+                  color: Colors.white,
+                ),
+              ),
           ],
         ),
       ),
