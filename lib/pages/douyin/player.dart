@@ -6,7 +6,8 @@ import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
-import 'package:PiliPlus/utils/storage_pref.dart';
+import 'package:PiliPlus/utils/storage.dart';
+import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:flutter/services.dart'
     show DeviceOrientation, SystemChrome, SystemUiMode;
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -212,7 +213,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _showToast(message);
     });
     // 「后台画中画」开关开着时，划回主屏幕自动弹小窗。
-    if (Pref.autoPiP) {
+    // 默认值和站内播放器保持一致：iOS 上没设过就当开着。
+    final autoPiP = GStorage.setting.get(
+      SettingBoxKey.autoPiP,
+      defaultValue: true,
+    );
+    if (autoPiP) {
       unawaited(
         Future<void>.sync(
           () => controller.setAutoEnterPictureInPicture(true),
