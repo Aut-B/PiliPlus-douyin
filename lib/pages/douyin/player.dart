@@ -92,8 +92,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final video = widget.videos[index];
     var url = _resolved[video.key];
     if (url == null) {
+      // 刚抓下来的签名直链最稳、也没有探测延迟；超过 30 分钟（放久了，
+      // 或者是从另一台手机同步过来的）才去要不过期的地址。
+      final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
+      final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
       final stable = video.stableUrl;
-      if (stable != null && await _probe(stable, video)) {
+      if (!fresh && stable != null && await _probe(stable, video)) {
         url = stable;
       } else {
         url = video.playUrl;
@@ -108,13 +112,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final platform =
         ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
     final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 6);
+      ..connectionTimeout = const Duration(seconds: 4);
     try {
       final request = await client.getUrl(Uri.parse(url));
       request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
       request.headers.set(HttpHeaders.userAgentHeader, platform.userAgent);
       request.headers.set(HttpHeaders.refererHeader, platform.referer);
-      final response = await request.close().timeout(const Duration(seconds: 8));
+      final response = await request.close().timeout(const Duration(seconds: 6));
       final mime = response.headers.contentType?.mimeType ?? '';
       final ok =
           (response.statusCode == 200 || response.statusCode == 206) &&
