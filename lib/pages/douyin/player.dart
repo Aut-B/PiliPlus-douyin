@@ -58,6 +58,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   ShortVideoLoopMode _mode = ShortVideoLoopMode.listLoop;
   bool _playing = false;
   bool _retried = false;
+  bool _fill = false;
+  int _epoch = 0;
   int _videoWidth = 0;
   int _videoHeight = 0;
 
@@ -128,6 +130,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Future<void> _openIndex(int index) async {
     final video = widget.videos[index];
     _retried = false;
+    // 换源要换一代画面：media_kit 重开之后纹理 id 会变，
+    // 不重建这一块就会出现「只有声音没有画面」。
+    _epoch++;
     var url = _resolved[video.key];
     if (url == null) {
       // 刚抓下来的签名直链最稳、也没有探测延迟；超过 30 分钟（放久了，
@@ -307,16 +312,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             if (controller == null)
               const Center(child: CircularProgressIndicator())
             else
-              Center(
-                child: AspectRatio(
-                  aspectRatio: _aspectRatio,
-                  child: SimpleVideo(
-                    controller: controller,
-                    fill: Colors.black,
-                    aspectRatio: _aspectRatio,
-                  ),
-                ),
-              ),
+              _videoView(controller),
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
               left: 8,
@@ -333,6 +329,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: () => setState(() => _fill = !_fill),
+                    tooltip: _fill ? '适应屏幕' : '铺满屏幕',
+                    icon: Icon(
+                      _fill ? Icons.fit_screen : Icons.aspect_ratio,
+                      color: Colors.white,
                     ),
                   ),
                   IconButton(
@@ -399,6 +403,31 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         ),
       ),
     );
+  }
+
+  Widget _videoView(VideoController controller) {
+    final video = SimpleVideo(
+      key: ValueKey(_epoch),
+      controller: controller,
+      fill: Colors.black,
+      aspectRatio: _aspectRatio,
+    );
+    if (_fill) {
+      // 铺满：按原比例放大到盖住整屏，多出来的裁掉（抖音那种全屏观感）。
+      return ClipRect(
+        child: SizedBox.expand(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: 1000,
+              height: 1000 / _aspectRatio,
+              child: video,
+            ),
+          ),
+        ),
+      );
+    }
+    return Center(child: AspectRatio(aspectRatio: _aspectRatio, child: video));
   }
 
   Widget _roundButton({required IconData icon, required VoidCallback onTap}) {

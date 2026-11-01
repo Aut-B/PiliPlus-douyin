@@ -41,6 +41,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   void _reload() {
     final stored = ShortVideoRepo.load(platform);
+    if (!mounted) return;
     setState(() {
       _videos
         ..clear()
@@ -61,11 +62,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     }
     setState(() => _syncing = true);
     try {
-      final count = await ShortVideoSync.synchronize();
-      _reload();
+      final result = await ShortVideoSync.synchronize();
       if (!mounted) return;
-      setState(() => _status = '已同步，共 $count 条');
-      if (!silent) SmartDialog.showToast('同步完成，共 $count 条');
+      _reload();
+      var text = '已同步：${result.summary}';
+      if (_videos.isEmpty && result.total > 0) {
+        // 总数不为 0、本页却是空的：说明那些条目不属于当前平台，
+        // 或者落库失败。两种都在 summary 里写清楚了，别再说「同步成功」。
+        text = '同步到 ${result.total} 条，但${platform.album}一条都没有（${result.summary}）';
+      } else if (_videos.isNotEmpty) {
+        text = '$text；本页 ${_videos.length} 条';
+      }
+      setState(() => _status = text);
+      if (!silent) SmartDialog.showToast(text);
     } catch (e) {
       if (!mounted) return;
       setState(() => _status = '同步失败：$e');

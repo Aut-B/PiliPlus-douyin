@@ -172,17 +172,32 @@ class ShortVideo {
     'updatedAt': updatedAt,
   };
 
-  factory ShortVideo.fromJson(Map<String, dynamic> json) => ShortVideo(
-    id: '${json['id'] ?? ''}',
-    platform: '${json['platform'] ?? 'douyin'}',
-    desc: '${json['desc'] ?? ''}',
-    author: '${json['author'] ?? ''}',
-    cover: '${json['cover'] ?? ''}',
-    durationMs: (json['durationMS'] as num?)?.toInt() ?? 0,
-    playUrl: '${json['playURL'] ?? ''}',
-    videoId: '${json['videoID'] ?? ''}',
-    updatedAt: (json['updatedAt'] as num?)?.toDouble() ?? 0,
-  );
+  factory ShortVideo.fromJson(Map<String, dynamic> json) {
+    final playUrl = '${json['playURL'] ?? json['playUrl'] ?? ''}';
+    return ShortVideo(
+      id: '${json['id'] ?? ''}',
+      platform: _normalizePlatform('${json['platform'] ?? ''}', playUrl),
+      desc: '${json['desc'] ?? ''}',
+      author: '${json['author'] ?? ''}',
+      cover: '${json['cover'] ?? ''}',
+      durationMs: _int(json['durationMS']) ?? 0,
+      playUrl: playUrl,
+      videoId: '${json['videoID'] ?? json['videoId'] ?? ''}',
+      updatedAt: (json['updatedAt'] as num?)?.toDouble() ?? 0,
+    );
+  }
+
+  /// 远端文件可能是别的版本写的：平台名大小写不一、或者干脆没这个字段。
+  /// 认不出来就看播放地址的域名——别把 TikTok 的条目塞进抖音列表。
+  static String _normalizePlatform(String raw, String playUrl) {
+    final value = raw.trim().toLowerCase();
+    if (value.contains('tiktok') || value == 'tt') return 'tiktok';
+    if (value.contains('douyin') || value == 'dy' || value == '抖音') {
+      return 'douyin';
+    }
+    if (playUrl.toLowerCase().contains('tiktok')) return 'tiktok';
+    return 'douyin';
+  }
 }
 
 abstract final class ShortVideoParser {

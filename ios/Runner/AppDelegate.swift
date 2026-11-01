@@ -141,6 +141,29 @@ final class ShortVideoWebViewController: UIViewController {
   private var hookInstalled = false
   private var pendingStart = false
   private var didFinishLoading = false
+  private var popup: ShortVideoPopupController?
+  private var lastPopupURL = ""
+  private var lastPopupAt = Date.distantPast
+
+  /// 常驻的极轻量脚本：只接管 `window.open`。
+  static let popupBridgeScript = """
+  (function () {
+    if (window.__kumonePopupBridge) { return; }
+    window.__kumonePopupBridge = true;
+    var realOpen = window.open;
+    window.open = function (url, name, features) {
+      var handle = null;
+      try { handle = realOpen.apply(window, arguments); } catch (e) { handle = null; }
+      try {
+        var target = url ? String(url) : '';
+        if (!handle && target && target !== 'about:blank') {
+          window.webkit.messageHandlers.shortvideo.postMessage({ popup: target });
+        }
+      } catch (e) {}
+      return handle;
+    };
+  })();
+  """
 
   private var homeURL: String { args["url"] as? String ?? "https://www.douyin.com/" }
   private var favoritesURL: String { args["favoritesUrl"] as? String ?? homeURL }
@@ -199,6 +222,15 @@ final class ShortVideoWebViewController: UIViewController {
     configuration.defaultWebpagePreferences.preferredContentMode = .desktop
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
     configuration.userContentController.add(self, name: "shortvideo")
+    // 只接管 window.open：登录阶段不注入抓取脚本，但弹窗被 WebKit 拦掉时
+    // 连 delegate 都不回调，点了「登录」就是一点反应都没有。
+    configuration.userContentController.addUserScript(
+      WKUserScript(
+        source: ShortVideoWebViewController.popupBridgeScript,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+      )
+    )
 
     let web = WKWebView(frame: .zero, configuration: configuration)
     web.customUserAgent = userAgent
@@ -273,6 +305,31 @@ final class ShortVideoWebViewController: UIViewController {
 
   @objc private func openLogin() {
     load(loginURL)
+  }
+
+  /// 开一个真正的弹窗，别把站点自己的页面冲掉。
+  private func presentPopup(_ url: URL) {
+    let scheme = (url.scheme ?? "").lowercased()
+    guard scheme == "http" || scheme == "https" else { return }
+    guard popup == nil else { return }
+    let signature = url.absoluteString
+    if signature == lastPopupURL, Date().timeIntervalSince(lastPopupAt) < 3 {
+      return
+    }
+    lastPopupURL = signature
+    lastPopupAt = Date()
+
+    let controller = ShortVideoPopupController(url: url, userAgent: userAgent) {
+      [weak self] in
+      guard let self else { return }
+      self.popup = nil
+      self.setStatus("登录窗口已关闭，刷新本页…")
+      self.webView.reload()
+    }
+    popup = controller
+    let navigation = UINavigationController(rootViewController: controller)
+    navigation.modalPresentationStyle = .fullScreen
+    present(navigation, animated: true)
   }
 
   @objc private func openInSafari() {
@@ -414,8 +471,15 @@ extension ShortVideoWebViewController: WKScriptMessageHandler {
     didReceive message: WKScriptMessage
   ) {
     guard message.name == "shortvideo",
-          let payload = message.body as? [String: Any],
-          let body = payload["body"] as? String else { return }
+          let payload = message.body as? [String: Any] else { return }
+
+    if let popup = payload["popup"] as? String,
+       let url = URL(string: popup) {
+      presentPopup(url)
+      return
+    }
+
+    guard let body = payload["body"] as? String else { return }
     received += 1
     emit("payload", ["body": body])
     if collecting {
@@ -488,10 +552,11 @@ extension ShortVideoWebViewController: WKNavigationDelegate {
 }
 
 extension ShortVideoWebViewController: WKUIDelegate {
-  /// `window.open` / `target=_blank` 一律在本页打开。
+  /// `window.open` / `target=_blank` 单独弹一层窗口。
   ///
-  /// 抖音的「登录」、搜索结果、视频详情全是新窗口链接；不实现这个回调，
-  /// 点了就什么都不发生——这正是「登录按钮点不动」的真正原因。
+  /// 以前是「塞回本页加载」，结果把站点自己的 SPA 冲掉——表现就是
+  /// 「二维码刚要出来又闪回首页」，登录永远做不成。现在开一个真正的弹窗，
+  /// cookie 落在同一个域上，关掉弹窗本页刷新一下就是登录态。
   func webView(
     _ webView: WKWebView,
     createWebViewWith configuration: WKWebViewConfiguration,
@@ -499,12 +564,7 @@ extension ShortVideoWebViewController: WKUIDelegate {
     windowFeatures: WKWindowFeatures
   ) -> WKWebView? {
     if let url = navigationAction.request.url {
-      let scheme = (url.scheme ?? "").lowercased()
-      if scheme == "http" || scheme == "https" || scheme == "about" {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        webView.load(request)
-      }
+      presentPopup(url)
     }
     return nil
   }
@@ -525,5 +585,167 @@ extension ShortVideoWebViewController: WKUIDelegate {
     completionHandler: @escaping (Bool) -> Void
   ) {
     completionHandler(true)
+  }
+}
+
+/// `window.open` 弹出来的登录窗。
+///
+/// 抖音 / TikTok 的二维码登录都走新窗口。塞回本页加载会把站点 SPA 冲掉，
+/// 所以这里单独开一层；cookie 落在同一个域上，关掉后本页刷新即为登录态。
+final class ShortVideoPopupCloseBridge: NSObject, WKScriptMessageHandler {
+  var onClose: (() -> Void)?
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard message.name == "kumoneClose" else { return }
+    DispatchQueue.main.async { [weak self] in
+      self?.onClose?()
+    }
+  }
+}
+
+final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
+  private let request: URL
+  private let userAgent: String
+  private let onClose: () -> Void
+  private let closeBridge = ShortVideoPopupCloseBridge()
+  private var didNotify = false
+
+  private lazy var webView: WKWebView = {
+    let configuration = WKWebViewConfiguration()
+    configuration.websiteDataStore = .default()
+    configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+    configuration.defaultWebpagePreferences.preferredContentMode = .desktop
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+    configuration.userContentController.add(closeBridge, name: "kumoneClose")
+    configuration.userContentController.addUserScript(
+      WKUserScript(
+        source: Self.closeBridgeScript,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: true
+      )
+    )
+    let view = WKWebView(frame: .zero, configuration: configuration)
+    view.customUserAgent = userAgent
+    view.navigationDelegate = self
+    view.allowsBackForwardNavigationGestures = true
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+  }()
+
+  private static let closeBridgeScript = """
+  (function () {
+    if (window.__kumoneCloseBridge) { return; }
+    window.__kumoneCloseBridge = true;
+    var realClose = window.close;
+    window.close = function () {
+      try { window.webkit.messageHandlers.kumoneClose.postMessage({ close: true }); } catch (e) {}
+      try { return realClose.apply(window, arguments); } catch (e) {}
+    };
+  })();
+  """
+
+  init(url: URL, userAgent: String, onClose: @escaping () -> Void) {
+    self.request = url
+    self.userAgent = userAgent
+    self.onClose = onClose
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .systemBackground
+    title = request.host ?? "登录"
+    navigationItem.leftBarButtonItem = UIBarButtonItem(
+      title: "关闭",
+      style: .done,
+      target: self,
+      action: #selector(closeSelf)
+    )
+    navigationItem.rightBarButtonItems = [
+      UIBarButtonItem(
+        image: UIImage(systemName: "arrow.clockwise"),
+        style: .plain,
+        target: self,
+        action: #selector(reloadSelf)
+      ),
+      UIBarButtonItem(
+        image: UIImage(systemName: "chevron.backward"),
+        style: .plain,
+        target: self,
+        action: #selector(backSelf)
+      ),
+    ]
+
+    view.addSubview(webView)
+    NSLayoutConstraint.activate([
+      webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+
+    closeBridge.onClose = { [weak self] in
+      self?.closeSelf()
+    }
+    webView.load(URLRequest(url: request, timeoutInterval: 30))
+  }
+
+  @objc private func closeSelf() {
+    dismiss(animated: true)
+  }
+
+  @objc private func reloadSelf() {
+    if webView.url == nil {
+      webView.load(URLRequest(url: request, timeoutInterval: 30))
+    } else {
+      webView.reload()
+    }
+  }
+
+  @objc private func backSelf() {
+    if webView.canGoBack {
+      webView.goBack()
+    } else {
+      reloadSelf()
+    }
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    guard !didNotify else { return }
+    didNotify = true
+    onClose()
+  }
+
+  func webView(
+    _ webView: WKWebView,
+    decidePolicyFor navigationAction: WKNavigationAction,
+    decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+  ) {
+    let scheme = (navigationAction.request.url?.scheme ?? "").lowercased()
+    let inApp = scheme.isEmpty
+      || scheme == "http"
+      || scheme == "https"
+      || scheme == "about"
+      || scheme == "file"
+      || scheme == "data"
+      || scheme == "blob"
+    if inApp {
+      decisionHandler(.allow)
+      return
+    }
+    if let url = navigationAction.request.url,
+       UIApplication.shared.canOpenURL(url) {
+      UIApplication.shared.open(url, options: [:], completionHandler: nil)
+    }
+    decisionHandler(.cancel)
   }
 }
