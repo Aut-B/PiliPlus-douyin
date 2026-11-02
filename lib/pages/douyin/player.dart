@@ -61,7 +61,8 @@ class ShortVideoPlayerPage extends StatefulWidget {
   State<ShortVideoPlayerPage> createState() => _ShortVideoPlayerPageState();
 }
 
-class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
+class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
+    with WidgetsBindingObserver {
   Player? _player;
   VideoController? _controller;
   StreamSubscription<bool>? _completedSub;
@@ -120,6 +121,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// iOS 画中画：系统判定不支持时把按钮藏起来。
   bool _pipSupported = true;
   bool _pipActive = false;
+
+  /// 「在前台主动开小窗」的次数。
+  ///
+  /// 站内播放器（B 站）就是这么做的，所以它在 6S 上从不定帧。抖音这边以前
+  /// 全靠系统「切后台自动进入」——系统会拿一份已经没人喂帧的图层把窗口弹
+  /// 出来，画面定在最后一帧，而且不送 didStart、controller 一直报 inactive
+  /// （build 29 读数里的 `启动调用/失败 0/0` 就是「我们一次都没主动开过」）。
+  int _fgPipStarts = 0;
+  DateTime? _fgPipStartedAt;
 
   /// 正在把当前这条整条下到本地（顶栏转圈 + 百分比）。
   bool _downloading = false;
@@ -189,6 +199,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    WidgetsBinding.instance.addObserver(this);
     _restoreGestureState();
     _init();
   }
@@ -317,12 +328,65 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       defaultValue: true,
     );
     if (autoPiP) {
+      // 这里**不再**让系统在切后台时自动弹窗。iOS 15 的自动进入会拿一份已经
+      // 没人喂帧的图层开窗：画面定帧、didStart 不到、controller 恒为 inactive，
+      // 后面所有补救都是在救这个死窗口。站内播放器之所以稳，是因为它在切后台
+      // **之前**就在前台把窗口起好了 —— 改成同一条路（见
+      // [didChangeAppLifecycleState]），这里只把图层与控制器武装好。
       unawaited(
         Future<void>.sync(
-          () => controller.setAutoEnterPictureInPicture(true),
+          () => controller.setAutoEnterPictureInPicture(false),
         ).catchError((_) {}),
       );
     }
+  }
+
+  /// 切后台之前，在前台把系统小窗真的开起来（照搬站内播放器的做法）。
+  ///
+  /// `inactive` 是唯一还能在系统掐断前调起小窗的时机：Home 键、锁屏、切 App
+  /// 都会先发它，此时进程还在前台、还能调 `startPictureInPicture()`。
+  /// 控制中心 / 来电横幅这类短暂 `inactive` 会在回到前台时把小窗收掉。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!Platform.isIOS) return;
+    switch (state) {
+      case AppLifecycleState.inactive:
+        _startPipFromForeground();
+      case AppLifecycleState.resumed:
+        _cancelForegroundPipIfTransient();
+      default:
+        break;
+    }
+  }
+
+  void _startPipFromForeground() {
+    if (_pipActive || !_playing) return;
+    final controller = _controller;
+    if (controller == null) return;
+    final autoPiP = GStorage.setting.get(
+      SettingBoxKey.autoPiP,
+      defaultValue: true,
+    );
+    if (!autoPiP) return;
+    _fgPipStarts += 1;
+    _fgPipStartedAt = DateTime.now();
+    // 不先 await `isPictureInPictureSupported()`：两次异步往返之后系统就不
+    // 让启动了。原生侧本来有 3 秒重试阶梯，起不来会走 error 流。
+    unawaited(controller.setPictureInPicture(true).catchError((Object _) {}));
+  }
+
+  void _cancelForegroundPipIfTransient() {
+    final startedAt = _fgPipStartedAt;
+    _fgPipStartedAt = null;
+    if (startedAt == null) return;
+    // 2.5 秒内就回到前台：刚才是控制中心 / 来电横幅那种短暂 inactive，不是
+    // 真的离开，把小窗收掉，别在 App 里飘着一个。
+    if (DateTime.now().difference(startedAt) >
+        const Duration(milliseconds: 2500)) {
+      return;
+    }
+    unawaited(_controller?.setPictureInPicture(false) ?? Future<void>.value());
+    if (mounted && _pipActive) setState(() => _pipActive = false);
   }
 
   Future<void> _togglePip() async {
@@ -369,7 +433,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       context: context,
       isScrollControlled: true,
       backgroundColor: const Color(0xFF1C1C1E),
-      builder: (_) => _PipDiagnosticsSheet(controller: controller),
+      builder: (_) => _PipDiagnosticsSheet(
+        controller: controller,
+        fgPipStarts: _fgPipStarts,
+      ),
     );
   }
 
@@ -1007,6 +1074,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _completedSub?.cancel();
     _playingSub?.cancel();
     _errorSub?.cancel();
@@ -1699,9 +1767,15 @@ class _QueueSheetState extends State<_QueueSheet> {
 ///
 /// 排障用法：打开面板 → 按 Home 让视频自动进小窗 → 等它卡住 → 切回来读结论那行。
 class _PipDiagnosticsSheet extends StatefulWidget {
-  const _PipDiagnosticsSheet({required this.controller});
+  const _PipDiagnosticsSheet({
+    required this.controller,
+    this.fgPipStarts = 0,
+  });
 
   final VideoController controller;
+
+  /// 切后台前「前台主动开小窗」的次数，0 表示这次还是走了系统自动进入。
+  final int fgPipStarts;
 
   @override
   State<_PipDiagnosticsSheet> createState() => _PipDiagnosticsSheetState();
@@ -1807,6 +1881,10 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
     final bgSeconds = _num(_data['bgSeconds']);
     if (bgSeconds >= 1.5) {
       final secs = bgSeconds.toStringAsFixed(1);
+      if (widget.fgPipStarts < 1) {
+        return '上次后台 $secs 秒：小窗是系统自动弹的（前台启动 0 次）'
+            ' —— 6S 上这条路拿到的是死图层';
+      }
       final enq = _num(_data['bgEnqueuedDelta']);
       final same = _num(_data['bgSameFrameDelta']);
       final moved = _num(_data['bgPositionDelta']);
@@ -1907,6 +1985,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['启动调用/失败',
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
+        ['前台进小窗', '$fgPipStarts 次'],
         ['停滞重推', _text(_data['stallNudge'])],
         ['控制器重建', _text(_data['controllerRebuild'])],
         ['图层被接管', _text(_data['layerDetached'])],
