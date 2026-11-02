@@ -153,7 +153,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     // 重新抓到了就撤掉删除墓碑，让它重新回到列表。
     ShortVideoRepo.unmarkDeleted(platform, parsed.map((e) => e.key));
     ShortVideoRepo.save(platform, _videos);
-    if (mounted) setState(() => _status = '已抓取 ${_videos.length} 条');
+    // 抓到的每一条同时归档进「播放列表」。那是另一份存储：删收藏、清空收藏
+    // 都不会动它，误删之后还能从播放列表里接着听/看，不用重新登录抓一遍。
+    final archived = ShortVideoPlaylistRepo.add(
+      parsed.map(PlaylistItem.fromShortVideo),
+    );
+    if (mounted) {
+      setState(
+        () => _status = '已抓取 ${_videos.length} 条'
+            '${archived > 0 ? '，播放列表 +$archived' : ''}',
+      );
+    }
   }
 
   void _play(int index) {
@@ -216,6 +226,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Future<void> _clear() async {
     final keys = _videos.map((e) => e.key).toList();
     final videos = List<ShortVideo>.of(_videos);
+    final positions = List<int>.generate(videos.length, (i) => i);
     setState(() {
       _videos.clear();
       _selected.clear();
@@ -228,6 +239,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     for (final video in videos) {
       await ShortVideoMediaCache.remove(video);
     }
+    _offerUndo(videos, positions);
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
 
@@ -243,6 +255,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       ),
     );
     if (!confirmed || !mounted) return;
+    final position = _videos.indexWhere((e) => e.key == video.key);
     setState(() {
       _videos.removeWhere((e) => e.key == video.key);
       _selected.remove(video.key);
@@ -251,6 +264,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     ShortVideoRepo.save(platform, _videos);
     ShortVideoRepo.markDeleted(platform, [video.key]);
     await ShortVideoMediaCache.remove(video);
+    _offerUndo([video], [position < 0 ? _videos.length : position]);
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
 
@@ -267,6 +281,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       content: const Text('本地缓存文件会一起删掉，下次同步时远端那份也会被排除。'),
     );
     if (!confirmed || !mounted) return;
+    final positions = <int>[
+      for (final video in targets)
+        _videos.indexWhere((e) => e.key == video.key),
+    ];
     setState(() {
       _videos.removeWhere((e) => _selected.contains(e.key));
       _status = '已删除 ${targets.length} 条，本地 ${_videos.length} 条';
@@ -278,8 +296,53 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     for (final video in targets) {
       await ShortVideoMediaCache.remove(video);
     }
+    _offerUndo(targets, [
+      for (final position in positions)
+        position < 0 ? _videos.length : position,
+    ]);
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
+
+  /// 删除后给一次「撤销」。
+  ///
+  /// 误删收藏的代价太大：远端那份会被墓碑排掉，只能重新登录、重新抓一遍。
+  /// 所以删除只改本地，并且留 6 秒的后悔药。
+  void _offerUndo(List<ShortVideo> removed, List<int> positions) {
+    if (removed.isEmpty || !mounted) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('已删除 ${removed.length} 条'),
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(
+            label: '撤销',
+            onPressed: () => _undoDelete(removed, positions),
+          ),
+        ),
+      );
+  }
+
+  Future<void> _undoDelete(
+    List<ShortVideo> removed,
+    List<int> positions,
+  ) async {
+    ShortVideoRepo.unmarkDeleted(platform, removed.map((e) => e.key));
+    setState(() {
+      for (var i = 0; i < removed.length; i++) {
+        final video = removed[i];
+        if (_videos.any((e) => e.key == video.key)) continue;
+        final at = (i < positions.length ? positions[i] : _videos.length)
+            .clamp(0, _videos.length);
+        _videos.insert(at, video);
+      }
+      _status = '已恢复 ${removed.length} 条，本地 ${_videos.length} 条';
+    });
+    ShortVideoRepo.save(platform, _videos);
+    if (ShortVideoSync.configured) await _sync(silent: true);
+  }
+
   /// 刷新本地缓存占用。
   Future<void> _refreshCacheSize() async {
     final bytes = await ShortVideoMediaCache.size();

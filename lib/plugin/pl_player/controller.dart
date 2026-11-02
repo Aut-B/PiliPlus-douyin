@@ -20,6 +20,8 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
+import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/media_diag.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
@@ -2178,6 +2180,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           }
 
           makeHeartBeat(-1, type: .completed);
+          _consumeInjectedNext();
         }
       }),
 
@@ -2368,6 +2371,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     audioSessionHandler?.setActive(true);
 
     playerStatus = .playing;
+  }
+
+  /// B 站收藏播完这一条时，看看「下一首播放」里有没有别的收藏夹排进来的视频。
+  ///
+  /// 以前插队队列只有小视频播放页会取，B 站播放器根本不知道它的存在，
+  /// 所以「播着 B 站，把抖音插到下一首」等于白插。这里接上：
+  /// 有就整批取走，交给小视频播放页接着播 —— 两个收藏夹从此连成一条链。
+  void _consumeInjectedNext() {
+    if (QueueBus.pending == 0) return;
+    final entries = QueueBus.drainAll();
+    if (entries.isEmpty) return;
+    // isInterrupt: 不主动让出音频焦点，交给新页面接手，中间别出现一段静音。
+    unawaited(pause(isInterrupt: true));
+    Get.to(() => ShortVideoPlayerPage(queue: entries, index: 0));
   }
 
   /// 暂停播放

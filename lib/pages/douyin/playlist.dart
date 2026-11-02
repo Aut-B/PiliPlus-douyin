@@ -47,6 +47,24 @@ class PlaylistItem {
     bvid: bvid,
   );
 
+  /// 从播放队列的一条转过来（播放页「存为播放列表」用）。
+  static PlaylistItem? fromEntry(QueueEntry entry) {
+    if (entry.isBili) {
+      final bvid = entry.bvid;
+      if (bvid == null || bvid.isEmpty) return null;
+      return PlaylistItem.fromBili(
+        bvid: bvid,
+        title: entry.title,
+        author: entry.author,
+        cover: entry.cover,
+        durationMs: entry.durationMs,
+      );
+    }
+    final video = entry.short;
+    if (video == null) return null;
+    return PlaylistItem.fromShortVideo(video);
+  }
+
   static PlaylistItem? fromJson(Map<String, dynamic> json) {
     final type = '${json['type'] ?? ''}';
     try {
@@ -176,6 +194,17 @@ abstract final class ShortVideoPlaylistRepo {
     final current = load()..removeWhere((e) => e.key == key);
     save(current);
   }
+
+  /// 按原位置插回去（删除后的「撤销」用）。
+  static void insertAt(int index, PlaylistItem item) {
+    final current = load()..removeWhere((e) => e.key == item.key);
+    final at = index.clamp(0, current.length);
+    current.insert(at, item);
+    save(current);
+  }
+
+  /// 这份列表里有没有这一条。
+  static bool contains(String key) => load().any((e) => e.key == key);
 
   static void clear() => save([]);
 

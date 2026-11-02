@@ -6,6 +6,7 @@ import 'package:PiliPlus/build_config.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/perf.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
@@ -352,10 +353,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     switch (state) {
       case AppLifecycleState.inactive:
         _startPipFromForeground();
+      case AppLifecycleState.paused:
+        // 后台播放：小窗没起来（6S 上很常见）时，系统几秒后就会把进程挂起，
+        // 声音跟着断。进后台这一下把音频会话重新激活、播放状态钉住，
+        // 系统才按「后台音频」放行 —— 熄屏继续听靠的就是这一步。
+        unawaited(_keepAudioAlive());
       case AppLifecycleState.resumed:
         _cancelForegroundPipIfTransient();
       default:
         break;
+    }
+  }
+
+  /// 切到后台后继续出声。
+  Future<void> _keepAudioAlive() async {
+    if (!_playing) return;
+    // 强制重设一次：`_setAudioSession` 有去重，别让它以为「已经是激活的」。
+    _audioActive = false;
+    await _setAudioSession(true);
+    final player = _player;
+    if (player == null || !mounted) return;
+    if (!player.state.playing) {
+      await player.play();
     }
   }
 
@@ -460,7 +479,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           Navigator.of(context).pop();
           _openQueuePicker();
         },
+        onSavePlaylist: _saveQueueToPlaylist,
+        onOpenPlaylist: () {
+          Navigator.of(context).pop();
+          Get.to(() => const ShortVideoPlaylistPage());
+        },
       ),
+    );
+  }
+
+  /// 把当前这一队（B 站 / 抖音 / TikTok 混着）存成永久播放列表。
+  ///
+  /// 播放页里那份 `_queue` 只在这次播放有效，退出就没了；抓取结果虽然会自动
+  /// 归档，但用户手动插进来的条目只能靠这一步留下来。
+  void _saveQueueToPlaylist() {
+    final items = <PlaylistItem>[
+      for (final entry in _queue)
+        if (PlaylistItem.fromEntry(entry) case final item?) item,
+    ];
+    if (items.isEmpty) {
+      _showToast('队列里没有可保存的条目');
+      return;
+    }
+    final added = ShortVideoPlaylistRepo.add(items);
+    _showToast(
+      added == 0
+          ? '这些已经在播放列表里了（共 ${ShortVideoPlaylistRepo.length} 条）'
+          : '已存为播放列表：新增 $added 条，共 ${ShortVideoPlaylistRepo.length} 条',
     );
   }
 
@@ -1581,6 +1626,8 @@ class _QueueSheet extends StatefulWidget {
     required this.onRemove,
     required this.onMove,
     required this.onAdd,
+    required this.onSavePlaylist,
+    required this.onOpenPlaylist,
   });
 
   final List<QueueEntry> queue;
@@ -1590,6 +1637,8 @@ class _QueueSheet extends StatefulWidget {
   final void Function(int index) onRemove;
   final void Function(int from, int to) onMove;
   final VoidCallback onAdd;
+  final VoidCallback onSavePlaylist;
+  final VoidCallback onOpenPlaylist;
 
   @override
   State<_QueueSheet> createState() => _QueueSheetState();
@@ -1648,6 +1697,16 @@ class _QueueSheetState extends State<_QueueSheet> {
                     Icons.playlist_add,
                     widget.onAdd,
                     tip: '加入抖音 / TikTok 视频',
+                  ),
+                  _mini(
+                    Icons.bookmark_add_outlined,
+                    widget.onSavePlaylist,
+                    tip: '存为播放列表（永久保存）',
+                  ),
+                  _mini(
+                    Icons.library_music_outlined,
+                    widget.onOpenPlaylist,
+                    tip: '打开播放列表',
                   ),
                   _mini(
                     Icons.close,
@@ -1893,6 +1952,10 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
       final nudges = _num(_data['stallNudge']);
       final rebuilds = _num(_data['controllerRebuild']);
       final detached = _data['layerDetached'] == true;
+      if (widget.fgPipStarts > 0 && starts < 1) {
+        return '上次后台 $secs 秒：前台进小窗 ${widget.fgPipStarts} 次，后台启动调用 0'
+            ' —— 主队列被后台冻死，重试没跑起来';
+      }
       if (starts > 0 && didStart < 1) {
         return '上次后台 $secs 秒：发起 ${starts.round()} 次小窗，didStart 一次没来'
             '（图层被接管：${detached ? '是' : '否'}）';
@@ -1985,6 +2048,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['启动调用/失败',
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
+        ['重复跳过', _text(_data['duplicateSkip'])],
         ['前台进小窗', '${widget.fgPipStarts} 次'],
         ['停滞重推', _text(_data['stallNudge'])],
         ['控制器重建', _text(_data['controllerRebuild'])],

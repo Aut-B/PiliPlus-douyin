@@ -113,6 +113,13 @@ abstract final class QueueBus {
 
   static QueueEntry? takeNext() => _next.isEmpty ? null : _next.removeAt(0);
 
+  /// 把排队的条目整批取走（B 站播放器播完一条时用：接下来交给小视频播放页）。
+  static List<QueueEntry> drainAll() {
+    final drained = List<QueueEntry>.of(_next);
+    _next.clear();
+    return drained;
+  }
+
   static void clear() => _next.clear();
 }
 
