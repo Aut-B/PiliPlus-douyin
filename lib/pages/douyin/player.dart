@@ -2058,6 +2058,10 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
         ['重复跳过', _text(_data['duplicateSkip'])],
+        [
+          '预热/可启动',
+          '${_text(_data['prewarm'])}/${_text(_data['prewarmOk'])}',
+        ],
         ['前台进小窗', '${widget.fgPipStarts} 次'],
         ['停滞重推', _text(_data['stallNudge'])],
         ['控制器重建', _text(_data['controllerRebuild'])],
