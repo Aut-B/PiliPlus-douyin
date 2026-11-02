@@ -1168,16 +1168,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     _iosPipStartedEvent = false;
     isIOSPip.value = true;
-    if (isLiveContainerMultitask) {
-      // 宿主的窗口托管方式可能影响小窗能否拿到画面。先把话说清楚，再把原生侧的读数
-      // 直接画进小窗画面——否则用户只会看到一个黑窗，无从判断卡在哪一步。
-      SmartDialog.showToast('多任务模式：若小窗无画面，读数会直接显示在小窗里');
-      unawaited(
-        videoController
-            .setPictureInPictureDebugOverlay(true)
-            .catchError((_) {}),
-      );
-    }
+    // 诊断叠加层会把读数连同一条**逐帧右移的纯红色色块**一起画进小窗画面，每帧
+    // 还要多做一次整帧拷贝与一次文字绘制。以前在多任务模式下是无条件打开的，
+    // 结果 15pm 的小窗底部一直有条红光在闪，还白吃掉一帧的带宽（6S 更扛不住）。
+    // 现在一律关掉：要看读数请用抖音播放页的诊断面板（「画字进小窗」开关，
+    // 面板一关就自动收掉）。这里显式下发一次 false，避免同一个控制器复用上一条
+    // 视频留下的状态。
+    unawaited(
+      videoController
+          .setPictureInPictureDebugOverlay(false)
+          .catchError((_) {}),
+    );
     unawaited(
       videoController.setPictureInPicture(true).catchError((_) {
         isIOSPip.value = false;

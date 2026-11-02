@@ -280,6 +280,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       _controller = controller;
     });
     _listenPip(controller);
+    // 兜底：每次进播放页都把诊断叠加层复位成关，免得上一页/上一条视频
+    // 留下的那条红色色块继续在小窗里闪。
+    unawaited(
+      controller.setPictureInPictureDebugOverlay(false).catchError((_) {}),
+    );
     await _openIndex(_index);
     _scheduleHide();
   }
@@ -1732,6 +1737,10 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
   void dispose() {
     _timer?.cancel();
     _copiedTimer?.cancel();
+    // 面板关掉就把叠加层收掉：否则那条红色色块会一直留在小窗里闪。
+    if (_inWindow) {
+      unawaited(widget.controller.setPictureInPictureDebugOverlay(false));
+    }
     super.dispose();
   }
 
@@ -1964,7 +1973,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
                 TextButton(
                   onPressed: _toggleInWindow,
                   child: Text(
-                    _inWindow ? '不画进小窗' : '画进小窗',
+                    _inWindow ? '收掉叠字' : '画字进小窗',
                     style: TextStyle(
                       fontSize: 13,
                       color: _inWindow ? Colors.lightGreenAccent : null,
