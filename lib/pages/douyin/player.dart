@@ -329,23 +329,32 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       defaultValue: true,
     );
     if (autoPiP) {
-      // 这里**不再**让系统在切后台时自动弹窗。iOS 15 的自动进入会拿一份已经
-      // 没人喂帧的图层开窗：画面定帧、didStart 不到、controller 恒为 inactive，
-      // 后面所有补救都是在救这个死窗口。站内播放器之所以稳，是因为它在切后台
-      // **之前**就在前台把窗口起好了 —— 改成同一条路（见
-      // [didChangeAppLifecycleState]），这里只把图层与控制器武装好。
+      // 必须打开「划回主屏幕由系统自动进小窗」。
+      //
+      // build 32 曾经把它关掉，改成在 `inactive` 里手动
+      // `setPictureInPicture(true)`。实测这条路走不通：build 34 读数里
+      // `前台进小窗 2 次`、`后台启动调用 0`、`校正尝试 0`，而 `保活定时器 101`
+      // 照常跳 —— 说明 App 退到后台后**主队列被冻死**，我们投到主线程的每一次
+      // 启动尝试（以及 `startPictureInPicture`）根本没机会执行。系统自动进入
+      // 是唯一不依赖我们主队列的通道，所以这里必须留着。
+      //
+      // 之前自动进入被判定「开了也是定帧」，根因在图层时间轴：样本按 PTS 排队，
+      // 时间轴一旦跑到样本前面，帧就被判过期丢掉，小窗停在上一次显示的画面上。
+      // 原生侧已经把图层时间轴摘掉了（`setupTimebase`），样本入队即显示。
       unawaited(
         Future<void>.sync(
-          () => controller.setAutoEnterPictureInPicture(false),
+          () => controller.setAutoEnterPictureInPicture(true),
         ).catchError((_) {}),
       );
     }
   }
 
-  /// 切后台之前，在前台把系统小窗真的开起来（照搬站内播放器的做法）。
+  /// 切后台之前，尽量在前台把系统小窗开起来（尽力而为，不是主路径）。
   ///
-  /// `inactive` 是唯一还能在系统掐断前调起小窗的时机：Home 键、锁屏、切 App
-  /// 都会先发它，此时进程还在前台、还能调 `startPictureInPicture()`。
+  /// 主路径是系统自动进入（`setAutoEnterPictureInPicture(true)`）：App 退到后台
+  /// 后主队列会被冻死，凡是我们自己投到主线程的调用都执行不到。这里保留一次
+  /// 手动尝试，只是因为个别机型在 `inactive` 那一刻还肯接受
+  /// `startPictureInPicture()`；失败了不影响自动进入那条路。
   /// 控制中心 / 来电横幅这类短暂 `inactive` 会在回到前台时把小窗收掉。
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
