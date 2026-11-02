@@ -1737,7 +1737,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
   void dispose() {
     _timer?.cancel();
     _copiedTimer?.cancel();
-    // 面板关掉就把叠加层收掉：否则那条红色色块会一直留在小窗里闪。
+    // 面板关掉就把叠加层收掉：否则那些诊断文字会一直压在小窗画面上。
     if (_inWindow) {
       unawaited(widget.controller.setPictureInPictureDebugOverlay(false));
     }
@@ -1812,8 +1812,12 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
       final moved = _num(_data['bgPositionDelta']);
       final starts = _num(_data['bgStartCallsDelta']);
       final didStart = _num(_data['bgDidStartDelta']);
+      final nudges = _num(_data['stallNudge']);
+      final rebuilds = _num(_data['controllerRebuild']);
+      final detached = _data['layerDetached'] == true;
       if (starts > 0 && didStart < 1) {
-        return '上次后台 $secs 秒：发起 ${starts.round()} 次小窗，didStart 一次没来';
+        return '上次后台 $secs 秒：发起 ${starts.round()} 次小窗，didStart 一次没来'
+            '（图层被接管：${detached ? '是' : '否'}）';
       }
       if (enq < 2) {
         return '上次后台 $secs 秒：一帧都没进图层（+${enq.round()}）';
@@ -1822,10 +1826,14 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         return '上次后台 $secs 秒：入队 +${enq.round()} 帧但内容没变 —— 卡在渲染';
       }
       if (moved < bgSeconds * 0.3) {
-        return '上次后台 $secs 秒：帧在送（+${enq.round()}）但进度不走 —— 卡在解码';
+        return '上次后台 $secs 秒：帧在送（+${enq.round()}）但进度不走 —— 卡在解码'
+            '${nudges > 0 ? '（看门狗已重推 ${nudges.round()} 次）' : ''}';
       }
+      // 叠加层开着时「同帧」几乎恒为 0（每帧都重画读数），这一项此时不可信；
+      // 判断卡帧只剩两条依据：进度在不在走、图层有没有被系统收进小窗。
       return '上次后台 $secs 秒：入队 +${enq.round()}、内容在变、进度 +${moved.toStringAsFixed(1)} 秒'
-          ' —— 问题在图层/小窗那一环';
+          ' —— 卡在图层/小窗那一环'
+          '（图层被接管：${detached ? '是' : '否'}，重建 ${rebuilds.round()} 次）';
     }
     if (_data['showing'] != true) return '小窗没在显示：先按 Home 让它自动进小窗';
     if (_noFrameSeconds >= 1.5) {
@@ -1846,9 +1854,11 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
       final moved = _num(_data['bgPositionDelta']);
       final starts = _num(_data['bgStartCallsDelta']);
       final didStart = _num(_data['bgDidStartDelta']);
+      final rebuilds = _num(_data['controllerRebuild']);
       final bad = enq < 2 ||
           same >= enq * 0.8 ||
           moved < bgSeconds * 0.3 ||
+          rebuilds > 0 ||
           (starts > 0 && didStart < 1);
       return bad ? Colors.redAccent : Colors.orangeAccent;
     }
@@ -1897,6 +1907,9 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['启动调用/失败',
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
+        ['停滞重推', _text(_data['stallNudge'])],
+        ['控制器重建', _text(_data['controllerRebuild'])],
+        ['图层被接管', _text(_data['layerDetached'])],
         ['后台/前台入队',
           '${_text(_data['bgEnqueued'])}/${_text(_data['fgEnqueued'])}'],
       ];
@@ -1989,7 +2002,8 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
             ),
             const Text(
               '入口：右上角心率图标 / 长按画面 1 秒 / 播放队列右上角。'
-              '进来后按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论',
+              '进来后按 Home 让它自动进小窗 → 等它卡住 → 切回来看上面那行结论。'
+              '「画字进小窗」只画文字，不再有红色色块',
               style: TextStyle(color: Colors.white38, fontSize: 11),
             ),
             const SizedBox(height: 8),
