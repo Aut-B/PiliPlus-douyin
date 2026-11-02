@@ -1985,7 +1985,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['启动调用/失败',
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
-        ['前台进小窗', '$fgPipStarts 次'],
+        ['前台进小窗', '${widget.fgPipStarts} 次'],
         ['停滞重推', _text(_data['stallNudge'])],
         ['控制器重建', _text(_data['controllerRebuild'])],
         ['图层被接管', _text(_data['layerDetached'])],
