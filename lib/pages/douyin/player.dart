@@ -2039,6 +2039,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
         ['补帧恢复', _text(_data['stallRecover'])],
         ['渲染为空', _text(_data['renderNil'])],
         ['恢复刷新', _text(_data['resumeFlush'])],
+        ['位置清屏', _text(_data['positionFlush'])],
         ['保活定时器', _text(_data['timerTicks'])],
         ['图层可写', _text(_data['layerReady'])],
         ['图层隐藏', _text(_data['layerHidden'])],
