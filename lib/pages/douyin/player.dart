@@ -1985,6 +1985,24 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
           ' —— 卡在图层/小窗那一环'
           '（图层被接管：${detached ? '是' : '否'}，重建 ${rebuilds.round()} 次）';
     }
+    // 小窗正在显示时（前台也能读到）：先看「同一帧被反复重推」「显示中清屏」
+    // 这两项 —— 它们就是肉眼看到的闪。原先只统计后台窗口期，前台小窗里闪的
+    // 时候这里什么都读不到，面板自然「什么问题都检测不出来」。
+    final sameShown = _num(_data['sameFrameShown']);
+    final flushShown = _num(_data['flushShown']);
+    final stallShown = _num(_data['stallShown']);
+    if (_data['showing'] == true) {
+      if (flushShown > 0) {
+        return '小窗显示中被清屏 ${flushShown.round()} 次 —— 每清一次就闪一下';
+      }
+      if (sameShown > 3) {
+        return '小窗显示中同帧 ${sameShown.round()} 次'
+            ' —— 图层在重推同一帧（闪的来源）';
+      }
+      if (stallShown > 5) {
+        return '小窗显示中补帧 ${stallShown.round()} 次 —— 渲染回调供帧不足';
+      }
+    }
     if (_data['showing'] != true) return '小窗没在显示：先按 Home 让它自动进小窗';
     if (_noFrameSeconds >= 1.5) {
       return '帧没送进小窗：累计 ${_noFrameSeconds.round()} 秒';
@@ -2059,6 +2077,15 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
           '${_text(_data['startCalls'])}/${_text(_data['startFail'])}'],
         ['同帧', _text(_data['sameFrame'])],
         ['重复跳过', _text(_data['duplicateSkip'])],
+        ['同帧(显示中)', _text(_data['sameFrameShown'])],
+        ['显示中补帧', _text(_data['stallShown'])],
+        ['未显示补帧', _text(_data['stallIdle'])],
+        ['显示中清屏', _text(_data['flushShown'])],
+        ['图层归属', _text(_data['layerOwner'])],
+        [
+          '宿主边长/透明度',
+          '${_text(_data['hostSide'])}/${_text(_data['hostAlpha'])}',
+        ],
         [
           '预热/可启动',
           '${_text(_data['prewarm'])}/${_text(_data['prewarmOk'])}',
