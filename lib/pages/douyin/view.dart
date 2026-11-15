@@ -1,7 +1,9 @@
+import 'dart:async' show unawaited;
+
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
@@ -168,10 +170,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   void _play(int index) {
     if (_videos.isEmpty) return;
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: _videos.map(QueueEntry.fromShortVideo).toList(),
-        index: index,
+    unawaited(
+      openShortVideoQueue(
+        _videos.map(QueueEntry.fromShortVideo).toList(),
+        index,
+        replaceCurrent: true,
       ),
     );
   }
@@ -188,10 +191,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _selecting = false;
       _selected.clear();
     });
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: queue.map(QueueEntry.fromShortVideo).toList(),
-        index: 0,
+    unawaited(
+      openShortVideoQueue(
+        queue.map(QueueEntry.fromShortVideo).toList(),
+        0,
+        replaceCurrent: true,
       ),
     );
   }

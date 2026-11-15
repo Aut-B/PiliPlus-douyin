@@ -1,4 +1,6 @@
 import Flutter
+import Foundation
+import CoreFoundation
 import UIKit
 import WebKit
 
@@ -9,6 +11,7 @@ import WebKit
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     application.applicationSupportsShakeToEdit = false // Disable shake to undo
+    PipQaHostLifecycle.shared.start()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -16,6 +19,286 @@ import WebKit
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ShortVideoWebView") {
       ShortVideoWebViewPlugin.register(with: registrar)
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliPlusPipQa") {
+      PipQaLifecyclePlugin.register(with: registrar)
+    }
+  }
+}
+
+final class PipQaHostLifecycle: NSObject {
+  static let shared = PipQaHostLifecycle()
+
+  private let lock = NSLock()
+  private let writeQueue = DispatchQueue(
+    label: "PiliPlus.PipQaHostLifecycle",
+    qos: .utility
+  )
+  private var observing = false
+  private var runId = ""
+
+  func start() {
+    lock.lock()
+    if observing {
+      lock.unlock()
+      return
+    }
+    observing = true
+    lock.unlock()
+    let center = NotificationCenter.default
+    center.addObserver(
+      self,
+      selector: #selector(handleWillResignActive),
+      name: UIApplication.willResignActiveNotification,
+      object: nil
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleDidEnterBackground),
+      name: UIApplication.didEnterBackgroundNotification,
+      object: nil
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleWillEnterForeground),
+      name: UIApplication.willEnterForegroundNotification,
+      object: nil
+    )
+    center.addObserver(
+      self,
+      selector: #selector(handleDidBecomeActive),
+      name: UIApplication.didBecomeActiveNotification,
+      object: nil
+    )
+    log(event: "started", appState: .active, synchronous: true)
+  }
+
+  func setRunId(_ value: String) {
+    lock.lock()
+    runId = value
+    lock.unlock()
+  }
+
+  func log(
+    event: String,
+    appState: UIApplication.State,
+    synchronous: Bool = false
+  ) {
+    lock.lock()
+    let currentRunId = runId
+    lock.unlock()
+    let payload: [String: Any] = [
+      "ts": Date().timeIntervalSince1970,
+      "runId": currentRunId,
+      "event": event,
+      "appState": stateName(appState),
+    ]
+    guard JSONSerialization.isValidJSONObject(payload),
+          let json = try? JSONSerialization.data(withJSONObject: payload),
+          let line = String(data: json, encoding: .utf8) else { return }
+    let data = Data((line + "\n").utf8)
+    if synchronous {
+      writeQueue.sync { self.appendHostDiagLine(data) }
+    } else {
+      writeQueue.async { self.appendHostDiagLine(data) }
+    }
+  }
+
+  private func appendHostDiagLine(_ data: Data) {
+    guard let directory = FileManager.default.urls(
+      for: .documentDirectory,
+      in: .userDomainMask
+    ).first else { return }
+    let file = directory.appendingPathComponent("pip_qa_host.jsonl")
+    if var existing = try? Data(contentsOf: file) {
+      existing.append(data)
+      try? existing.write(to: file, options: .atomic)
+    } else {
+      try? data.write(to: file, options: .atomic)
+    }
+  }
+
+  @objc private func handleWillResignActive() {
+    log(event: "willResignActive", appState: .inactive, synchronous: true)
+  }
+
+  @objc private func handleDidEnterBackground() {
+    log(event: "didEnterBackground", appState: .background, synchronous: true)
+  }
+
+  @objc private func handleWillEnterForeground() {
+    log(event: "willEnterForeground", appState: .inactive, synchronous: true)
+  }
+
+  @objc private func handleDidBecomeActive() {
+    log(event: "didBecomeActive", appState: .active, synchronous: true)
+  }
+
+  private func stateName(_ state: UIApplication.State) -> String {
+    switch state {
+    case .active: return "active"
+    case .inactive: return "inactive"
+    case .background: return "background"
+    @unknown default: return "unknown"
+    }
+  }
+}
+
+/// 自动 QA 的宿主控制通道。只有写入 Documents/pip_qa.json 时才会启用；
+/// Dart 侧只负责启动后台和写判定，原生侧用全局队列计时并自动重新激活。
+final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
+  private static let shared = PipQaLifecyclePlugin()
+  private static let suspendSelector = NSSelectorFromString("suspend")
+  private static let resumeSelector = NSSelectorFromString("resume")
+  private static let suspendDelay: Double = 0.2
+
+  private let lock = NSLock()
+  private var resumeWork: DispatchWorkItem?
+  private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+  private var resumeTriggered = false
+  private var resumeApplied = false
+
+  static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: "PiliPlus/PipQa",
+      binaryMessenger: registrar.messenger()
+    )
+    registrar.addMethodCallDelegate(Self.shared, channel: channel)
+  }
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "background":
+      let seconds = Self.backgroundSeconds(from: call.arguments)
+      if let args = call.arguments as? [String: Any] {
+        PipQaHostLifecycle.shared.setRunId((args["runId"] as? String) ?? "")
+      }
+      DispatchQueue.main.async {
+        self.beginBackgroundInterval(seconds: seconds)
+        result(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.suspendDelay) {
+          PipQaHostLifecycle.shared.log(
+            event: "suspendRequested",
+            appState: .inactive,
+            synchronous: true
+          )
+          UIApplication.shared.perform(
+            Self.suspendSelector,
+            with: nil,
+            afterDelay: 0
+          )
+        }
+      }
+    case "foreground":
+      self.resumeNow()
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private static func backgroundSeconds(from arguments: Any?) -> Double {
+    guard let args = arguments as? [String: Any] else { return 10 }
+    let value: Double
+    if let number = args["seconds"] as? NSNumber {
+      value = number.doubleValue
+    } else if let number = args["seconds"] as? Double {
+      value = number
+    } else if let number = args["seconds"] as? Int {
+      value = Double(number)
+    } else {
+      return 10
+    }
+    return min(60, max(2, value))
+  }
+
+  private func beginBackgroundInterval(seconds: Double) {
+    lock.lock()
+    resumeWork?.cancel()
+    let previousTask = backgroundTask
+    backgroundTask = .invalid
+    resumeTriggered = false
+    resumeApplied = false
+    lock.unlock()
+    if previousTask != .invalid {
+      DispatchQueue.main.async {
+        UIApplication.shared.endBackgroundTask(previousTask)
+      }
+    }
+    let task = UIApplication.shared.beginBackgroundTask(
+      withName: "PiliPlusPipQa"
+    ) { [weak self] in
+      DispatchQueue.global(qos: .userInitiated).async { self?.resumeNow() }
+    }
+    let work = DispatchWorkItem { [weak self] in
+      self?.resumeNow()
+    }
+    lock.lock()
+    backgroundTask = task
+    resumeWork = work
+    lock.unlock()
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(
+      deadline: .now() + Self.suspendDelay + seconds,
+      execute: work
+    )
+  }
+
+  private func resumeNow() {
+    lock.lock()
+    if resumeTriggered {
+      lock.unlock()
+      return
+    }
+    resumeTriggered = true
+    resumeWork?.cancel()
+    resumeWork = nil
+    let task = backgroundTask
+    backgroundTask = .invalid
+    lock.unlock()
+    PipQaHostLifecycle.shared.log(
+      event: "resumeRequested",
+      appState: .inactive,
+      synchronous: true
+    )
+    let applyResume: () -> Void = { [weak self] in
+      guard let self = self else { return }
+      self.lock.lock()
+      if self.resumeApplied {
+        self.lock.unlock()
+        return
+      }
+      self.resumeApplied = true
+      self.lock.unlock()
+      _ = UIApplication.shared.perform(Self.resumeSelector)
+      PipQaHostLifecycle.shared.log(
+        event: "resumeApplied",
+        appState: UIApplication.shared.applicationState,
+        synchronous: true
+      )
+      if task != .invalid {
+        UIApplication.shared.endBackgroundTask(task)
+      }
+    }
+    let scheduleResume: () -> Void = {
+      CFRunLoopPerformBlock(
+        CFRunLoopGetMain(),
+        CFRunLoopMode.commonModes.rawValue as CFTypeRef,
+        applyResume
+      )
+      CFRunLoopWakeUp(CFRunLoopGetMain())
+      DispatchQueue.main.async(execute: applyResume)
+    }
+    scheduleResume()
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(
+      deadline: .now() + 0.4
+    ) { [weak self] in
+      guard let self = self else { return }
+      self.lock.lock()
+      let alreadyApplied = self.resumeApplied
+      self.lock.unlock()
+      if !alreadyApplied {
+        scheduleResume()
+      }
     }
   }
 }

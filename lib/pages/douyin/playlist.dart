@@ -1,11 +1,11 @@
+import 'dart:async' show unawaited;
 import 'dart:convert';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
-import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
-import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
 /// 播放列表里的一条。
@@ -246,10 +246,11 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
       SmartDialog.showToast('列表里没有可播放的条目');
       return;
     }
-    Get.to(
-      () => ShortVideoPlayerPage(
-        queue: entries,
-        index: start.clamp(0, entries.length - 1),
+    unawaited(
+      openShortVideoQueue(
+        entries,
+        start.clamp(0, entries.length - 1),
+        replaceCurrent: true,
       ),
     );
   }
