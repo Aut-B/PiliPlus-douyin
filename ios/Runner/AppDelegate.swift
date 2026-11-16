@@ -13,10 +13,6 @@ import Darwin
   ) -> Bool {
     application.applicationSupportsShakeToEdit = false // Disable shake to undo
     PipQaHostLifecycle.shared.start()
-    QaDumpPlugin.captureLaunchConfig()
-    if PipQaSelfInstall.handleLaunchRequestIfNeeded() {
-      return true
-    }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -24,12 +20,6 @@ import Darwin
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ShortVideoWebView") {
       ShortVideoWebViewPlugin.register(with: registrar)
-    }
-    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliPlusPipQa") {
-      PipQaLifecyclePlugin.register(with: registrar)
-    }
-    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliPlusQaDump") {
-      QaDumpPlugin.register(with: registrar)
     }
   }
 }
