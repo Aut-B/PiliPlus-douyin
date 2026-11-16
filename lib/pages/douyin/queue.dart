@@ -4,6 +4,7 @@ import 'package:PiliPlus/http/video.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:PiliPlus/pages/douyin/web.dart';
 
 /// 播放队列里的一条。
 ///
@@ -203,8 +204,25 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
       ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
   final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
-  // TikTok 的签名直链即使「看起来新」也经常 403，所以永远先探长期地址。
-  if (!fresh || platform == ShortVideoPlatform.tiktok) {
+  // TikTok 的 tiktokv.com「长期地址」实测全返回 HTTP 400，签到直链又必然
+  // 过期。唯一可靠的路子是回视频页重新解析一条，20 分钟内复用。
+  if (platform == ShortVideoPlatform.tiktok && video.videoId.isNotEmpty) {
+    final resolved = await ShortVideoWeb.resolvePlayUrl(
+      platformId: platform.id,
+      videoId: video.videoId,
+      userAgent: platform.userAgent,
+    );
+    if (resolved != null) {
+      ShortVideoPlayStats.noteNetwork(video.key, tiktok: true);
+      return QueueMedia(
+        url: resolved,
+        userAgent: platform.userAgent,
+        referer: platform.referer,
+        cookie: cookie,
+      );
+    }
+  }
+  if (!fresh) {
     final stable = await _probeStable(video, platform, cookie);
     if (stable != null) {
       ShortVideoPlayStats.noteNetwork(
@@ -254,12 +272,9 @@ List<String> stableUrls(ShortVideo video) {
   if (video.videoId.isEmpty) return const [];
   final encoded = Uri.encodeComponent(video.videoId);
   final hosts = video.platform == 'tiktok'
-      ? const [
-          'https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
-          'https://api19-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
-          'https://api22-normal-c-useast1a.tiktokv.com/aweme/v1/play/',
-          'https://api-h2.tiktokv.com/aweme/v1/play/',
-          'https://api.tiktokv.com/aweme/v1/play/',
+      ? const <String>[
+          // TikTok 的 aweme/v1/play/ 必须带 App 的 device_id / aid / 签名，
+          // 浏览器 UA 裸请求一律 HTTP 400（真机实测），所以这里不留了。
         ]
       : const [
           'https://www.iesdouyin.com/aweme/v1/play/',

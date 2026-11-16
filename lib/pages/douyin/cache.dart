@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/perf.dart';
+import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/utils/path_utils.dart';
 
 /// 一次缓存下载的结果。[path] 有值表示成功，否则 [error] 说明卡在哪一步。
@@ -152,6 +153,56 @@ abstract final class ShortVideoMediaCache {
       if (existing != null) return ShortVideoDownload(path: existing);
       final target = await _fileFor(video);
       final errors = <String>[];
+
+      // 一、原生 URLSession。TikTok 的 CDN 认的是网页会话的 cookie，Dart 的
+      // HttpClient 带不上，所以这条路径才是「下得动」的那条（Kumone 同源）。
+      final cookieDomain = video.platform == 'tiktok'
+          ? 'tiktok.com'
+          : 'douyin.com';
+      final nativePath = await ShortVideoWeb.nativeDownload(
+        urls: urls,
+        destPath: target.path,
+        userAgent: userAgent,
+        referer: referer,
+        cookieDomain: cookieDomain,
+        onProgress: onProgress,
+      );
+      if (nativePath != null) {
+        unawaited(_prune());
+        return ShortVideoDownload(path: nativePath);
+      }
+      if (ShortVideoWeb.lastDownloadError.isNotEmpty) {
+        errors.add('native: ${ShortVideoWeb.lastDownloadError}');
+      }
+
+      // 二、收藏里存的是签名直链，过一阵必然 403。用 videoId 回视频页重新
+      // 解析一条新地址再下一次。
+      if (video.videoId.isNotEmpty) {
+        final fresh = await ShortVideoWeb.resolvePlayUrl(
+          platformId: video.platform,
+          videoId: video.videoId,
+          userAgent: userAgent,
+        );
+        if (fresh != null) {
+          final retried = await ShortVideoWeb.nativeDownload(
+            urls: [fresh],
+            destPath: target.path,
+            userAgent: userAgent,
+            referer: referer,
+            cookieDomain: cookieDomain,
+            onProgress: onProgress,
+          );
+          if (retried != null) {
+            unawaited(_prune());
+            return ShortVideoDownload(path: retried);
+          }
+          errors.add('fresh: ${ShortVideoWeb.lastDownloadError}');
+        } else {
+          errors.add('fresh: 没解析出新地址');
+        }
+      }
+
+      // 三、Dart 兜底（抖音一直走这条也能成）。
       for (final url in urls) {
         if (url.isEmpty) continue;
         final error = await _fetch(

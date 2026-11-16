@@ -383,6 +383,59 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
       // 设备物理内存（字节）。Dart 侧据此决定短视频走不走「低内存」那套策略
       // （串行下载、缓存上限更小、解码缓冲压到最低）——6S 这类 2GB 机器顶不住。
       result(Int(ProcessInfo.processInfo.physicalMemory))
+    case "resolvePlayUrl":
+      // 收藏里存的直链带签名，过几个小时就 403（TikTok 必过期）。这里用一个
+      // 离屏 WKWebView 打开视频页，从页面自带的 JSON 里把新直链抠出来——
+      // 和用户在浏览器里打开同一条视频走的是同一条路径。
+      let args = call.arguments as? [String: Any] ?? [:]
+      let videoId = args["videoId"] as? String ?? ""
+      guard !videoId.isEmpty else {
+        result(nil)
+        return
+      }
+      ShortVideoPlayResolver(
+        videoId: videoId,
+        platform: args["platform"] as? String ?? "tiktok",
+        userAgent: args["userAgent"] as? String ?? ""
+      ) { url in
+        DispatchQueue.main.async { result(url) }
+      }.start()
+    case "download":
+      // TikTok 的 CDN 按网页会话校验：Dart 的 HttpClient 一个 cookie 都不带。
+      // 用 URLSession 并把 WKWebView 的 cookie 显式塞进请求头，这条路径和
+      // Kumone 真机上验证过的一致。
+      let args = call.arguments as? [String: Any] ?? [:]
+      let id = args["id"] as? Int ?? 0
+      let urls = args["urls"] as? [String] ?? []
+      let dest = args["destPath"] as? String ?? ""
+      guard !urls.isEmpty, !dest.isEmpty else {
+        result(["error": "缺少下载参数"])
+        return
+      }
+      let downloader = ShortVideoNativeDownloader(
+        urls: urls,
+        destPath: dest,
+        userAgent: args["userAgent"] as? String ?? "",
+        referer: args["referer"] as? String ?? "",
+        cookieDomain: args["cookieDomain"] as? String ?? "",
+        progress: { [weak self] value in
+          DispatchQueue.main.async {
+            self?.channel.invokeMethod(
+              "downloadProgress",
+              arguments: ["id": id, "progress": value]
+            )
+          }
+        }
+      ) { path, error in
+        DispatchQueue.main.async {
+          if let path = path {
+            result(["path": path])
+          } else {
+            result(["error": error ?? "下载失败"])
+          }
+        }
+      }
+      downloader.start()
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -1473,5 +1526,400 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
       index = next
     }
     NSLog("[PIPQA] %@", "END \(name) parts=\(part)")
+  }
+}
+
+// MARK: - 短视频：原生下载
+
+/// WKWebView 的 cookie 罐和 URLSession 的不是同一个，这里手动取出来拼成
+/// 请求头。TikTok 的 CDN 就是按这个会话认人的。
+enum ShortVideoCookies {
+  static func header(for needle: String, completion: @escaping (String) -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      let picked = cookies.filter { needle.isEmpty || $0.domain.contains(needle) }
+      let header = picked.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+      completion(header)
+    }
+  }
+}
+
+/// 用 URLSession 把一条视频整段下下来。
+///
+/// 不用 Dart 的 HttpClient：它的 cookie 罐是独立的，TikTok 的 CDN 会按网页
+/// 会话校验，一个 cookie 都不带就是 403 / 0 字节。这里关掉 URLSession 自己的
+/// cookie 存储（否则会被空罐覆盖），改成显式写 `Cookie` 头。
+final class ShortVideoNativeDownloader: NSObject, URLSessionDownloadDelegate {
+  private let urls: [String]
+  private let destPath: String
+  private let userAgent: String
+  private let referer: String
+  private let cookieDomain: String
+  private let progressHandler: (Double) -> Void
+  private let completion: (String?, String?) -> Void
+
+  private var session: URLSession!
+  private var cookie = ""
+  private var index = 0
+  private var lastError = "没有可用的地址"
+  private var moved = false
+  private var finished = false
+
+  init(
+    urls: [String],
+    destPath: String,
+    userAgent: String,
+    referer: String,
+    cookieDomain: String,
+    progress: @escaping (Double) -> Void,
+    completion: @escaping (String?, String?) -> Void
+  ) {
+    self.urls = urls
+    self.destPath = destPath
+    self.userAgent = userAgent
+    self.referer = referer
+    self.cookieDomain = cookieDomain
+    self.progressHandler = progress
+    self.completion = completion
+    super.init()
+    let config = URLSessionConfiguration.default
+    config.httpShouldSetCookies = false
+    config.httpCookieStorage = nil
+    config.httpCookieAcceptPolicy = .never
+    config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    config.timeoutIntervalForRequest = 20
+    config.timeoutIntervalForResource = 120
+    session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+  }
+
+  func start() {
+    ShortVideoCookies.header(for: cookieDomain) { [weak self] value in
+      guard let self = self else { return }
+      self.cookie = value
+      self.attemptNext()
+    }
+  }
+
+  private func attemptNext() {
+    if finished { return }
+    guard index < urls.count else {
+      finish(nil, lastError)
+      return
+    }
+    let raw = urls[index]
+    index += 1
+    guard let url = URL(string: raw), url.scheme != nil else {
+      lastError = "地址无效"
+      attemptNext()
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    if !userAgent.isEmpty {
+      request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+    }
+    if !referer.isEmpty {
+      request.setValue(referer, forHTTPHeaderField: "Referer")
+    }
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
+    request.setValue("en-US,en;q=0.9,zh-CN;q=0.8", forHTTPHeaderField: "Accept-Language")
+    request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+    if !cookie.isEmpty {
+      request.setValue(cookie, forHTTPHeaderField: "Cookie")
+    }
+    moved = false
+    lastError = ""
+    session.downloadTask(with: request).resume()
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    guard totalBytesExpectedToWrite > 0 else { return }
+    let value = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+    progressHandler(min(0.999, max(0, value)))
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didFinishDownloadingTo location: URL
+  ) {
+    guard let http = downloadTask.response as? HTTPURLResponse else {
+      lastError = "没有响应"
+      return
+    }
+    let status = http.statusCode
+    let mime = (http.mimeType ?? "").lowercased()
+    guard status == 200 || status == 206 else {
+      lastError = "HTTP \(status)"
+      return
+    }
+    if mime.contains("html") || mime.contains("json") || mime.contains("text/") {
+      lastError = "返回的是网页不是视频（\(mime)）"
+      return
+    }
+    let attrs = try? FileManager.default.attributesOfItem(atPath: location.path)
+    let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+    guard size > 16 * 1024 else {
+      lastError = "只有 \(size) 字节"
+      return
+    }
+    do {
+      let dir = (destPath as NSString).deletingLastPathComponent
+      if !dir.isEmpty {
+        try? FileManager.default.createDirectory(
+          atPath: dir,
+          withIntermediateDirectories: true
+        )
+      }
+      try? FileManager.default.removeItem(atPath: destPath)
+      try FileManager.default.moveItem(at: location, to: URL(fileURLWithPath: destPath))
+      moved = true
+      progressHandler(1)
+    } catch {
+      lastError = "写入失败：\(error.localizedDescription)"
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: Error?
+  ) {
+    if moved {
+      finish(destPath, nil)
+      return
+    }
+    let status = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+    if let error = error {
+      lastError = status > 0
+        ? "HTTP \(status) / \(error.localizedDescription)"
+        : error.localizedDescription
+    } else if lastError.isEmpty {
+      lastError = status > 0 ? "HTTP \(status)" : "未知错误"
+    }
+    attemptNext()
+  }
+
+  private func finish(_ path: String?, _ error: String?) {
+    if finished { return }
+    finished = true
+    session.invalidateAndCancel()
+    session = nil
+    completion(path, error)
+  }
+}
+
+// MARK: - 短视频：过期直链重解析
+
+/// 用离屏 WKWebView 打开视频页，从页面自带的 JSON 里取一条新直链。
+///
+/// TikTok 网页把整条视频的数据塞在 `__UNIVERSAL_DATA_FOR_REHYDRATION__`
+/// 这个 script 里（抖音在 `_ROUTER_DATA` 里）；不依赖具体结构，直接把所有
+/// 长得像 CDN 地址的字符串捞出来。
+final class ShortVideoPlayResolver: NSObject {
+  private let videoId: String
+  private let platform: String
+  private let userAgent: String
+  private let completion: (String?) -> Void
+  private var webView: WKWebView?
+  private var timer: Timer?
+  private var ticks = 0
+  private var candidate = 0
+  private var finished = false
+
+  init(
+    videoId: String,
+    platform: String,
+    userAgent: String,
+    completion: @escaping (String?) -> Void
+  ) {
+    self.videoId = videoId
+    self.platform = platform
+    self.userAgent = userAgent
+    self.completion = completion
+    super.init()
+  }
+
+  func start() {
+    // TikTok 的 embed 页是服务端直出的，先用一次轻量 HTTP 试试：2G 内存的
+    // 6s 上能省掉一整个 WKWebView。失败再退回 WebView。
+    if platform == "tiktok" {
+      prefetch()
+      return
+    }
+    startWebView()
+  }
+
+  private func pages() -> [String] {
+    if platform == "douyin" {
+      return ["https://www.douyin.com/video/\(videoId)"]
+    }
+    return [
+      "https://www.tiktok.com/embed/v2/\(videoId)",
+      "https://www.tiktok.com/@i/video/\(videoId)",
+      "https://m.tiktok.com/v/\(videoId).html",
+    ]
+  }
+
+  private func prefetch() {
+    guard let url = URL(string: pages()[0]) else {
+      startWebView()
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 8
+    request.setValue(
+      userAgent.isEmpty
+        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 15_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Mobile/15E148 Safari/604.1"
+        : userAgent,
+      forHTTPHeaderField: "User-Agent"
+    )
+    request.setValue("https://www.tiktok.com/", forHTTPHeaderField: "Referer")
+    request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+    let task = URLSession.shared.dataTask(with: request) { [self] data, _, _ in
+      var found: String?
+      if let data = data, data.count > 1024, data.count < 4_000_000,
+         let text = String(data: data, encoding: .utf8) {
+        found = ShortVideoPlayResolver.pick(text)
+      }
+      DispatchQueue.main.async {
+        guard !self.finished else { return }
+        if let found = found {
+          self.finish(found)
+        } else {
+          self.startWebView()
+        }
+      }
+    }
+    task.resume()
+  }
+
+  private func startWebView() {
+    guard !finished else { return }
+    let config = WKWebViewConfiguration()
+    config.websiteDataStore = .default()
+    config.defaultWebpagePreferences.preferredContentMode = .desktop
+    let web = WKWebView(
+      frame: CGRect(x: 0, y: 0, width: 390, height: 844),
+      configuration: config
+    )
+    if !userAgent.isEmpty {
+      web.customUserAgent = userAgent
+    }
+    webView = web
+    candidate = 0
+    if let url = URL(string: pages()[0]) {
+      web.load(URLRequest(url: url))
+    }
+    let ticker = Timer(timeInterval: 0.9, repeats: true) { [self] _ in
+      self.poll()
+    }
+    RunLoop.main.add(ticker, forMode: .common)
+    timer = ticker
+  }
+
+  private func poll() {
+    guard !finished, let web = webView else { return }
+    ticks += 1
+    // 约 18 秒还没捞到就放弃，别把播放卡住。
+    if ticks > 20 {
+      finish(nil)
+      return
+    }
+    // 第 7 / 13 个 tick 依次换下一个候选页：embed → 主页 → 移动版。
+    if ticks == 7 || ticks == 13 {
+      let list = pages()
+      let next = candidate + 1
+      if next < list.count {
+        candidate = next
+        if let url = URL(string: list[next]) {
+          web.load(URLRequest(url: url))
+        }
+        return
+      }
+    }
+    let js = """
+    (function () {
+      var el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+      if (el && el.textContent) { return el.textContent; }
+      var other = document.getElementById('_ROUTER_DATA');
+      if (other && other.textContent) { return other.textContent; }
+      var html = document.documentElement ? document.documentElement.innerHTML : '';
+      return html.length > 900000 ? html.substring(0, 900000) : html;
+    })()
+    """
+    web.evaluateJavaScript(js) { [self] value, _ in
+      guard !self.finished else { return }
+      guard let text = value as? String, text.count > 200 else { return }
+      if let url = ShortVideoPlayResolver.pick(text) {
+        self.finish(url)
+      }
+    }
+  }
+
+  private func finish(_ url: String?) {
+    if finished { return }
+    finished = true
+    timer?.invalidate()
+    timer = nil
+    webView?.stopLoading()
+    webView = nil
+    completion(url)
+  }
+
+  /// 在页面 JSON 里挑一条能直接下的地址。
+  static func pick(_ text: String) -> String? {
+    var fallback: String?
+    for raw in text.split(separator: "\"") {
+      guard raw.contains("http") else { continue }
+      let token = unescape(String(raw))
+      guard token.hasPrefix("http") else { continue }
+      guard token.contains("/video/tos/")
+        || token.contains("aweme/v1/play/")
+        || token.contains("douyinvod") else { continue }
+      if token.contains("mime_type=video_mp4") { return token }
+      if fallback == nil { fallback = token }
+    }
+    return fallback
+  }
+
+  /// JSON 里的 `\/`、`\u002F`、`\u0026` 都要还原，否则地址是坏的。
+  static func unescape(_ input: String) -> String {
+    if !input.contains("\\") {
+      return input
+    }
+    var output = ""
+    var index = input.startIndex
+    while index < input.endIndex {
+      let char = input[index]
+      if char == "\\",
+         let next = input.index(index, offsetBy: 1, limitedBy: input.endIndex),
+         next < input.endIndex {
+        if input[next] == "/" {
+          output.append("/")
+          index = input.index(after: next)
+          continue
+        }
+        if input[next] == "u",
+           let end = input.index(index, offsetBy: 6, limitedBy: input.endIndex) {
+          let hex = String(input[input.index(index, offsetBy: 2)..<end])
+          if hex.count == 4,
+             let code = UInt32(hex, radix: 16),
+             let scalar = Unicode.Scalar(code) {
+            output.append(Character(scalar))
+            index = end
+            continue
+          }
+        }
+      }
+      output.append(char)
+      index = input.index(after: index)
+    }
+    return output
   }
 }

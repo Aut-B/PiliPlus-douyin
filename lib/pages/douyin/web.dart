@@ -39,6 +39,14 @@ abstract final class ShortVideoWeb {
           if (args is String) onStatus?.call(args);
         case 'closed':
           onClosed?.call();
+        case 'downloadProgress':
+          if (args is Map) {
+            final id = args['id'];
+            final value = args['progress'];
+            if (id is int && value is num) {
+              _downloadProgress[id]?.call(value.toDouble());
+            }
+          }
       }
       return null;
     });
@@ -114,7 +122,98 @@ abstract final class ShortVideoWeb {
   static void clearCookieCache() {
     _cookieCache.clear();
     _cookieAt.clear();
+    _playUrlCache.clear();
+    _playUrlAt.clear();
   }
+
+  /// 重新解析出来的直链，20 分钟内复用。
+  static final Map<String, String> _playUrlCache = {};
+  static final Map<String, DateTime> _playUrlAt = {};
+
+  /// 让原生这边开一个离屏网页，把一条视频的新直链重新解析出来。
+  ///
+  /// 收藏里存的是签名直链，过几个小时就 403；TikTok 官方的「长期地址」
+  /// （tiktokv.com）实测全返回 HTTP 400，只能回页面里重新拿。
+  static Future<String?> resolvePlayUrl({
+    required String platformId,
+    required String videoId,
+    required String userAgent,
+  }) async {
+    if (videoId.isEmpty) return null;
+    final cacheKey = '$platformId:$videoId';
+    final at = _playUrlAt[cacheKey];
+    if (at != null &&
+        DateTime.now().difference(at) < const Duration(minutes: 20)) {
+      final cached = _playUrlCache[cacheKey];
+      if (cached != null && cached.isNotEmpty) return cached;
+    }
+    _ensureHandler();
+    try {
+      final url = await _channel.invokeMethod<String>('resolvePlayUrl', {
+        'platform': platformId,
+        'videoId': videoId,
+        'userAgent': userAgent,
+      });
+      if (url == null || url.isEmpty) return null;
+      _playUrlCache[cacheKey] = url;
+      _playUrlAt[cacheKey] = DateTime.now();
+      return url;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static int _downloadSeq = 0;
+  static final Map<int, void Function(double)> _downloadProgress = {};
+
+  /// 最近一次原生下载的失败原因（给体检结果用）。
+  static String lastDownloadError = '';
+
+  /// 原生 URLSession 下载，成功返回本地路径。
+  ///
+  /// 关键差别在于 cookie：这里把 WKWebView 的整罐 cookie 显式塞进请求头，
+  /// 而 Dart 的 HttpClient 是另一套罐子，TikTok 的 CDN 认的就是前者。
+  static Future<String?> nativeDownload({
+    required List<String> urls,
+    required String destPath,
+    required String userAgent,
+    required String referer,
+    required String cookieDomain,
+    void Function(double progress)? onProgress,
+  }) async {
+    final targets = urls.where((url) => url.isNotEmpty).toList(growable: false);
+    if (targets.isEmpty || destPath.isEmpty) return null;
+    _ensureHandler();
+    final id = ++_downloadSeq;
+    if (onProgress != null) _downloadProgress[id] = onProgress;
+    lastDownloadError = '';
+    try {
+      final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'download',
+        {
+          'id': id,
+          'urls': targets,
+          'destPath': destPath,
+          'userAgent': userAgent,
+          'referer': referer,
+          'cookieDomain': cookieDomain,
+        },
+      );
+      final path = result?['path'];
+      if (path is String && path.isNotEmpty) return path;
+      final error = result?['error'];
+      lastDownloadError = error is String && error.isNotEmpty
+          ? error
+          : '原生下载失败';
+      return null;
+    } catch (e) {
+      lastDownloadError = '$e';
+      return null;
+    } finally {
+      _downloadProgress.remove(id);
+    }
+  }
+
   static Future<void> start() => _channel.invokeMethod('start');
 
   static Future<void> stop() => _channel.invokeMethod('stop');
