@@ -113,6 +113,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   /// 这一条已经判过「播完」，避免 ticker 和 completed 双触发。
   bool _completionFired = false;
+
+  /// 用户从队列选中、自然播完或自动 QA 才允许自动起播。
+  /// 普通进页只预载画面，不自动播放。
+  bool _allowAutoPlay = false;
+  DateTime? _openStartedAt;
+
+  /// PiP 期间的解码/音频错误不应该被当成源坏了去跳下一条。
+  String _lastPlaybackError = '';
+  String _lastSkipReason = '';
   bool _fill = false;
   bool _landscape = false;
   bool _showControls = true;
@@ -291,10 +300,16 @@ final Set<String> _shufflePlayed = {};
         if (current == null || !mounted) return;
         final position = current.state.position;
         final duration = current.state.duration;
+        final openedAt = _openStartedAt;
+        final openedLongEnough = openedAt == null ||
+            DateTime.now().difference(openedAt) >= const Duration(seconds: 5);
         // 播到末尾自己判一次：media_kit 的 completed 在换源 / 小窗之后并不总触发，
         // 只靠它的话「自动连播」和「下一首」就是死的。
         if (duration > Duration.zero &&
-            position > Duration.zero &&
+            duration >= const Duration(seconds: 3) &&
+            position >= const Duration(seconds: 5) &&
+            position.inMilliseconds >= duration.inMilliseconds * 0.8 &&
+            openedLongEnough &&
             duration - position <= const Duration(milliseconds: 500) &&
             !_openInFlight &&
             !_completionFired) {
@@ -485,10 +500,17 @@ final Set<String> _shufflePlayed = {};
 
   void _onPlayerError(String message) {
     if (!mounted) return;
+    _lastPlaybackError = message;
     if (message.startsWith('画中画') ||
         message.startsWith('启动画中画') ||
         message.startsWith('系统说')) {
       _showToast(message);
+      return;
+    }
+    // 小窗已经起来后，PiP/音频会话/解码错误往往只是系统状态切换。
+    // 直接走换源退回会把好视频误判成坏源，表现为几秒跳一条。
+    if (_session.pipActive) {
+      _showToast('小窗播放错误：$message');
       return;
     }
     unawaited(_onPlaybackError(message));
@@ -574,8 +596,9 @@ final Set<String> _shufflePlayed = {};
   ///
   /// 排障用法：打开面板 → 按 Home 让它自动进小窗 → 等它卡住 → 切回来读结论那一行。
   Future<void> _openPipDiagnostics() async {
-    if (!_session.ready) {
-      _showToast('播放器还没准备好');
+    final controller = _session.controller;
+    if (controller == null) {
+      _showToast('播放器尚未初始化：$_lastPlaybackError');
       return;
     }
     await showModalBottomSheet<void>(
@@ -583,13 +606,18 @@ final Set<String> _shufflePlayed = {};
       isScrollControlled: true,
       backgroundColor: const Color(0xFF1C1C1E),
       builder: (_) => _PipDiagnosticsSheet(
-        controller: _session.controller!,
+        controller: controller,
         fgPipStarts: _session.foregroundPipStarts,
         foregroundStartRequired:
             (PipQaConfig.active?.requiresForegroundPipStart ??
                 (_session.pipQaMode == 'manual')),
         modeLabel: PipQaConfig.active?.foregroundPipStartLabel ??
             'B 站同款默认路径（legacy）',
+        extraLines: [
+          '最近播放错误：${_lastPlaybackError.isEmpty ? '无' : _lastPlaybackError}',
+          '最近切换原因：${_lastSkipReason.isEmpty ? '无' : _lastSkipReason}',
+          '播放器就绪：${_session.ready}',
+        ],
       ),
     );
   }
@@ -649,6 +677,7 @@ final Set<String> _shufflePlayed = {};
   Future<void> _jumpTo(int index) async {
     if (index < 0 || index >= _queue.length || index == _displayedIndex) return;
     _markShufflePlayed(_queue[index].key);
+    _allowAutoPlay = true;
     setState(() => _index = index);
     await _openIndex(index);
   }
@@ -733,9 +762,12 @@ final Set<String> _shufflePlayed = {};
     int index, {
     bool resetRetry = true,
     String? restoreKey,
+    bool? autoPlay,
   }) async {
     if (_queue.isEmpty) return;
     final token = ++_openToken;
+    _openStartedAt = DateTime.now();
+    if (autoPlay != null) _allowAutoPlay = autoPlay;
     _openInFlight = true;
     try {
       _index = _clampedIndex(index);
@@ -801,7 +833,9 @@ final Set<String> _shufflePlayed = {};
       await _session.prepareForNewMedia();
       final opened = _openLock.then((_) async {
         if (token != _openToken || !mounted) return;
-        await player.open(Media(url), play: true);
+        final shouldAutoPlay =
+            _allowAutoPlay || _qaAutoRunActive || widget.showImmediately;
+        await player.open(Media(url), play: shouldAutoPlay);
       });
       _openLock = opened.then((_) {}, onError: (_) {});
       await opened;
@@ -851,6 +885,7 @@ final Set<String> _shufflePlayed = {};
   /// 解析不出来就跳下一条；连跳一圈还不行就停下来说清楚。
   void _skipBroken(int index) {
     if (_queue.isEmpty) return;
+    _lastSkipReason = '播放错误跳下一条';
     if (_queue.length <= 1 || _skipped >= _queue.length) {
       _showToast('这条播不了');
       return;
@@ -917,6 +952,7 @@ final Set<String> _shufflePlayed = {};
         return;
       }
       _showToast('播放失败：$message');
+      _lastSkipReason = '三级回退后仍失败';
       _skipBroken(index);
     } finally {
       _busy = false;
@@ -1075,6 +1111,8 @@ final Set<String> _shufflePlayed = {};
   void _onCompleted() {
     if (!mounted || _openInFlight || _completionFired || _queue.isEmpty) return;
     _completionFired = true;
+    _lastSkipReason = '播放完成';
+    _allowAutoPlay = true;
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
     final current = _displayedIndex;
@@ -2106,6 +2144,7 @@ class _PipDiagnosticsSheet extends StatefulWidget {
     this.fgPipStarts = 0,
     this.foregroundStartRequired = false,
     this.modeLabel = 'B 站同款默认路径（legacy）',
+    this.extraLines = const <String>[],
   });
 
   final VideoController controller;
@@ -2118,6 +2157,9 @@ class _PipDiagnosticsSheet extends StatefulWidget {
 
   /// 结论里使用的模式名。
   final String modeLabel;
+
+  /// 播放器还没 ready 时也能看到的 Dart 侧上下文。
+  final List<String> extraLines;
 
   @override
   State<_PipDiagnosticsSheet> createState() => _PipDiagnosticsSheetState();
@@ -2386,6 +2428,7 @@ class _PipDiagnosticsSheetState extends State<_PipDiagnosticsSheet> {
     final lines = <String>[
       '结论：$_verdict',
       '版本：${BuildConfig.versionName}(${BuildConfig.versionCode})',
+      ...widget.extraLines,
     ];
     for (final row in _rows) {
       lines.add('${row[0]}: ${row[1]}');

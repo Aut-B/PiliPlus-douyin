@@ -192,6 +192,7 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
             _completePipStart();
             pipActive = true;
             _acquirePipHold();
+            unawaited(forceOverlayOff());
             unawaited(_setAudioSession(true));
             unawaited(forceOverlayOff());
           case 'restore':
@@ -326,14 +327,14 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
   }
 
   Future<void> forceOverlayOff() async {
-    if (!Platform.isIOS || !ready) return;
+    if (!Platform.isIOS || controller == null) return;
     try {
       await controller!.setPictureInPictureDebugOverlay(false);
     } catch (_) {}
   }
 
   Future<void> prepareForNewMedia() async {
-    if (!Platform.isIOS || !ready) return;
+    if (!Platform.isIOS || controller == null) return;
     final current = controller!;
     try {
       await forceOverlayOff();
