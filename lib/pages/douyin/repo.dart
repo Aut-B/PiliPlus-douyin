@@ -135,6 +135,8 @@ class ShortVideoSyncResult {
     required this.remote,
     this.storedDouyin = -1,
     this.storedTiktok = -1,
+    this.added = 0,
+    this.pushed = false,
   });
 
   final int douyin;
@@ -147,6 +149,12 @@ class ShortVideoSyncResult {
   final int storedDouyin;
   final int storedTiktok;
 
+  /// 这一轮真正新增到远端的条数。
+  final int added;
+
+  /// 这一轮有没有真的写远端。false 代表远端已是最新，直接跳过。
+  final bool pushed;
+
   int get total => douyin + tiktok;
 
   bool get storedOk =>
@@ -155,7 +163,10 @@ class ShortVideoSyncResult {
   String get summary {
     final remoteText = remote < 0 ? '远端无文件' : '远端 $remote 条';
     if (storedOk) {
-      return '抖音 $douyin / TikTok $tiktok（$remoteText）';
+      if (!pushed) {
+        return '抖音 $douyin / TikTok $tiktok（$remoteText，已是最新）';
+      }
+      return '抖音 $douyin / TikTok $tiktok（$remoteText，新增 $added 条）';
     }
     final storedText = storedDouyin < 0 || storedTiktok < 0
         ? '本地写入失败'
@@ -223,7 +234,11 @@ abstract final class ShortVideoSync {
     await client.write(remotePath, utf8.encode(jsonEncode(document.toJson())));
   }
 
-  /// 本地 + 远端取并集，写回本地，再把合并结果推上去。
+  /// 本地 + 远端取并集，写回本地，只有真的有新增/变化时才推回远端。
+  ///
+  /// 以前每次同步都无条件 push 整份 JSON：收藏几百条时，热路径每次都得重写
+  /// 远端整个文件，表现就是「每次同步都把整个收藏夹重新收藏一遍」，又慢又
+  /// 容易被 WebDAV 限流。现在先比指纹，没有差异就完全不碰远端。
   static Future<ShortVideoSyncResult> synchronize() async {
     if (!configured) {
       return const ShortVideoSyncResult(douyin: 0, tiktok: 0, remote: -1);
@@ -235,6 +250,21 @@ abstract final class ShortVideoSync {
       remote?.items ?? const [],
     ).where((e) => !deleted.contains(e.key)).toList();
     final written = ShortVideoRepo.saveAll(merged);
+    final remoteItems = remote?.items ?? const <ShortVideo>[];
+    final added = _countNewKeys(remoteItems, merged);
+    final removed = _countNewKeys(merged, remoteItems);
+    if (added == 0 && removed == 0) {
+      // 远端已经是最新的：不写、不重排、不动 updatedAt。
+      return ShortVideoSyncResult(
+        douyin: merged.where((e) => e.platform == 'douyin').length,
+        tiktok: merged.where((e) => e.platform == 'tiktok').length,
+        remote: remote?.items.length ?? -1,
+        storedDouyin: written['douyin'] ?? -1,
+        storedTiktok: written['tiktok'] ?? -1,
+        added: 0,
+        pushed: false,
+      );
+    }
     await push(
       ShortVideoSyncDocument(
         updatedAt: DateTime.now().millisecondsSinceEpoch.toDouble(),
@@ -247,6 +277,22 @@ abstract final class ShortVideoSync {
       remote: remote?.items.length ?? -1,
       storedDouyin: written['douyin'] ?? -1,
       storedTiktok: written['tiktok'] ?? -1,
+      added: added,
+      pushed: true,
     );
+  }
+
+  /// `source` 里有、`reference` 里没有的条数（按 key 比）。
+  static int _countNewKeys(
+    List<ShortVideo> source,
+    List<ShortVideo> reference,
+  ) {
+    if (source.isEmpty) return 0;
+    final known = reference.map((e) => e.key).toSet();
+    var count = 0;
+    for (final video in source) {
+      if (!known.contains(video.key)) count++;
+    }
+    return count;
   }
 }
