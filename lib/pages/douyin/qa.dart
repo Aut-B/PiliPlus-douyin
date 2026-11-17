@@ -35,43 +35,8 @@ Future<PipQaConfig?> loadPipQaConfig() async {
     PipQaConfig.source = 'host';
     return fromHost;
   }
-  // 启动参数（`dvt launch 'bundle -PIPQA {json}'`）。
-  //
-  // 这条通道不需要 App 有任何沙盒外权限，也不需要重打包，是 TrollStore 包
-  // 最稳的一条配置送达路径：env 在部分系统版本上不会进 `Platform.environment`。
-  try {
-    final raw = await _qaDumpChannel.invokeMethod<String>('launchConfig');
-    final fromLaunch = _configFromHost(raw);
-    if (fromLaunch != null) {
-      PipQaConfig.source = 'launch';
-      return fromLaunch;
-    }
-  } catch (_) {}
-  // TrollStore 安装的包没有 installd 记录，house_arrest 会
-  // InstallationLookupFailed，写不进 Documents。原生侧仍然能读写
-  // /private/var/mobile/Media/piliplus_qa/，所以优先走这条通道。
-  try {
-    final raw = await _qaDumpChannel.invokeMethod<String>(
-      'read',
-      <String, Object?>{'name': PipQaConfig.fileName},
-    );
-    final fromMedia = _configFromHost(raw);
-    if (fromMedia != null) {
-      PipQaConfig.source = 'media';
-      return fromMedia;
-    }
-  } catch (_) {}
-  try {
-    final dir = await getApplicationDocumentsDirectory();
-    final file = File('${dir.path}/${PipQaConfig.fileName}');
-    if (!await file.exists()) return null;
-    final decoded = jsonDecode(await file.readAsString());
-    if (decoded is! Map) return null;
-    final config = PipQaConfig.fromJson(decoded.cast<String, dynamic>());
-    if (!config.enabled) return null;
-    PipQaConfig.source = 'documents';
-    return config;
-  } catch (_) {}
+  // 内嵌配置绑定 build number。手机里遗留的 pip_qa.json / launch 参数会带旧
+  // runId、旧日志和强制跳条，必须忽略；只有 CI 的 --dart-define 可以覆盖。
   final builtIn = _builtInConfig();
   PipQaConfig.source = 'builtin';
   return builtIn;
@@ -160,6 +125,7 @@ Future<void> startPipQaIfRequested(PipQaConfig? config) async {
   if (config == null || !config.autoStart) return;
   if (await _qaAlreadyRan(config)) return;
   PipQaRuntime.begin(config);
+  await _clearStaleQaEvidence(config);
   ShortVideoSession.instance.resetPipQaCounters();
   try {
     final queue = buildPipQaQueue(config);
@@ -184,6 +150,30 @@ Future<void> startPipQaIfRequested(PipQaConfig? config) async {
   } catch (error) {
     await _finishQaWithFailure(config, '自动 QA 启动失败：$error');
   }
+}
+
+Future<void> _clearStaleQaEvidence(PipQaConfig config) async {
+  const names = <String>[
+    'pip_qa_log.json',
+    'pip_diag.jsonl',
+    'pip_qa_host.jsonl',
+    'pip_diag_latest.txt',
+  ];
+  for (final name in names) {
+    try {
+      await _qaDumpChannel.invokeMethod<void>(
+        'clear',
+        <String, Object?>{'name': name},
+      );
+    } catch (_) {}
+  }
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    for (final name in names) {
+      final file = File('${dir.path}/$name');
+      if (await file.exists()) await file.delete();
+    }
+  } catch (_) {}
 }
 
 Future<void> _startPipQaRun(

@@ -412,7 +412,9 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
     }
     if (config.shuffle && _mode != ShortVideoLoopMode.shuffle) {
       _mode = ShortVideoLoopMode.shuffle;
-      _resetShuffleBag();
+      // QA 每轮必须保持同一套 randomly shuffled deck；重建牌堆会让
+      // 下一个视频回到起点，表现为同一条反复播放。
+      _syncShuffleQueue();
     }
     _qaRecorder?.close();
     final recorder = PipQaRecorder(
@@ -474,6 +476,9 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
 
   void _recordQaAdvance(String reason) {
     if (!_qaAutoRunActive) return;
+    if (reason == 'qaTimer' || reason == 'shuffleNext') {
+      return;
+    }
     _qaAdvanceHistory.add(<String, Object?>{
       'at': DateTime.now().toIso8601String(),
       'fromKey': _playingKey,
@@ -1196,13 +1201,10 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
   }
 
   int _nextShuffleIndex() {
-    if (_qaAutoRunActive) {
-      _lastAdvanceReason = '随机播放自然切换';
-      _recordQaAdvance('shuffleNext');
-    }
     if (_queue.isEmpty) return 0;
     if (_queue.length <= 1) return _displayedIndex;
     _syncShuffleQueue();
+    _markShufflePlayed(_current.key);
     if (_shuffleDeck.isEmpty) _startShuffleRound();
     while (_shuffleDeck.isNotEmpty) {
       final key = _shuffleDeck.removeAt(0);
@@ -1231,8 +1233,10 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
         )
         .toList();
     if (remaining.isEmpty) {
-      // 这一轮已经播完：清空历史重新开一轮，不能刚重启就一直重复。
-      _shufflePlayed.clear();
+      // 一轮播完后只淘汰旧条目，当前条目保留，避免新一轮第一首又回到起点。
+      _shufflePlayed
+        ..clear()
+        ..add(currentKey);
       remaining = allKeys.where((key) => key != currentKey).toList();
     }
     remaining.shuffle(_shuffleRandom);

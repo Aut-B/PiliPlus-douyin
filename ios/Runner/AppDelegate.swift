@@ -87,6 +87,32 @@ final class PipQaHostLifecycle: NSObject {
     lock.unlock()
   }
 
+  /// 丢弃上一轮残留宿主日志并写入本轮开始标记。旧日志不能再冒充当前 run 的证据。
+  func beginRun(runId value: String) {
+    lock.lock()
+    runId = value
+    lock.unlock()
+    writeQueue.async {
+      guard let directory = FileManager.default.urls(
+        for: .documentDirectory,
+        in: .userDomainMask
+      ).first else { return }
+      let file = directory.appendingPathComponent("pip_qa_host.jsonl")
+      try? FileManager.default.removeItem(at: file)
+      let marker: [String: Any] = [
+        "ts": Date().timeIntervalSince1970,
+        "runId": value,
+        "event": "runStarted",
+        "appState": "active",
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: marker) {
+        var line = data
+        line.append(contentsOf: Data("\n".utf8))
+        try? line.write(to: file, options: .atomic)
+      }
+    }
+  }
+
   func log(
     event: String,
     appState: UIApplication.State,
@@ -179,7 +205,9 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
     case "background":
       let seconds = Self.backgroundSeconds(from: call.arguments)
       if let args = call.arguments as? [String: Any] {
-        PipQaHostLifecycle.shared.setRunId((args["runId"] as? String) ?? "")
+        let runId = (args["runId"] as? String) ?? ""
+        PipQaHostLifecycle.shared.setRunId(runId)
+        PipQaHostLifecycle.shared.beginRun(runId: runId)
       }
       DispatchQueue.main.async {
         self.beginBackgroundInterval(seconds: seconds)
@@ -1468,6 +1496,28 @@ final class QaDumpPlugin: NSObject, FlutterPlugin {
         }
       }
       NSLog("[PIPQA] read miss: \(safeName) (media+documents)")
+      result(nil)
+      return
+    }
+    if call.method == "clear" {
+      let name = (call.arguments as? [String: Any])?["name"] as? String ?? ""
+      let safeName = name
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "..", with: "_")
+      guard !safeName.isEmpty else {
+        result(FlutterError(code: "bad_args", message: "missing name", details: nil))
+        return
+      }
+      let mediaPath = (Self.mediaDir as NSString).appendingPathComponent(safeName)
+      try? FileManager.default.removeItem(atPath: mediaPath)
+      if let docs = NSSearchPathForDirectoriesInDomains(
+        .documentDirectory,
+        .userDomainMask,
+        true
+      ).first {
+        let path = (docs as NSString).appendingPathComponent(safeName)
+        try? FileManager.default.removeItem(atPath: path)
+      }
       result(nil)
       return
     }
