@@ -562,6 +562,10 @@ final class ShortVideoWebViewController: UIViewController {
   private var popup: ShortVideoPopupController?
   private var lastPopupURL = ""
   private var lastPopupAt = Date.distantPast
+  /// 登录完成轮询的代号：每次点登录加一，旧的轮询发现代号变了就自己停。
+  private var loginWatchGeneration = 0
+  /// 这次点登录之后，登录浮层到底有没有出现过。
+  private var loginDialogSeen = false
 
   static func armedHookScript(hookScript: String) -> String {
     """
@@ -743,21 +747,145 @@ final class ShortVideoWebViewController: UIViewController {
     load(favoritesURL)
   }
 
+  /// 打开登录。
+  ///
+  /// 直接 `load(loginURL)` 是不行的：`sso.douyin.com` 只是一个登录落地页，
+  /// 登录浮层必须由 `www.douyin.com` 自己的前端拉起来，才有回调可以把 cookie
+  /// 写进 douyin.com 域。卸载重装后 WKWebView 的 data store 是空的，未登录的
+  /// 抖音首页会把侧栏「我的」和头像入口做成点不动的样式，用户于是「根本没有登录
+  /// 入口」。这里改成：先在当前页面里用 JS 点官方登录按钮，点不到再退回 SSO。
   @objc private func openLogin() {
-    load(loginURL)
+    let script = ShortVideoWebViewController.loginTriggerScript
+    webView.evaluateJavaScript(script) { [weak self] result, error in
+      guard let self else { return }
+      if error == nil, ShortVideoWebViewController.truthy(result) {
+        self.setStatus("已调出登录浮层，扫码或手机号登录后等待自动刷新…")
+        self.watchLoginCompletion()
+        return
+      }
+      // 页面没渲染登录按钮（还没加载完、或站点改版）：退回站点自己的登录页。
+      self.load(self.loginURL)
+    }
   }
+
+  /// `evaluateJavaScript` 把 JS 布尔桥接成 NSNumber 而不是 Bool，
+  /// 直接 `as? Bool` 会永远失败，于是每次都被当成「没点到」退回 SSO。
+  static func truthy(_ value: Any?) -> Bool {
+    if let flag = value as? Bool { return flag }
+    if let number = value as? NSNumber { return number.boolValue }
+    return false
+  }
+
+  /// 等登录完成，然后刷新当前页把登录态带进来。
+  ///
+  /// 抖音的登录浮层是前端自己管理的，登录完不会整页跳转，cookie 虽然写进了
+  /// douyin.com 域，但当前页面上的旧渲染还是未登录状态；不刷新就抓不到收藏。
+  private func watchLoginCompletion() {
+    loginWatchGeneration += 1
+    loginDialogSeen = false
+    let generation = loginWatchGeneration
+    pollLoginState(generation: generation, attempt: 0)
+  }
+
+  private func pollLoginState(generation: Int, attempt: Int) {
+    guard generation == loginWatchGeneration, attempt < 60 else { return }
+    let probe = """
+    (function () {
+      var dialog = document.querySelector(
+        '[class*=login-container], [class*=loginModal], [id*=login-modal]'
+      );
+      var dialogVisible = false;
+      if (dialog) {
+        var style = window.getComputedStyle(dialog);
+        var rect = dialog.getBoundingClientRect();
+        dialogVisible = style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && rect.width > 0
+          && rect.height > 0;
+      }
+      var avatar = document.querySelector(
+        '[data-e2e*=user-info], [class*=userInfo], [class*=avatar]'
+      );
+      // seen 用来区分「登录浮层出现过又关掉」和「压根没弹出浮层」：
+      // 未登录页面上也有 avatar 节点，只看它会一开头就误判成已登录。
+      return { visible: dialogVisible, seen: !!dialog, avatar: !!avatar };
+    })();
+    """
+    webView.evaluateJavaScript(probe) { [weak self] result, _ in
+      guard let self, generation == self.loginWatchGeneration else { return }
+      let map = result as? [String: Any] ?? [:]
+      let visible = ShortVideoWebViewController.truthy(map["visible"])
+      let seen = ShortVideoWebViewController.truthy(map["seen"])
+      let avatar = ShortVideoWebViewController.truthy(map["avatar"])
+      if seen { self.loginDialogSeen = true }
+      // 判定登录完成：浮层曾出现过、现在已关闭，且页面上出现了登录态节点。
+      if self.loginDialogSeen && !visible && avatar {
+        self.loginWatchGeneration += 1
+        self.setStatus("登录成功，正在刷新页面…")
+        self.webView.reload()
+        return
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+        self.pollLoginState(generation: generation, attempt: attempt + 1)
+      }
+    }
+  }
+
+  /// 在当前页面里找官方登录入口并点一下。
+  ///
+  /// 顺序：抖音头部的「登录」按钮 → 侧栏「我的」→ TikTok 的 log in 链接。
+  /// 返回 true 表示点到了至少一个候选元素。
+  static let loginTriggerScript: String = """
+  (function () {
+    var texts = ['登录', '立即登录', 'Log in', 'Log in to TikTok', '登录/注册'];
+    var nodes = document.querySelectorAll(
+      'button, a, div[role=button], [data-e2e*=login], [class*=login]'
+    );
+    var hit = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = (el.innerText || el.textContent || '').trim();
+      if (t.length === 0 || t.length > 12) { continue; }
+      for (var j = 0; j < texts.length; j++) {
+        if (t === texts[j] || t.indexOf(texts[j]) === 0) {
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) { continue; }
+          el.click();
+          hit = hit + 1;
+          break;
+        }
+      }
+      if (hit > 0) { break; }
+    }
+    if (hit === 0) {
+      // 兜底：站点常把登录入口挂在 avatar / 个人中心上。
+      var avatar = document.querySelector(
+        '[data-e2e*=avatar], [class*=avatar], [class*=Avatar]'
+      );
+      if (avatar) { avatar.click(); hit = hit + 1; }
+    }
+    return hit > 0;
+  })();
+  """
 
   /// 开一个真正的弹窗，别把站点自己的页面冲掉。
   private func presentPopup(_ url: URL) {
     let scheme = (url.scheme ?? "").lowercased()
     guard scheme == "http" || scheme == "https" else { return }
-    guard popup == nil else { return }
     let signature = url.absoluteString
     if signature == lastPopupURL, Date().timeIntervalSince(lastPopupAt) < 3 {
       return
     }
     lastPopupURL = signature
     lastPopupAt = Date()
+
+    // 弹窗已经开着的时候以前是直接 return：抖音登录先弹扫码再转手机号，
+    // 第二次 window.open 就被静默吞掉，用户感觉「点了完全没反应」。
+    // 现在改成让已有弹窗自己跳过去，而不是丢弃这次导航。
+    if let existing = popup {
+      existing.load(url)
+      return
+    }
 
     let controller = ShortVideoPopupController(url: url, userAgent: userAgent) {
       [weak self] in
@@ -1106,6 +1234,13 @@ final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
     self.userAgent = userAgent
     self.onClose = onClose
     super.init(nibName: nil, bundle: nil)
+  }
+
+  /// 已经开着的弹窗改去加载新地址（主页面又发起了一次 window.open）。
+  func load(_ url: URL) {
+    guard isViewLoaded else { return }
+    webView.customUserAgent = userAgent
+    webView.load(URLRequest(url: url))
   }
 
   @available(*, unavailable)
