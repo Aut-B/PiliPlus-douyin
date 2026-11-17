@@ -380,6 +380,10 @@ PipQaVerdict? _evaluateHostDiag(
       );
     }
     // 回推路径同样必须做 runId 混轮校验，否则旧日志能冒充本轮证据。
+    final fallbackEvents = hostDiag['events'];
+    if (fallbackEvents is! List || fallbackEvents.isEmpty) {
+      return PipQaVerdict(false, '宿主生命周期事件缺失：$detail');
+    }
     final fallbackMixed = _mixedRunId(hostDiag, expectedRunId);
     if (fallbackMixed != null) return fallbackMixed;
     return null;
