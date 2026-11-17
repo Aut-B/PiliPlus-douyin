@@ -1232,7 +1232,7 @@ packages:
     description:
       path: media_kit_video
       ref: pip-6s
-      resolved-ref: 6686161e3a254b816de2c879314f2e0901f6e8c6
+      resolved-ref: 760bfa50a48dbd72aa242aa7a80ea9950e6325a5
       url: "https://github.com/Aut-B/Kazumi-media-kit.git"
     source: git
     version: "1.2.5"
