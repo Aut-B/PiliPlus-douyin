@@ -84,7 +84,7 @@ PipQaConfig _builtInConfig() {
     index: 0,
     playSeconds: 20,
     backgroundSeconds: 12,
-    advanceEvery: 4,
+    advanceEvery: 0,
     autoStart: true,
     pipMode: PipQaConfig.defaultPipMode,
     seedKeys: const <String>[],

@@ -122,6 +122,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// PiP 期间的解码/音频错误不应该被当成源坏了去跳下一条。
   String _lastPlaybackError = '';
   String _lastSkipReason = '';
+  String _lastAdvanceReason = '';
+  int _naturalCompletionCount = 0;
+  int _forcedAdvanceCount = 0;
   bool _fill = false;
   bool _landscape = false;
   bool _showControls = true;
@@ -153,6 +156,7 @@ List<String> _shuffleDeck = const [];
 String _shuffleQueueSignature = '';
 String _shuffleSignature = '';
 final Set<String> _shufflePlayed = {};
+final List<Map<String, Object?>> _qaAdvanceHistory = [];
 
   bool _ready = false;
 
@@ -420,12 +424,24 @@ final Set<String> _shufflePlayed = {};
         'playing': _playing,
         'ready': _ready,
         'qaAdvanceTick': _qaAdvanceTick,
+        'positionMs': _session.controller?.state.position.inMilliseconds ?? 0,
+        'durationMs': _session.controller?.state.duration.inMilliseconds ?? 0,
+        'lastAdvanceReason': _lastAdvanceReason,
+        'naturalCompletionCount': _naturalCompletionCount,
+        'forcedAdvanceCount': _forcedAdvanceCount,
+        'advanceHistory': _qaAdvanceHistory.length > 30
+            ? _qaAdvanceHistory.sublist(_qaAdvanceHistory.length - 30)
+            : _qaAdvanceHistory,
       },
       index: _index,
     );
     _qaRecorder = recorder;
     recorder.start();
     PipQaRuntime.markReady();
+    _qaAdvanceHistory.clear();
+    _naturalCompletionCount = 0;
+    _forcedAdvanceCount = 0;
+    _lastAdvanceReason = 'QA 已附加，等待真实播放完成';
     _qaAdvanceTimer?.cancel();
     _qaFinishTimer?.cancel();
     if (config.effectiveAdvanceEvery > 0) {
@@ -434,6 +450,9 @@ final Set<String> _shufflePlayed = {};
         (_) {
           if (!mounted || _queue.length < 2) return;
           _qaAdvanceTick += 1;
+          _forcedAdvanceCount += 1;
+          _lastAdvanceReason = 'QA 定时强制跳条';
+          _recordQaAdvance('qaTimer');
           if (_mode == ShortVideoLoopMode.shuffle) {
             unawaited(_jumpTo(_nextShuffleIndex()));
           } else {
@@ -451,6 +470,20 @@ final Set<String> _shufflePlayed = {};
       ),
       () => unawaited(_finishQa()),
     );
+  }
+
+  void _recordQaAdvance(String reason) {
+    if (!_qaAutoRunActive) return;
+    _qaAdvanceHistory.add(<String, Object?>{
+      'at': DateTime.now().toIso8601String(),
+      'fromKey': _playingKey,
+      'reason': reason,
+      'positionMs': _session.controller?.state.position.inMilliseconds ?? 0,
+      'durationMs': _session.controller?.state.duration.inMilliseconds ?? 0,
+    });
+    if (_qaAdvanceHistory.length > 80) {
+      _qaAdvanceHistory.removeAt(0);
+    }
   }
 
   Future<void> _finishQa() async {
@@ -886,6 +919,9 @@ final Set<String> _shufflePlayed = {};
   void _skipBroken(int index) {
     if (_queue.isEmpty) return;
     _lastSkipReason = '播放错误跳下一条';
+    _lastAdvanceReason = '播放错误跳下一条';
+    _forcedAdvanceCount += 1;
+    _recordQaAdvance('playbackError');
     if (_queue.length <= 1 || _skipped >= _queue.length) {
       _showToast('这条播不了');
       return;
@@ -1112,6 +1148,9 @@ final Set<String> _shufflePlayed = {};
     if (!mounted || _openInFlight || _completionFired || _queue.isEmpty) return;
     _completionFired = true;
     _lastSkipReason = '播放完成';
+    _lastAdvanceReason = '真实播放完成';
+    _naturalCompletionCount += 1;
+    _recordQaAdvance('completed');
     _allowAutoPlay = true;
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
@@ -1157,6 +1196,10 @@ final Set<String> _shufflePlayed = {};
   }
 
   int _nextShuffleIndex() {
+    if (_qaAutoRunActive) {
+      _lastAdvanceReason = '随机播放自然切换';
+      _recordQaAdvance('shuffleNext');
+    }
     if (_queue.isEmpty) return 0;
     if (_queue.length <= 1) return _displayedIndex;
     _syncShuffleQueue();

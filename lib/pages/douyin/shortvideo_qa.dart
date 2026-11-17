@@ -98,6 +98,7 @@ abstract final class ShortVideoQa {
         saved?.played.where(keys.toSet().contains).toList() ?? const [];
     final runId = PipQaConfig.active?.runId ?? 'auto-${BuildConfig.versionCode}';
     final pip = await _readPipSummary(runId);
+    final advanceHistory = _advanceHistory(pip);
     final realSequence = <String>[
       for (final key in (pip.remove('sequence') as List?) ?? const []) '$key',
     ];
@@ -115,6 +116,10 @@ abstract final class ShortVideoQa {
       'realSequence': realSequence.length > 80
           ? realSequence.sublist(realSequence.length - 80)
           : realSequence,
+      'advanceHistory': advanceHistory,
+      'naturalCompletionCount': _historyCount(advanceHistory, 'completed'),
+      'forcedAdvanceCount': _historyCount(advanceHistory, 'qaTimer') +
+          _historyCount(advanceHistory, 'playbackError'),
     };
 
     final playStats = ShortVideoPlayStats.snapshot();
@@ -173,7 +178,8 @@ abstract final class ShortVideoQa {
         'shuffleNoRepeat': keys.length <= 1 ||
             (shuffle['algorithmNoRepeatInRound'] == true &&
                 shuffle['realEvidence'] == true &&
-                shuffle['realNoRepeat'] == true),
+                shuffle['realNoRepeat'] == true &&
+                (shuffle['naturalCompletionCount'] as int) > 0),
         'pipBackground': (pip['pass'] ?? pip['passed']) == true,
       },
     };
@@ -318,6 +324,37 @@ abstract final class ShortVideoQa {
   static List<Map<String, Object?>> _tailEvents(List<Map<String, Object?>> events) {
     if (events.length <= 12) return events;
     return events.sublist(events.length - 12);
+  }
+
+  static List<Map<String, Object?>> _advanceHistory(Map<String, Object?> pip) {
+    final samples = pip['samples'];
+    if (samples is! List) return const [];
+    final seen = <String>{};
+    final history = <Map<String, Object?>>[];
+    for (final sample in samples) {
+      if (sample is! Map) continue;
+      final raw = sample['advanceHistory'];
+      if (raw is! List) continue;
+      for (final item in raw) {
+        if (item is! Map) continue;
+        final reason = '${item['reason'] ?? ''}';
+        final at = '${item['at'] ?? ''}';
+        final marker = '$at|$reason|${item['fromKey'] ?? ''}';
+        if (seen.add(marker)) {
+          history.add(item.map((key, value) => MapEntry('$key', value)));
+        }
+      }
+    }
+    if (history.length > 80) {
+      return history.sublist(history.length - 80);
+    }
+    return history;
+  }
+
+  static int _historyCount(List<Map<String, Object?>> history, String reason) {
+    return history
+        .where((item) => '${item['reason'] ?? ''}' == reason)
+        .length;
   }
 
   static Future<void> _write(Map<String, Object?> result) async {
