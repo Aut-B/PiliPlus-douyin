@@ -424,8 +424,8 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
         'playing': _playing,
         'ready': _ready,
         'qaAdvanceTick': _qaAdvanceTick,
-        'positionMs': _session.controller?.state.position.inMilliseconds ?? 0,
-        'durationMs': _session.controller?.state.duration.inMilliseconds ?? 0,
+        'positionMs': _position.inMilliseconds,
+        'durationMs': _duration.inMilliseconds,
         'lastAdvanceReason': _lastAdvanceReason,
         'naturalCompletionCount': _naturalCompletionCount,
         'forcedAdvanceCount': _forcedAdvanceCount,
@@ -478,8 +478,8 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
       'at': DateTime.now().toIso8601String(),
       'fromKey': _playingKey,
       'reason': reason,
-      'positionMs': _session.controller?.state.position.inMilliseconds ?? 0,
-      'durationMs': _session.controller?.state.duration.inMilliseconds ?? 0,
+      'positionMs': _position.inMilliseconds,
+      'durationMs': _duration.inMilliseconds,
     });
     if (_qaAdvanceHistory.length > 80) {
       _qaAdvanceHistory.removeAt(0);
