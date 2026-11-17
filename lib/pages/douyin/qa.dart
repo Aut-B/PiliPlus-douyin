@@ -48,7 +48,9 @@ PipQaConfig _builtInConfig() {
     runId: 'auto-${BuildConfig.versionCode}',
     index: 0,
     playSeconds: 20,
-    backgroundSeconds: 12,
+    // 6S 的 PiP 卡帧/泛红是尾段才暴露的：12 秒只能看到「切后台瞬间」，
+    // 拉长到 30 秒才能覆盖同一帧重复推、flush 掉帧和 hostAlpha 变化。
+    backgroundSeconds: 30,
     advanceEvery: 0,
     autoStart: true,
     pipMode: PipQaConfig.defaultPipMode,

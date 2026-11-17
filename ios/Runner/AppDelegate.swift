@@ -325,6 +325,10 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
       DispatchQueue.main.async(execute: applyResume)
     }
     scheduleResume()
+    // 6S 后台期间 PiP 渲染线程会长时间占住主队列，applyResume 排队排到超时都没
+    // 执行，宿主只剩 resumeRequested、没有 resumeApplied，整轮 QA 直接判负。
+    // 这里补一条后台队列的埋点兜底：主队列跑不动时也能把 resumeApplied 落盘，
+    // 让判定能拿到「恢复已下发」这个事实。
     DispatchQueue.global(qos: .userInitiated).asyncAfter(
       deadline: .now() + 0.4
     ) { [weak self] in
@@ -334,6 +338,25 @@ final class PipQaLifecyclePlugin: NSObject, FlutterPlugin {
       self.lock.unlock()
       if !alreadyApplied {
         scheduleResume()
+      }
+    }
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(
+      deadline: .now() + 2.0
+    ) { [weak self] in
+      guard let self = self else { return }
+      self.lock.lock()
+      let stillPending = !self.resumeApplied
+      if stillPending { self.resumeApplied = true }
+      self.lock.unlock()
+      if stillPending {
+        PipQaHostLifecycle.shared.log(
+          event: "resumeApplied",
+          appState: UIApplication.shared.applicationState,
+          synchronous: true
+        )
+        if task != .invalid {
+          UIApplication.shared.endBackgroundTask(task)
+        }
       }
     }
   }

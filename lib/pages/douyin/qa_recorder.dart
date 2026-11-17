@@ -525,10 +525,22 @@ Future<Map<String, Object?>> readPipQaHostDiag({
 
 Map<String, Object?> _hostDiagSegment(List<Map<String, Object?>> events) {
   const absent = <String, Object?>{};
+  final resumeAppliedList = events
+      .where((event) => _text(event['event']) == 'resumeApplied')
+      .toList(growable: false);
+  final resumeAppliedAny = resumeAppliedList.isEmpty
+      ? const <String, Object?>{}
+      : resumeAppliedList.last;
+  final backgroundList = events
+      .where((event) => _text(event['event']) == 'didEnterBackground')
+      .toList(growable: false);
+  final backgroundAny = backgroundList.isEmpty
+      ? const <String, Object?>{}
+      : backgroundList.last;
   final incomplete = <String, Object?>{
     'segmentComplete': false,
     'hostBackgroundSeconds': -1.0,
-    'backgroundEvent': absent,
+    'backgroundEvent': backgroundAny,
     'willEnterForegroundEvent': absent,
     'foregroundEvent': absent,
     'suspendRequested': events.any(
@@ -537,9 +549,11 @@ Map<String, Object?> _hostDiagSegment(List<Map<String, Object?>> events) {
     'resumeRequested': events.any(
       (event) => _text(event['event']) == 'resumeRequested',
     ),
-    'resumeApplied': events.any(
-      (event) => _text(event['event']) == 'resumeApplied',
-    ),
+    'resumeApplied': resumeAppliedAny.isNotEmpty,
+    // 6S 在 PiP 抢主队列时可能压根没分派 didBecomeActive，整段就此判成
+    // incomplete；这里保留 resumeApplied 事件本身，让判定侧还能用它的
+    // 时间戳回推真实后台时长，而不是被一条丢失的生命周期回调全盘否掉。
+    'resumeAppliedEvent': resumeAppliedAny,
   };
   var foregroundIndex = -1;
   for (var index = events.length - 1; index >= 0; index -= 1) {
@@ -641,6 +655,10 @@ Map<String, Object?> _hostDiagEvent(
 
 /// QA 通道事件只是内部控制标记：resumeApplied 记的是执行 resume 那一刻的
 /// 真实 applicationState，不能拿它覆盖 didBecomeActive 的最终生命周期状态。
+///
+/// 但 6S 后台被 PiP 占住主队列时，resume 之后 didBecomeActive 根本来不及分派，
+/// 日志里最后一条生命周期事件永远停在 didEnterBackground，于是整轮被判成
+/// 「没回前台」。这种情况下 resumeApplied 是唯一能证明已恢复的证据，必须兜底。
 String _hostDiagLastAppState(List<Map<String, Object?>> events) {
   const lifecycleEvents = <String>{
     'started',
@@ -649,13 +667,26 @@ String _hostDiagLastAppState(List<Map<String, Object?>> events) {
     'willEnterForeground',
     'didBecomeActive',
   };
+  var latestLifecycleSeq = -1;
+  var latestLifecycleState = '';
   for (var index = events.length - 1; index >= 0; index -= 1) {
     final event = events[index];
     if (lifecycleEvents.contains(_text(event['event']))) {
-      return _text(event['appState']);
+      latestLifecycleSeq = index;
+      latestLifecycleState = _text(event['appState']);
+      break;
     }
   }
-  return '';
+  for (var index = events.length - 1; index > latestLifecycleSeq; index -= 1) {
+    final event = events[index];
+    if (_text(event['event']) != 'resumeApplied') continue;
+    final state = _text(event['appState']);
+    if (state.isNotEmpty && state != 'background' && state != 'inactive') {
+      return state;
+    }
+    break;
+  }
+  return latestLifecycleState;
 }
 
 Map<String, Object?> _nativeDiagSegment(

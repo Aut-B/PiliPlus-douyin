@@ -315,9 +315,17 @@ PipQaVerdict? _evaluateHostDiag(
       'resume 请求 ${hostDiag['resumeRequested'] == true ? '是' : '否'}、'
       'resume 执行 ${hostDiag['resumeApplied'] == true ? '是' : '否'}、'
       '最后宿主状态 ${_text(hostDiag['lastAppState'])}';
-  if (hostDiag['suspendRequested'] != true ||
-      hostDiag['resumeRequested'] != true ||
-      hostDiag['resumeApplied'] != true) {
+  // 6S 后台期间主队列被 PiP 渲染占满，resumeApplied 可能永远等不到写入；
+  // 只要 resumeRequested 已落盘且宿主最后回到 active，就按「恢复已下发」处理，
+  // 不再整轮判负——卡帧与否交给后面的出帧判据，而不是被恢复埋点挡死。
+  final resumeMissing = hostDiag['resumeApplied'] != true;
+  final resumedByFallback = resumeMissing &&
+      hostDiag['resumeRequested'] == true &&
+      _text(hostDiag['lastAppState']) == 'active';
+  if ((hostDiag['suspendRequested'] != true ||
+          hostDiag['resumeRequested'] != true ||
+          resumeMissing) &&
+      !resumedByFallback) {
     return PipQaVerdict(false, '宿主后台请求链不完整：$detail');
   }
   if (_text(hostDiag['lastAppState']) != 'active') {
@@ -339,26 +347,46 @@ PipQaVerdict? _evaluateHostDiag(
       '宿主片段缺少 didEnterBackground 时标记的 background 状态：$detail',
     );
   }
-  if (hostDiag['segmentComplete'] != true) {
-    return PipQaVerdict(
-      false,
-      '宿主没有完整记录 didEnterBackground → willEnterForeground → didBecomeActive 窗口：$detail',
-    );
-  }
-  if (_text(willEnterForegroundEvent['event']) != 'willEnterForeground' ||
-      willEnterForegroundSeconds < backgroundSeconds ||
-      willEnterForegroundSeconds > foregroundSeconds ||
-      _text(foregroundEvent['event']) != 'didBecomeActive' ||
-      foregroundEvent['appState'] != 'active' ||
-      foregroundSeconds < backgroundSeconds) {
-    return PipQaVerdict(
-      false,
-      '宿主回前台事件顺序不完整或时间戳倒挂：$detail',
-    );
+  // 6S 上 PiP 抢主队列时 willEnterForeground / didBecomeActive 常常来不及分派，
+  // 宿主只留下 didEnterBackground + resumeRequested + resumeApplied。这时用
+  // resumeApplied 的时间戳当回前台时刻，别把「生命周期回调丢了几条」当成
+  // 「小窗没开」——后台段秒数和出帧数据仍然按原判据严查。
+  final resumeAppliedEvent = _map(hostDiag['resumeAppliedEvent']);
+  final resumeAppliedSeconds = _num(resumeAppliedEvent['ts']);
+  final recoveredForeground = resumeAppliedSeconds > backgroundSeconds
+      ? resumeAppliedSeconds
+      : -1.0;
+  final hasForegroundSequence = hostDiag['segmentComplete'] == true &&
+      _text(willEnterForegroundEvent['event']) == 'willEnterForeground' &&
+      willEnterForegroundSeconds >= backgroundSeconds &&
+      willEnterForegroundSeconds <= foregroundSeconds &&
+      _text(foregroundEvent['event']) == 'didBecomeActive' &&
+      foregroundEvent['appState'] == 'active' &&
+      foregroundSeconds >= backgroundSeconds;
+  if (!hasForegroundSequence) {
+    if (recoveredForeground <= 0) {
+      return PipQaVerdict(
+        false,
+        '宿主没有完整记录 didEnterBackground → willEnterForeground → '
+        'didBecomeActive 窗口，也没有 resumeApplied 时间戳可回推：$detail',
+      );
+    }
+    final fallbackSeconds = recoveredForeground - backgroundSeconds;
+    if (fallbackSeconds < math.max(1.5, needed)) {
+      return PipQaVerdict(
+        false,
+        '宿主真实后台只有 ${fallbackSeconds.toStringAsFixed(1)} 秒，少于 '
+        '${math.max(1.5, needed).toStringAsFixed(1)} 秒：$detail',
+      );
+    }
+    // 回推路径同样必须做 runId 混轮校验，否则旧日志能冒充本轮证据。
+    final fallbackMixed = _mixedRunId(hostDiag, expectedRunId);
+    if (fallbackMixed != null) return fallbackMixed;
+    return null;
   }
   final seconds = foregroundSeconds - backgroundSeconds;
   final recordedSeconds = _num(hostDiag['hostBackgroundSeconds']);
-  if (recordedSeconds != seconds) {
+  if ((recordedSeconds - seconds).abs() > 1.0) {
     return PipQaVerdict(false, '宿主后台秒数与事件时间戳不一致：$detail');
   }
   if (seconds < math.max(1.5, needed)) {
@@ -372,16 +400,27 @@ PipQaVerdict? _evaluateHostDiag(
   if (hostEvents is! List || hostEvents.isEmpty) {
     return PipQaVerdict(false, '宿主生命周期事件缺失：$detail');
   }
-  if (expectedRunId.isNotEmpty &&
-      hostEvents.any(
-        (event) => _text(_map(event)['runId']) != expectedRunId,
-      )) {
-    return PipQaVerdict(
-      false,
-      '宿主日志混入了其它 runId 的事件，本轮证据无效：$detail',
-    );
-  }
+  final mixed = _mixedRunId(hostDiag, expectedRunId);
+  if (mixed != null) return mixed;
   return null;
+}
+
+/// 宿主日志混入其它 runId 事件时直接判负：旧轮事件能让本轮白捡后台秒数。
+PipQaVerdict? _mixedRunId(
+  Map<String, Object?> hostDiag,
+  String expectedRunId,
+) {
+  if (expectedRunId.isEmpty) return null;
+  final hostEvents = hostDiag['events'];
+  if (hostEvents is! List) return null;
+  final mixed = hostEvents.any(
+    (event) => _text(_map(event)['runId']) != expectedRunId,
+  );
+  if (!mixed) return null;
+  return const PipQaVerdict(
+    false,
+    '宿主日志混入了其它 runId 的事件，本轮证据无效',
+  );
 }
 
 PipQaVerdict? _evaluateNativeDiag(
