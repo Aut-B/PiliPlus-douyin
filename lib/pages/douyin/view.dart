@@ -117,7 +117,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _sync(silent: true);
     };
     try {
-      await ShortVideoWeb.open(platform);
+      // 把本地已有条数带下去：抓够这么多就不再无限滚动翻旧数据。
+      await ShortVideoWeb.open(platform, knownCount: _videos.length);
     } catch (e) {
       if (mounted) setState(() => _status = '打开网页失败：$e');
       SmartDialog.showToast('打开网页失败: $e');

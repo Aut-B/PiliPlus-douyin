@@ -204,6 +204,28 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
       ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
   final age = DateTime.now().millisecondsSinceEpoch / 1000 - video.updatedAt;
   final fresh = video.updatedAt > 0 && age >= 0 && age < 30 * 60;
+  // 新鲜的签名直链直接播，不要先绕一次网络解析。
+  //
+  // 以前 TikTok 是无条件先 `resolvePlayUrl`：哪怕手里这条直链 30 分钟内都有效，
+  // 也要先打一次网络、等它返回才开播。弱网下就是「点了一点反应都没有」，用户理解成
+  // 「TikTok 强迫我先下载/先等它解析」。抖音那边一直是直链优先，只有 tiktok 分支
+  // 把顺序写反了。现在两边统一：能直接播就先播，解析只作为兜底。
+  //
+  // 这里刻意不再加 `_probe`：探测本身要 4 秒连接 + 6 秒响应，等于把「先解析」
+  // 换成了「先探测」，一样是开播前多等一截。真放不出来播放器会立刻报错，
+  // 那时再走下面的重新解析，比开播前一律探测快得多。
+  if (fresh && video.playUrl.isNotEmpty) {
+    ShortVideoPlayStats.noteNetwork(
+      video.key,
+      tiktok: platform == ShortVideoPlatform.tiktok,
+    );
+    return QueueMedia(
+      url: video.playUrl,
+      userAgent: platform.userAgent,
+      referer: platform.referer,
+      cookie: cookie,
+    );
+  }
   // TikTok 的 tiktokv.com「长期地址」实测全返回 HTTP 400，签到直链又必然
   // 过期。唯一可靠的路子是回视频页重新解析一条，20 分钟内复用。
   if (platform == ShortVideoPlatform.tiktok && video.videoId.isNotEmpty) {

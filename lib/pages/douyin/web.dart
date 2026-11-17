@@ -52,7 +52,10 @@ abstract final class ShortVideoWeb {
     });
   }
 
-  static Future<void> open(ShortVideoPlatform platform) async {
+  static Future<void> open(
+    ShortVideoPlatform platform, {
+    int knownCount = 0,
+  }) async {
     _ensureHandler();
     await _channel.invokeMethod('open', {
       'url': platform.homeUrl,
@@ -61,7 +64,7 @@ abstract final class ShortVideoWeb {
       'userAgent': platform.userAgent,
       'title': '${platform.album} · 登录与抓取',
       'hookScript': hookJs(platform),
-      'driverScript': driverJs(platform),
+      'driverScript': driverJs(platform, knownCount: knownCount),
     });
   }
 
@@ -242,6 +245,14 @@ String hookJs(ShortVideoPlatform platform) {
   function post(url, text) {
     try {
       if (!interesting(text)) { return; }
+      // 记下页面上累计见过多少条：驱动脚本靠它判断「是否已经抓够本地基线」。
+      try {
+        // 只数明确的视频 id 字段，避免把 "id": 之类的杂项算进去导致提前停止滚动。
+        var ids = text.match(/"(?:aweme_id|item_id)"\\s*:\\s*"?([0-9]{8,})/g);
+        if (ids) {
+          window.__kumoneSeenCount = (window.__kumoneSeenCount || 0) + ids.length;
+        }
+      } catch (e) {}
       window.webkit.messageHandlers.shortvideo.postMessage({
         url: String(url),
         body: text
@@ -287,12 +298,21 @@ String hookJs(ShortVideoPlatform platform) {
 }
 
 /// 自动点开「收藏」tab，并持续滚到底，让列表继续分页。
-String driverJs(ShortVideoPlatform platform) {
+///
+/// `knownCount` 是本地已经有的收藏条数（0 表示没有本地基线）。
+/// 一旦页面上累计见过的条目达到这个数、且连续若干轮没有新增，就停止滚动：
+/// 收藏几百条时，无限滚动会把整个收藏夹从头拉一遍，用户感受到的就是
+/// 「每次同步都把整个收藏夹重新解析/重新收藏一遍」。只要新增的部分抓到了，
+/// 剩下的旧条目本地本来就有，没必要再滚。
+String driverJs(ShortVideoPlatform platform, {int knownCount = 0}) {
   final titles = platform.tabTitles.map((e) => "'$e'").join(',');
   return '''
 (function () {
   if (window.__kumoneDriver) { return; }
   var TITLES = [$titles];
+  var KNOWN = $knownCount;
+  var idleRounds = 0;
+  var lastHeight = 0;
   window.__kumoneDriver = setInterval(function () {
     try {
       if (!window.__kumoneClickedTab) {
@@ -307,8 +327,28 @@ String driverJs(ShortVideoPlatform platform) {
             }
           }
         }
+        return;
       }
-      window.scrollTo(0, document.body.scrollHeight);
+      var height = document.body.scrollHeight;
+      if (height === lastHeight) {
+        idleRounds = idleRounds + 1;
+      } else {
+        idleRounds = 0;
+        lastHeight = height;
+      }
+      // 滚不动了：已经到底，或者能拉的都拉完了。
+      if (idleRounds >= 4) {
+        clearInterval(window.__kumoneDriver);
+        window.__kumoneDriver = null;
+        return;
+      }
+      // 已经攒够本地基线那么多条、又连续两轮没有新的：就停，不再无谓地翻旧数据。
+      if (KNOWN > 0 && window.__kumoneSeenCount >= KNOWN && idleRounds >= 2) {
+        clearInterval(window.__kumoneDriver);
+        window.__kumoneDriver = null;
+        return;
+      }
+      window.scrollTo(0, height);
     } catch (e) {}
   }, 1200);
 })();

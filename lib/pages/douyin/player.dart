@@ -152,11 +152,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   int _videoHeight = 0;
 
   final Random _shuffleRandom = Random();
-List<String> _shuffleDeck = const [];
-String _shuffleQueueSignature = '';
-String _shuffleSignature = '';
-final Set<String> _shufflePlayed = {};
-final List<Map<String, Object?>> _qaAdvanceHistory = [];
+  List<String> _shuffleDeck = const [];
+  String _shuffleQueueSignature = '';
+  String _shuffleSignature = '';
+  final Set<String> _shufflePlayed = {};
+  /// 最近播过的条目，按播放先后排列（最早在前）。新一轮靠它排除「刚播过的」。
+  final List<String> _shuffleRecent = <String>[];
+  final List<Map<String, Object?>> _qaAdvanceHistory = [];
 
   bool _ready = false;
 
@@ -1212,6 +1214,7 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
       final index = _indexOfKey(key);
       if (index < 0) continue;
       _shufflePlayed.add(key);
+      _noteShuffleRecent(key);
       _persistShuffle();
       return index;
     }
@@ -1220,6 +1223,7 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
     );
     if (fallbackIndex < 0) return _displayedIndex;
     _shufflePlayed.add(_queue[fallbackIndex].key);
+    _noteShuffleRecent(_queue[fallbackIndex].key);
     _persistShuffle();
     return fallbackIndex;
   }
@@ -1233,22 +1237,65 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
         )
         .toList();
     if (remaining.isEmpty) {
-      // 一轮播完后只淘汰旧条目，当前条目保留，避免新一轮第一首又回到起点。
+      // 一轮播完了，重开一轮。
+      //
+      // 以前这里只把「当前这首」留在 played 里，其余全部放回去重洗：于是新一轮的
+      // 第一首有机会正好是「刚刚播过的上一首」，用户听到的就是「随机播放会重复」。
+      // 现在把最近播过的几首也保留为排除集，新一轮开头不会立刻倒回去。
+      final recent = _shuffleRecentKeys(_recentShuffleCount);
       _shufflePlayed
         ..clear()
-        ..add(currentKey);
-      remaining = allKeys.where((key) => key != currentKey).toList();
+        ..add(currentKey)
+        ..addAll(recent);
+      remaining = allKeys
+          .where((key) => !_shufflePlayed.contains(key))
+          .toList();
+      // 队列太短、排除完就没得播了：只留当前这首，保证还能往下走。
+      if (remaining.isEmpty) {
+        _shufflePlayed
+          ..clear()
+          ..add(currentKey);
+        remaining = allKeys.where((key) => key != currentKey).toList();
+      }
     }
     remaining.shuffle(_shuffleRandom);
     _shuffleDeck = remaining;
     _shufflePlayed.add(currentKey);
+    _noteShuffleRecent(currentKey);
     _persistShuffle();
+  }
+
+  /// 新一轮要排除多少首最近播过的。队列很短时不能全排除，否则一首都不剩。
+  int get _recentShuffleCount {
+    final total = _queue.length;
+    if (total <= 3) return 0;
+    // 取队列的四分之一、最多 3 首：够挡住「立刻重复」，又不会把候选集削太狠。
+    final wanted = (total ~/ 4).clamp(1, 3).toInt();
+    return wanted > total - 2 ? 0 : wanted;
+  }
+
+  List<String> _shuffleRecentKeys(int count) {
+    if (count <= 0 || _shuffleRecent.isEmpty) return const <String>[];
+    return _shuffleRecent.length <= count
+        ? List<String>.of(_shuffleRecent)
+        : _shuffleRecent.sublist(_shuffleRecent.length - count);
+  }
+
+  void _noteShuffleRecent(String key) {
+    _shuffleRecent.remove(key);
+    _shuffleRecent.add(key);
+    // 只留一小段，避免长时间播放把列表撑大。
+    const keep = 8;
+    while (_shuffleRecent.length > keep) {
+      _shuffleRecent.removeAt(0);
+    }
   }
 
   void _resetShuffleBag() {
     _shuffleDeck = const [];
     _shuffleQueueSignature = '';
     _shufflePlayed.clear();
+    _shuffleRecent.clear();
     unawaited(ShortVideoShuffleStore.clear());
   }
 
@@ -1283,6 +1330,11 @@ final List<Map<String, Object?>> _qaAdvanceHistory = [];
     _shuffleDeck = _shuffleDeck
         .where((key) => !_shufflePlayed.contains(key))
         .toList();
+    // 恢复的历史里也记下最近几首，重启后新一轮同样不会立刻倒回刚播过的。
+    final recent = saved.played.where(knownKeys.contains).toList(growable: false);
+    for (final key in recent.take(_recentShuffleCount)) {
+      _noteShuffleRecent(key);
+    }
   }
 
   void _persistShuffle() {
