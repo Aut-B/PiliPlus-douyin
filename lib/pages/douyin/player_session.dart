@@ -195,6 +195,11 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
             unawaited(forceOverlayOff());
             unawaited(_setAudioSession(true));
             unawaited(forceOverlayOff());
+          case 'restore':
+            _completePipStart();
+            pipActive = false;
+            _iosPipRestoring = true;
+            unawaited(_restorePage());
           case 'stop':
             _failPipStart(event);
             pipActive = false;
@@ -652,6 +657,17 @@ class ShortVideoSession extends GetxService with WidgetsBindingObserver {
     index = currentIndex;
     queue = List<QueueEntry>.of(currentQueue);
     displayedKey = key;
+  }
+
+  Future<void> _restorePage() async {
+    if (queue.isEmpty) return;
+    if (Get.currentRoute == ShortVideoPlayerRoute.routeName) return;
+    await openShortVideoQueue(
+      queue,
+      index,
+      showImmediately: true,
+      replaceCurrent: true,
+    );
   }
 
   Future<void> reportPlayerError(String message) {

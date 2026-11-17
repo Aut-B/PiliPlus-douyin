@@ -1,3 +1,4 @@
+import 'dart:async' show unawaited;
 import 'dart:io';
 
 import 'package:PiliPlus/build_config.dart';
@@ -10,8 +11,10 @@ import 'package:PiliPlus/common/widgets/scroll_behavior.dart';
 import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/models/common/theme/theme_color_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
+import 'package:PiliPlus/pages/douyin/qa.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
+import 'package:PiliPlus/pages/douyin/shortvideo_qa.dart';
 import 'package:PiliPlus/router/app_pages.dart';
 import 'package:PiliPlus/services/account_service.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
@@ -113,6 +116,7 @@ void main() async {
   ShortVideoAutoCache.refreshProtection();
   ShortVideoPlaylistRepo.onChanged = ShortVideoAutoCache.schedule;
   ShortVideoAutoCache.schedule();
+  ShortVideoQa.schedule();
   Get
     ..lazyPut(AccountService.new)
     ..lazyPut(DownloadService.new);
@@ -217,6 +221,29 @@ void main() async {
     );
   } else {
     runApp(const MyApp());
+  }
+  unawaited(_startPipQa());
+}
+
+Future<void> _startPipQa() async {
+  try {
+    final config = await loadPipQaConfig();
+    await dumpQaBoot(<String, Object?>{
+      'stage': 'config',
+      'source': PipQaConfig.source,
+      'runId': config?.runId,
+      'enabled': config?.enabled,
+      'autoStart': config?.autoStart,
+      'pipMode': config?.pipMode,
+    });
+    await startPipQaIfRequested(config);
+    await dumpQaBoot(<String, Object?>{
+      'stage': 'started',
+      'runId': config?.runId,
+      'started': PipQaRuntime.isStarted,
+    });
+  } catch (error) {
+    await dumpQaBoot(<String, Object?>{'stage': 'error', 'error': '$error'});
   }
 }
 

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:PiliPlus/build_config.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
 import 'package:PiliPlus/pages/douyin/player_session.dart';
@@ -70,9 +71,25 @@ Future<PipQaConfig?> loadPipQaConfig() async {
     if (!config.enabled) return null;
     PipQaConfig.source = 'documents';
     return config;
-  } catch (_) {
-    return null;
-  }
+  } catch (_) {}
+  final builtIn = _builtInConfig();
+  PipQaConfig.source = 'builtin';
+  return builtIn;
+}
+
+PipQaConfig _builtInConfig() {
+  return PipQaConfig(
+    enabled: true,
+    runId: 'auto-${BuildConfig.versionCode}',
+    index: 0,
+    playSeconds: 20,
+    backgroundSeconds: 12,
+    advanceEvery: 4,
+    autoStart: true,
+    pipMode: PipQaConfig.defaultPipMode,
+    seedKeys: const <String>[],
+    shuffle: true,
+  );
 }
 
 /// 把「这一轮 QA 是怎么启动的」落盘。
@@ -214,20 +231,32 @@ Future<File?> _qaMarker(PipQaConfig config) async {
 }
 
 Future<bool> _qaAlreadyRan(PipQaConfig config) async {
+  final name = 'pip_qa_done_${config.runId}.json';
+  try {
+    final raw = await _qaDumpChannel.invokeMethod<String>(
+      'read',
+      <String, Object?>{'name': name},
+    );
+    if (raw != null && raw.trim().isNotEmpty) return true;
+  } catch (_) {}
   final file = await _qaMarker(config);
   return file != null && await file.exists();
 }
 
 Future<void> _markQaRan(PipQaConfig config) async {
+  final marker = jsonEncode(<String, Object?>{
+    'runId': config.runId,
+    'at': DateTime.now().toIso8601String(),
+  });
+  try {
+    await _qaDumpChannel.invokeMethod<List<Object?>>('write', <String, Object?>{
+      'name': 'pip_qa_done_${config.runId}.json',
+      'content': marker,
+    });
+  } catch (_) {}
   try {
     final file = await _qaMarker(config);
-    await file?.writeAsString(
-      jsonEncode(<String, Object?>{
-        'runId': config.runId,
-        'at': DateTime.now().toIso8601String(),
-      }),
-      flush: true,
-    );
+    await file?.writeAsString(marker, flush: true);
   } catch (_) {}
 }
 

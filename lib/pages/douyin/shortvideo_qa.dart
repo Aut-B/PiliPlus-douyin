@@ -12,37 +12,61 @@ import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
-/// 三条主需求的自动体检。
-///
-/// 结果写到 App 的 Documents，装有本包的手机可以在「文件」里直接看，也能用
-/// house_arrest 拉出来。每次跑都往 `shortvideo_qa_history.jsonl` 追加一行，
-/// 便于判断缓存是否在逐步补齐。
 abstract final class ShortVideoQa {
   static const String resultFileName = 'shortvideo_qa_result.json';
   static const String historyFileName = 'shortvideo_qa_history.jsonl';
-
-  /// 写文件之外再走一条能读回来的通道：原生侧会把内容落到
-  /// `/private/var/mobile/Media/piliplus_qa/` 并用 NSLog 分段打印，
-  /// 这样即使 USB 拉不到 Documents，也能从系统日志里还原结果。
   static const MethodChannel _dump = MethodChannel('PiliPlus/QaDump');
 
   static bool _scheduled = false;
-  static final List<Timer> _timers = [];
 
   static void schedule() {
     if (!Platform.isIOS || _scheduled) return;
     _scheduled = true;
-    // 先等启动那一轮缓存跑起来，再在几个时间点各拍一张快照。
-    for (final seconds in const [25, 180, 360, 600]) {
-      _timers.add(
-        Timer(Duration(seconds: seconds), () {
-          unawaited(run());
-        }),
-      );
+    unawaited(_runOncePerBuild());
+  }
+
+  static Future<void> _runOncePerBuild() async {
+    final cacheSettled = await _waitForCacheSettled();
+    await run(cacheSettled: cacheSettled, finalPass: false);
+    await _waitForQaFinished();
+    await run(
+      cacheSettled: cacheSettled || _cacheSnapshotSettled(),
+      finalPass: true,
+    );
+  }
+
+  static bool _cacheSnapshotSettled() {
+    final snapshot = ShortVideoAutoCache.snapshot();
+    final doneAt = snapshot['doneAt'];
+    return snapshot['running'] == false &&
+        doneAt is int &&
+        doneAt > 0;
+  }
+
+  static Future<bool> _waitForCacheSettled() async {
+    const poll = Duration(seconds: 4);
+    final deadline = DateTime.now().add(const Duration(seconds: 180));
+    while (DateTime.now().isBefore(deadline)) {
+      if (_cacheSnapshotSettled()) return true;
+      await Future<void>.delayed(poll);
+    }
+    return _cacheSnapshotSettled();
+  }
+
+  static Future<void> _waitForQaFinished() async {
+    const poll = Duration(seconds: 3);
+    final deadline = DateTime.now().add(const Duration(seconds: 240));
+    while (DateTime.now().isBefore(deadline)) {
+      if (PipQaRuntime.isFinished) return;
+      await Future<void>.delayed(poll);
     }
   }
 
-  static Future<Map<String, Object?>> run() async {
+  static Future<Map<String, Object?>> run({
+    bool cacheSettled = true,
+    bool finalPass = true,
+  }) async {
+    final autoCache = ShortVideoAutoCache.snapshot();
     final videos = ShortVideoAutoCache.collectVideos();
     var local = 0;
     var douyinTotal = 0;
@@ -70,11 +94,12 @@ abstract final class ShortVideoQa {
     final keys = videos.map((video) => video.key).toList(growable: false);
     final signature = ShortVideoShuffleStore.signatureOf(keys);
     final saved = await ShortVideoShuffleStore.load();
-    final played = saved?.played.where(keys.toSet().contains).toList() ?? const [];
-    final pip = await _readPipSummary();
+    final played =
+        saved?.played.where(keys.toSet().contains).toList() ?? const [];
+    final runId = PipQaConfig.active?.runId ?? 'auto-${BuildConfig.versionCode}';
+    final pip = await _readPipSummary(runId);
     final realSequence = <String>[
-      for (final key in (pip.remove('sequence') as List?) ?? const [])
-        '$key',
+      for (final key in (pip.remove('sequence') as List?) ?? const []) '$key',
     ];
     final roundSize = (pip.remove('queueTotal') as int?) ?? keys.length;
     final shuffle = <String, Object?>{
@@ -83,8 +108,6 @@ abstract final class ShortVideoQa {
       'persistedPlayed': played.length,
       'signatureMatch': saved == null ? null : saved.signature == signature,
       'algorithmNoRepeatInRound': _simulateRounds(keys),
-      // 真机实际播放顺序（来自 pip_qa_log 的 displayedKey 采样），
-      // 不是纸上模拟：同一轮里重复出现就直接判失败。
       'realSequenceLength': realSequence.length,
       'realDistinctKeys': realSequence.toSet().length,
       'realNoRepeat': _noRepeatWithinRound(realSequence, roundSize),
@@ -97,14 +120,31 @@ abstract final class ShortVideoQa {
     final playStats = ShortVideoPlayStats.snapshot();
     final tiktokPlayed = (playStats['tiktokLocalHits'] as int? ?? 0) +
         (playStats['tiktokNetworkFallbacks'] as int? ?? 0);
-    final tiktokLocalFirst =
-        tiktokTotal == 0 ||
+    final tiktokLocalHits = playStats['tiktokLocalHits'] as int? ?? 0;
+    final tiktokNetworkFallbacks =
+        playStats['tiktokNetworkFallbacks'] as int? ?? 0;
+    final tiktokLocalFirst = tiktokTotal == 0 ||
         (tiktokPlayed > 0 &&
-            (playStats['tiktokLocalHits'] as int? ?? 0) > 0 &&
-            (playStats['tiktokNetworkFallbacks'] as int? ?? 0) == 0);
+            tiktokLocalHits > 0 &&
+            tiktokNetworkFallbacks == 0);
+    final tiktokCacheOk =
+        tiktokTotal == 0 || (cacheSettled && tiktokLocal == tiktokTotal);
+    final tiktokStatus = tiktokTotal == 0
+        ? 'no-tiktok-videos'
+        : !cacheSettled
+            ? 'cache-incomplete'
+            : tiktokLocal < tiktokTotal
+                ? 'cache-missing'
+                : tiktokPlayed == 0
+                    ? 'no-play-evidence'
+                    : tiktokLocalFirst
+                        ? 'local-play-ok'
+                        : 'network-fallback';
 
     final result = <String, Object?>{
       'generatedAt': DateTime.now().toIso8601String(),
+      'runId': runId,
+      'finalPass': finalPass,
       'build': <String, Object?>{
         'versionCode': BuildConfig.versionCode,
         'versionName': BuildConfig.versionName,
@@ -116,33 +156,32 @@ abstract final class ShortVideoQa {
         'missing': missing,
         'douyin': <String, Object?>{'total': douyinTotal, 'local': douyinLocal},
         'tiktok': <String, Object?>{'total': tiktokTotal, 'local': tiktokLocal},
-        'autoCache': ShortVideoAutoCache.snapshot(),
+        'settled': cacheSettled,
+        'autoCache': autoCache,
       },
       'tiktok': <String, Object?>{
         'localFirst': tiktokLocalFirst,
+        'cacheOk': tiktokCacheOk,
+        'status': tiktokStatus,
         'playStats': playStats,
       },
       'shuffle': shuffle,
       'pip': pip,
       'verdict': <String, Object?>{
         'cacheComplete': videos.isNotEmpty && local == videos.length,
-        // TikTok 收藏必须整批都能离线播，只中一条不算过。
-        'tiktokLocalPlayable':
-            tiktokTotal == 0 || tiktokLocal == tiktokTotal,
+        'tiktokLocalPlayable': tiktokCacheOk && tiktokLocalFirst,
         'shuffleNoRepeat': keys.length <= 1 ||
             (shuffle['algorithmNoRepeatInRound'] == true &&
                 shuffle['realEvidence'] == true &&
                 shuffle['realNoRepeat'] == true),
-        // pip_qa_log.json 的最终判定由原生 PiP 证据算出（pass/verdict），
-        // 不是这里再猜一遍。
         'pipBackground': (pip['pass'] ?? pip['passed']) == true,
       },
     };
+    if (!finalPass) result['stage'] = 'interim';
     await _write(result);
     return result;
   }
 
-  /// 用同一套「抽牌袋」规则跑两轮，任何一轮内出现重复就判失败。
   static bool _simulateRounds(List<String> keys) {
     if (keys.length <= 1) return true;
     final random = Random(20261116);
@@ -169,8 +208,6 @@ abstract final class ShortVideoQa {
     return true;
   }
 
-  /// 真机播放顺序里，同一条只要在一轮（= 队列长度）之内又出现，就算重复。
-  /// 距离等于轮长是下一轮的第一条，允许。
   static bool _noRepeatWithinRound(List<String> sequence, int round) {
     if (round <= 1) return true;
     final lastSeen = <String, int>{};
@@ -183,53 +220,104 @@ abstract final class ShortVideoQa {
     return true;
   }
 
-  static Future<Map<String, Object?>> _readPipSummary() async {
-    final summary = <String, Object?>{
-      'logFound': false,
-      'configSource': PipQaConfig.source,
-    };
+  static Future<String?> _readText(String name) async {
+    try {
+      final raw = await _dump.invokeMethod<String>('read', <String, Object?>{
+        'name': name,
+      });
+      if (raw != null && raw.trim().isNotEmpty) return raw;
+    } catch (_) {}
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/pip_qa_log.json');
-      if (!await file.exists()) return summary;
-      final decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map) return summary;
-      summary['logFound'] = true;
-      final activeRunId = PipQaConfig.active?.runId;
-      if (activeRunId != null &&
-          '${decoded['runId'] ?? ''}' != activeRunId) {
-        // 上一轮的日志不能当成本轮证据。
-        summary['staleRunId'] = decoded['runId'];
-        return summary;
-      }
-      for (final key in const [
-        'pass',
-        'passed',
-        'verdict',
-        'backgroundSeconds',
-        'backgroundPositionAdvanced',
-        'positionAdvanced',
-        'pipActiveInBackground',
-        'failures',
-      ]) {
-        if (decoded.containsKey(key)) summary[key] = decoded[key];
-      }
-      final samples = decoded['samples'];
-      if (samples is List) {
-        final sequence = <String>[];
-        var queueTotal = 0;
-        for (final sample in samples) {
-          if (sample is! Map) continue;
-          queueTotal = (sample['total'] as num?)?.toInt() ?? queueTotal;
-          final key = '${sample['displayedKey'] ?? ''}'.trim();
-          if (key.isEmpty || key == 'null') continue;
-          if (sequence.isEmpty || sequence.last != key) sequence.add(key);
-        }
-        summary['sequence'] = sequence;
-        summary['queueTotal'] = queueTotal;
+      final file = File('${dir.path}/$name');
+      if (await file.exists()) return file.readAsString();
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<Map<String, Object?>> _readJson(String name) async {
+    final raw = await _readText(name);
+    if (raw == null) return const <String, Object?>{};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        return decoded.map((key, value) => MapEntry('$key', value));
       }
     } catch (_) {}
+    return const <String, Object?>{};
+  }
+
+  static Future<Map<String, Object?>> _readPipSummary(String runId) async {
+    final log = await _readJson(PipQaConfig.logFileName);
+    final hostRaw = await _readText(PipQaConfig.hostDiagFileName);
+    final nativeRaw = await _readText(PipQaConfig.nativeDiagFileName);
+    final hostEvents = _jsonlForRun(hostRaw, runId);
+    final nativeEvents = _jsonlForRun(nativeRaw, runId);
+    final summary = <String, Object?>{
+      'logFound': log.isNotEmpty,
+      'configSource': PipQaConfig.source,
+      'hostDiagFound': hostEvents.isNotEmpty,
+      'nativeDiagFound': nativeEvents.isNotEmpty,
+      'hostEvents': hostEvents.length,
+      'nativeEvents': nativeEvents.length,
+      'hostTail': _tailEvents(hostEvents),
+      'nativeTail': _tailEvents(nativeEvents),
+    };
+    if (log.isEmpty) return summary;
+    final logRunId = '${log['runId'] ?? ''}';
+    if (logRunId != runId) {
+      summary['staleRunId'] = logRunId;
+      return summary;
+    }
+    for (final key in const [
+      'pass',
+      'passed',
+      'verdict',
+      'failures',
+      'backgroundSeconds',
+      'backgroundPositionAdvanced',
+      'positionAdvanced',
+      'pipActiveInBackground',
+      'hostDiag',
+      'nativeDiag',
+    ]) {
+      if (log.containsKey(key)) summary[key] = log[key];
+    }
+    final samples = log['samples'];
+    if (samples is List) {
+      final sequence = <String>[];
+      var queueTotal = 0;
+      for (final sample in samples) {
+        if (sample is! Map) continue;
+        queueTotal = (sample['total'] as num?)?.toInt() ?? queueTotal;
+        final key = '${sample['displayedKey'] ?? ''}'.trim();
+        if (key.isEmpty || key == 'null') continue;
+        if (sequence.isEmpty || sequence.last != key) sequence.add(key);
+      }
+      summary['sequence'] = sequence;
+      summary['queueTotal'] = queueTotal;
+    }
     return summary;
+  }
+
+  static List<Map<String, Object?>> _jsonlForRun(String? raw, String runId) {
+    if (raw == null || raw.trim().isEmpty) return const [];
+    final events = <Map<String, Object?>>[];
+    for (final line in const LineSplitter().convert(raw)) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final decoded = jsonDecode(line);
+        if (decoded is Map && '${decoded['runId'] ?? ''}' == runId) {
+          events.add(decoded.map((key, value) => MapEntry('$key', value)));
+        }
+      } catch (_) {}
+    }
+    return events;
+  }
+
+  static List<Map<String, Object?>> _tailEvents(List<Map<String, Object?>> events) {
+    if (events.length <= 12) return events;
+    return events.sublist(events.length - 12);
   }
 
   static Future<void> _write(Map<String, Object?> result) async {
@@ -240,6 +328,8 @@ abstract final class ShortVideoQa {
       await File('${dir.path}/$historyFileName').writeAsString(
         '${jsonEncode(<String, Object?>{
           'at': result['generatedAt'],
+          'runId': result['runId'],
+          'finalPass': result['finalPass'],
           'cache': result['cache'],
           'verdict': result['verdict'],
         })}\n',

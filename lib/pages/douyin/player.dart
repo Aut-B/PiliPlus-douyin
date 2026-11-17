@@ -102,9 +102,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   late List<QueueEntry> _queue = List<QueueEntry>.of(widget.queue);
 
   late int _index;
-  ShortVideoLoopMode _mode = ShortVideoLoopMode.sequential;
+  ShortVideoLoopMode _mode = ShortVideoLoopMode.listLoop;
   bool _playing = false;
-  bool _hasStartedPlayback = false;
 
   /// 这一条已经重试到第几步：0 直链、1 备用地址、2 本地缓存。
   int _retryStage = 0;
@@ -317,10 +316,7 @@ final Set<String> _shufflePlayed = {};
           _onCompleted();
         }
         // 真的播起来了才算这条没问题，别再在 open() 之后立刻清跳数。
-        if (position > const Duration(seconds: 2)) {
-          _skipped = 0;
-          _hasStartedPlayback = true;
-        }
+        if (position > const Duration(seconds: 2)) _skipped = 0;
         if (position == _position && duration == _duration) return;
         if (_session.pipActive) {
           // 小窗里不需要 Flutter 重绘，少给 6S 这类老机器添负担。
@@ -339,7 +335,6 @@ final Set<String> _shufflePlayed = {};
       await _session.armPip();
       final restoredKey = _session.displayedKey;
       final shouldRestore = widget.showImmediately &&
-          _hasStartedPlayback &&
           restoredKey != null &&
           _queue.any((entry) => entry.key == restoredKey);
       await _openIndex(
@@ -773,7 +768,6 @@ final Set<String> _shufflePlayed = {};
     final token = ++_openToken;
     _openStartedAt = DateTime.now();
     if (autoPlay != null) _allowAutoPlay = autoPlay;
-    if (!_qaAutoRunActive && !widget.showImmediately) _allowAutoPlay = false;
     _openInFlight = true;
     try {
       _index = _clampedIndex(index);
@@ -1118,6 +1112,7 @@ final Set<String> _shufflePlayed = {};
     if (!mounted || _openInFlight || _completionFired || _queue.isEmpty) return;
     _completionFired = true;
     _lastSkipReason = '播放完成';
+    _allowAutoPlay = true;
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
     final current = _displayedIndex;
