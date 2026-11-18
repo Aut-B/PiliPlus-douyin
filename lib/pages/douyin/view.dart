@@ -13,6 +13,59 @@ import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
+/// 抖音 / TikTok 收藏的入口页：顶部一排平台切换，下面是选中平台的收藏。
+///
+/// 导航栏的枚举项必须是编译期常量，所以那里只能放这个无参页面；
+/// 具体平台的收藏列表由它按当前选择构建。
+class ShortVideoPage extends StatefulWidget {
+  const ShortVideoPage({super.key});
+
+  @override
+  State<ShortVideoPage> createState() => _ShortVideoPageState();
+}
+
+class _ShortVideoPageState extends State<ShortVideoPage> {
+  ShortVideoPlatform _platform = ShortVideoPlatform.douyin;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final platform in <ShortVideoPlatform>[
+              ShortVideoPlatform.douyin,
+              ShortVideoPlatform.tiktok,
+            ])
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: TextButton(
+                  onPressed: () {
+                    setState(() => _platform = platform);
+                  },
+                  style: TextButton.styleFrom(
+                    minimumSize: const Size(64, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    backgroundColor: _platform == platform
+                        ? Theme.of(context).colorScheme.primaryContainer
+                        : null,
+                  ),
+                  child: Text(platform.album),
+                ),
+              ),
+          ],
+        ),
+      ),
+      // 换平台就换一份 State，避免两个平台的列表状态互相污染。
+      body: ShortVideoFavoritesPage(
+        key: ValueKey(_platform.id),
+        platform: _platform,
+      ),
+    );
+  }
+}
+
 /// 抖音 / TikTok 收藏列表。
 ///
 /// 抓取本身在原生 WKWebView 里做（网页登录 + 旁观接口返回），这里只负责
