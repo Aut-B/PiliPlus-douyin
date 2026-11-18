@@ -96,7 +96,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _leaving = true;
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
-        await IOSPipHelper.dispose();
+        IOSPipHelper.dispose();
         _pipEntered = false;
       }
     } catch (_) {}
@@ -404,8 +404,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           ComBtn(
             icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
             // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
-            // 关小窗卡住，用户看到的就是「点了没反应」。
-            onTap: () => unawaited(_leave()),
+            // 关小窗卡住，用户看到的就是「点了没反应」。_leave 是同步的，
+            // 收尾在它内部以 unawaited 方式启动。
+            onTap: _leave,
             tooltip: '返回',
           ),
           Expanded(
