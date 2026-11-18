@@ -23,11 +23,16 @@ import 'package:media_kit_video/media_kit_video.dart';
 ///   不再自建一条 PiP 帧管道；
 /// * 不在这里做任何 QA 埋点。QA 是另一条独立链路，不参与播放逻辑。
 ///
-/// 关于「整个页面像死了」：上一版把小窗按钮、上下条按钮直接叠在
-/// `Positioned.fill` 的视频手势上，iOS 上手指落在按钮上时事件仍会被下面的
-/// 播放器手势吃掉，点「向下」既不返回也不暂停，表现出来就是页面卡死。
-/// 现在所有控件都包在 [HitTestBehavior.opaque] 的 `AbsorbPointer` 外层里，
-/// 视频手势只在真正的空白画面区域生效。
+/// 关于「整个页面像死了」：这里曾经踩过两个坑，别走回头路。
+///
+/// 一是控件和视频手势几何重叠——把上下条按钮叠在 `Positioned.fill` 的视频
+/// 手势上，手指落在按钮上时事件被下面的播放器手势吃掉，点「向下」既不返回
+/// 也不暂停。现在控件是 Stack 里独立的 Positioned，和视频区域在几何上分开。
+///
+/// 二是有人试图用 `AbsorbPointer` 包住控件层「防止事件漏下去」，这是反的：
+/// `AbsorbPointer` 是让**子树收不到事件**，等于把所有按钮禁用掉。控件层在
+/// Stack 里位于视频层之上，命中测试按逆序走，本来就先到控件层，不需要任何
+/// 拦截。详见 `_controls` 的注释。
 class ShortVideoPlayerPage extends StatefulWidget {
   const ShortVideoPlayerPage({
     required this.queue,

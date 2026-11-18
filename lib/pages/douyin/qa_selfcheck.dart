@@ -68,7 +68,7 @@ abstract final class QaSelfCheck {
     try {
       await _drive(evidence, watchdog);
     } catch (error, stack) {
-      evidence.fail('unhandled', '$error', detail: '$stack');
+      evidence.fail('unhandled', '$error', extra: '$stack');
     } finally {
       watchdog.cancel();
       try {
@@ -184,16 +184,16 @@ abstract final class QaSelfCheck {
     );
 
     // 6. 返回之后再读一次通道状态：确认原生通道没被返回动作带崩。
-    final afterBack = await QaProbe.probeChannel();
+    //    注意：兜底强制回首页后，通道仍应可用——不可用说明是原生侧真出事了。
+    final afterBack = await evidence.step(
+      'probe_channel_after_back',
+      () => QaProbe.probeChannel(),
+      watchdog: watchdog,
+    );
     evidence.checks['after_back'] = <String, Object?>{
       'channelOk': afterBack['ok'],
       'error': afterBack['error'],
     };
-    await evidence.stepDone(
-      'probe_channel_after_back',
-      afterBack['ok'] == true ? 'ok' : 'fail',
-      elapsedMs: afterBack['elapsedMs'] as int? ?? 0,
-    );
   }
 
   /// 点返回，并区分结果。
@@ -439,6 +439,10 @@ final class _Evidence {
   }
 
   /// 全部通过才为 true。缺项按不通过算。
+  ///
+  /// `pass` 只回答「这些检查项是不是都过了」，不回答「这轮跑完了没」——
+  /// 后者看 `status`：`running` 中途落盘时 `pass` 必然是 false，
+  /// `aborted` 的结论要以 `status` 为准，不能拿 `pass` 当成败。
   bool get _pass {
     final channel = checks['shortvideo_web'];
     if (channel is! Map || channel['ok'] != true) return false;

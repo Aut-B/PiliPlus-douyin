@@ -90,40 +90,54 @@ abstract final class QaProbe {
   ///
   /// 按 tooltip 找：`player.dart` 的返回 `ComBtn` 是唯一带 `'返回'` tooltip 的。
   /// 找不到返回 null，由调用方记成「不确定」。
-  static Finder? backButtonFinder() {
-    final finder = find.byTooltip('返回');
-    final matched = finder.evaluate();
-    if (matched.isEmpty) return null;
-    return finder.at(matched.length - 1);
+  ///
+  /// 注意不能用 `flutter_test` 的 `find.byTooltip` / `Finder`：那是测试专用包，
+  /// 打进 release 包会直接编译失败。这里走 Element 树自己找。
+  static Element? _findBackButtonElement() {
+    Element? found;
+    void visit(Element element) {
+      if (found != null) return;
+      final widget = element.widget;
+      if (widget is Tooltip && widget.message == '返回') {
+        found = element;
+        return;
+      }
+      element.visitChildren(visit);
+    }
+
+    for (final element in WidgetsBinding.instance.rootElements) {
+      visit(element);
+      if (found != null) break;
+    }
+    return found;
   }
 
   /// 把页面里所有带「返回」tooltip 的 widget 列出来，供命中测试结果附带说明。
   static List<Map<String, Object?>> describeBackButtons() {
     final result = <Map<String, Object?>>[];
-    final finder = find.byTooltip('返回');
-    for (final element in finder.evaluate()) {
-      final box = element.renderObject;
-      String? rect;
-      if (box is RenderBox && box.hasSize) {
-        final offset = box.localToGlobal(Offset.zero);
-        rect =
-            '${offset.dx.toStringAsFixed(1)},'
-            '${offset.dy.toStringAsFixed(1)},'
-            '${box.size.width.toStringAsFixed(1)},'
-            '${box.size.height.toStringAsFixed(1)}';
-      }
-      result.add(<String, Object?>{
-        'type': '${element.widget.runtimeType}',
-        'rect': rect,
-      });
+    final target = _findBackButtonElement();
+    if (target == null) return result;
+    final box = target.renderObject;
+    String? rect;
+    if (box is RenderBox && box.hasSize) {
+      final offset = box.localToGlobal(Offset.zero);
+      rect =
+          '${offset.dx.toStringAsFixed(1)},'
+          '${offset.dy.toStringAsFixed(1)},'
+          '${box.size.width.toStringAsFixed(1)},'
+          '${box.size.height.toStringAsFixed(1)}';
     }
+    result.add(<String, Object?>{
+      'type': '${target.widget.runtimeType}',
+      'rect': rect,
+    });
     return result;
   }
 
   static Offset? _backButtonCenter() {
-    final finder = backButtonFinder();
-    if (finder == null) return null;
-    final box = finder.evaluate().first.renderObject;
+    final element = _findBackButtonElement();
+    if (element == null) return null;
+    final box = element.renderObject;
     if (box is! RenderBox || !box.hasSize || !box.attached) return null;
     return box.localToGlobal(box.size.center(Offset.zero));
   }
@@ -148,7 +162,7 @@ abstract final class QaProbe {
       };
     }
     final view = binding.renderViews.first;
-    final hit = HitTestResult();
+    final hit = HitTestResult(position: center);
     view.hitTest(hit, center);
     final chain = <String>[
       for (final entry in hit.path) '${entry.target.runtimeType}',
@@ -165,9 +179,9 @@ abstract final class QaProbe {
   }
 
   static bool _chainSeesBackButton(HitTestResult hit) {
-    final finder = backButtonFinder();
-    if (finder == null) return false;
-    final target = finder.evaluate().first.renderObject;
+    final element = _findBackButtonElement();
+    if (element == null) return false;
+    final target = element.renderObject;
     for (final entry in hit.path) {
       if (identical(entry.target, target)) return true;
     }
