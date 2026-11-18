@@ -1,0 +1,16 @@
+diff --git a/lib/src/popup_menu.dart b/lib/src/popup_menu.dart
+index 6eca3e4..a1d71f2 100644
+--- a/lib/src/popup_menu.dart
++++ b/lib/src/popup_menu.dart
+@@ -456,6 +456,11 @@ class PopupMenuItemState<T, W extends PopupMenuItem<T>> extends State<W> {
+         data: IconThemeData(opacity: isDark ? 0.5 : 0.38),
+         child: item,
+       );
++    } else {
++      item = IconTheme.merge(
++        data: IconThemeData(color: style.color),
++        child: item,
++      );
+     }
+ 
+     return MergeSemantics(

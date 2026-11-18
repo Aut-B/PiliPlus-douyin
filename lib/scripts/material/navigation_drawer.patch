@@ -1,0 +1,33 @@
+diff --git a/lib/src/navigation_drawer.dart b/lib/src/navigation_drawer.dart
+index fb1fe49..3ad0e48 100644
+--- a/lib/src/navigation_drawer.dart
++++ b/lib/src/navigation_drawer.dart
+@@ -75,8 +75,11 @@ class NavigationDrawer extends StatelessWidget {
+     this.onDestinationSelected,
+     this.selectedIndex = 0,
+     this.tilePadding = const EdgeInsets.symmetric(horizontal: 12.0),
++    this.flex = 1,
+   });
+ 
++  final int flex;
++
+   /// The background color of the [Material] that holds the [NavigationDrawer]'s
+   /// contents.
+   ///
+@@ -200,6 +203,7 @@ class NavigationDrawer extends StatelessWidget {
+           children: <Widget>[
+             ?header,
+             Expanded(
++              flex: flex,
+               child: Material(
+                 type: MaterialType.transparency,
+                 child: ListView(children: wrappedChildren),
+@@ -417,7 +421,7 @@ class _NavigationDestinationBuilder extends StatelessWidget {
+       child: _NavigationDestinationSemantics(
+         child: SizedBox(
+           height: navigationDrawerTheme.tileHeight ?? defaults.tileHeight,
+-          child: inkWell,
++          child: Material(type: MaterialType.transparency, child: inkWell),
+         ),
+       ),
+     );
