@@ -49,7 +49,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   String _deckSignature = '';
 
   bool _opening = false;
-  bool _completed = false;
   String? _error;
   bool _shuffle = false;
 
@@ -77,7 +76,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_opening || _queue.isEmpty) return;
     final target = index.clamp(0, _queue.length - 1);
     _opening = true;
-    _completed = false;
     try {
       final entry = _queue[target];
       setState(() {
