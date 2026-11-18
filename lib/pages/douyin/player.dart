@@ -377,10 +377,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       child: ColoredBox(
         color: Colors.black,
         child: Center(
-          child: SimpleVideo(
-            controller: controller,
-            fill: Colors.black,
-            aspectRatio: null,
+          // 和上游播放页一样用 FittedBox 把画面约束在可用区域内。
+          // 之前不套 FittedBox 时 SimpleVideo 拿到的是无约束的尺寸，
+          // 竖屏视频在 6S 上会被反复重新测量，主 isolate 被拖住，
+          // 表现就是「整页像卡死、按钮点了没反应」。
+          child: FittedBox(
+            fit: BoxFit.contain,
+            child: SimpleVideo(
+              controller: controller,
+              fill: Colors.black,
+              aspectRatio: null,
+            ),
           ),
         ),
       ),
