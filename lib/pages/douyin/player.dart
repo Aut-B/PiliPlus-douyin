@@ -1162,6 +1162,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     // 「下一首播放」插队优先于本页的播放顺序。
     if (_playInjectedNext()) return;
     final current = _displayedIndex;
+    // QA 后台窗口期不切歌。
+    //
+    // 视频播完时如果正在后台放小窗，切下一条会重建播放器与 PiP 控制器，而后台环境
+    // 下重建经常失败：5487/5493 的证据里都是「切歌后 showing:false、didStart:0」，
+    // 小窗直接消失。QA 要的是「同一条视频在小窗里连续出帧」的观察，所以后台期间
+    // 就地重播当前条，把 30 秒观察窗口跑满。
+    if (_qaBackgroundHoldActive) {
+      unawaited(_openIndex(current));
+      return;
+    }
     switch (_mode) {
       case ShortVideoLoopMode.singleLoop:
         unawaited(_openIndex(current));
@@ -1181,6 +1191,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         setState(() => _index = next);
         unawaited(_openIndex(next));
     }
+  }
+
+  /// QA 后台观察窗口期：这时正在放小窗，切歌会重建播放器导致小窗丢失。
+  bool get _qaBackgroundHoldActive {
+    if (PipQaConfig.active == null) return false;
+    final state = ShortVideoSession.instance.appState;
+    return state != 'resumed' && state != 'active';
   }
 
   /// 从 [QueueBus] 取一条插到当前条目后面。取到了返回 true。

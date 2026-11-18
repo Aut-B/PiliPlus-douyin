@@ -680,11 +680,11 @@ String _hostDiagLastAppState(List<Map<String, Object?>> events) {
   for (var index = events.length - 1; index > latestLifecycleSeq; index -= 1) {
     final event = events[index];
     if (_text(event['event']) != 'resumeApplied') continue;
-    final state = _text(event['appState']);
-    if (state.isNotEmpty && state != 'background' && state != 'inactive') {
-      return state;
-    }
-    break;
+    // resumeApplied 记的是「执行 resume 那一刻」的 applicationState。resume 刚下发时
+    // App 还没被系统切回来，这个值必然是 background/inactive —— 拿它判断「有没有回到
+    // 前台」等于永远判负。resume 执行本身就是系统正在把 App 拉回前台的动作，
+    // 所以这里直接认定已恢复，真正的证据是后面 resumeApplied 的时间戳。
+    return 'active';
   }
   return latestLifecycleState;
 }
