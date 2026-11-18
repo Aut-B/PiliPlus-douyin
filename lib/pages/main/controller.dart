@@ -328,6 +328,8 @@ class MainController extends GetxController
           () => switch (currentNav) {
             .home => homeController.showRefresh(),
             .dynamics => dynamicController.showRefresh(),
+            // 抖音页自己管刷新，没有可下拉的外层列表。
+            .shortVideo => null,
             .mine => null,
           },
         );
