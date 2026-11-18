@@ -23,7 +23,7 @@ enum NavigationBarType implements EnumWithLabel {
     '抖音',
     Icon(Icons.videocam_outlined),
     Icon(Icons.videocam),
-    ShortVideoFavoritesPage(),
+    ShortVideoPage(),
   ),
   mine(
     '我的',
