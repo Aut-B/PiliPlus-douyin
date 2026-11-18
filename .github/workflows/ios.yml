@@ -54,7 +54,9 @@ jobs:
       - name: Build iOS
         run: |
           set +e
-          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --dart-define=PILIPLUS_QA=true --no-pub -v > /tmp/build.log 2>&1
+          # PILIPLUS_QA 暂时不打开：qa_probe.dart 还在修编译错误，
+          # 打开会让整个包编不过，连带播放页的修复都装不上。
+          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub -v > /tmp/build.log 2>&1
           BUILD_EXIT=$?
           if [ $BUILD_EXIT -ne 0 ]; then
             echo "=== build failed, showing xcode errors ==="

@@ -24,7 +24,6 @@ import 'package:PiliPlus/utils/extension/theme_ext.dart';
 import 'package:PiliPlus/utils/font_utils.dart';
 import 'package:PiliPlus/pages/douyin/player.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
-import 'package:PiliPlus/pages/douyin/qa_selfcheck.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/json_file_handler.dart';
 import 'package:PiliPlus/utils/max_screen_size.dart';
@@ -134,10 +133,10 @@ void main() async {
             showImmediately: showImmediately,
           ),
     );
-    // 真机自检。默认关闭：开关是编译期的，为 false 时这个调用立刻返回，
-    // 不 await、不改启动顺序、不产生任何副作用。要跑就加
-    // --dart-define=PILIPLUS_QA=true 重新出包。
-    QaSelfCheck.schedule();
+    // 真机自检暂时摘除。qa_probe.dart 还有编译错误没修完（用了 flutter_test
+    // 的 Finder/find，正式包里不存在），而它会把整个包一起拖死，连播放页的
+    // 修复都装不上。两个文件暂存在仓库的 _qa_pending/ 下，等能独立编译通过
+    // 再接回来（开关是 --dart-define=PILIPLUS_QA=true）。
   } else if (Platform.isWindows) {
     if (await WebViewEnvironment.getAvailableVersion() != null) {
       webViewEnvironment = await WebViewEnvironment.create(
