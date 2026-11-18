@@ -41,7 +41,10 @@ jobs:
       - name: Analyze Dart
         run: |
           set +e
-          flutter analyze --no-fatal-infos --no-fatal-warnings lib/pages/douyin lib/models/common/nav_bar_config.dart lib/pages/main/controller.dart lib/main.dart
+          # controller.dart 必须一起分析：抖音播放页复用了它，改它的签名
+          # （setDataSource 的 isLocalFile）如果只靠 CI 的 Xcode 阶段发现，
+          # 报出来的往往是误导性的签名错误。analyze 几秒就能定位。
+          flutter analyze --no-fatal-infos --no-fatal-warnings lib/pages/douyin lib/models/common/nav_bar_config.dart lib/pages/main/controller.dart lib/main.dart lib/plugin/pl_player/controller.dart
           EXIT=$?
           if [ $EXIT -ne 0 ]; then
             echo "=== analyzer found errors; full output above ==="
@@ -51,7 +54,7 @@ jobs:
       - name: Build iOS
         run: |
           set +e
-          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub -v > /tmp/build.log 2>&1
+          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --dart-define=PILIPLUS_QA=true --no-pub -v > /tmp/build.log 2>&1
           BUILD_EXIT=$?
           if [ $BUILD_EXIT -ne 0 ]; then
             echo "=== build failed, showing xcode errors ==="

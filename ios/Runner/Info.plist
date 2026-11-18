@@ -130,6 +130,13 @@
 			<string>audio</string>
 			<string>picture-in-picture</string>
 		</array>
+		<!-- 让 Documents 目录出现在系统「文件」App 的「我的 iPhone」里。
+		     自检证据 pilip_selfcheck.json 就写在 Documents 下，开了这个
+		     用户不用 Filza 也能直接翻到、直接发出来。 -->
+		<key>UIFileSharingEnabled</key>
+		<true/>
+		<key>LSSupportsOpeningDocumentsInPlace</key>
+		<true/>
 		<key>UIStatusBarHidden</key>
 		<false/>
 		<key>NSLocalNetworkUsageDescription</key>

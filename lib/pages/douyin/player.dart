@@ -67,6 +67,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 页面已经在退，避免重复触发。
   bool _leaving = false;
 
+  /// 当前这次横向拖动累计的位移（像素）。用来判断「滑得够不够远」，
+  /// 不依赖瞬时速度——慢速拖动也应该能返回。
+  double _dragDx = 0;
+
   QueueEntry get _current => _queue[_index];
 
   @override
@@ -158,6 +162,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       // 抖音 / TikTok 的 CDN 认网页 UA 和 referer，上游 controller 里默认写死了
       // 桌面 UA + B 站 referer，直接用会 403 或者只给到一部分数据（表现为
       // 「有声音没画面」）。这里在开播前把 header 换成本条自己的来源。
+      //
+      // 本地文件一律清成上游默认（传 null 恢复）。本地命中时没有 CDN 参与，
+      // 留着上一条抖音的 UA/referer 纯属脏状态。
       if (!media.isLocal) {
         _player.overrideMediaHeader(
           userAgent: media.userAgent.isEmpty ? null : media.userAgent,
@@ -167,13 +174,22 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         _player.overrideMediaHeader();
       }
       await _player.setDataSource(
-        // 缓存好的那条是磁盘上的 mp4。用 NetworkSource 去喂一个本地路径，
-        // mpv 会先当网络源探测一遍再回退，白白多等几秒——「缓存了几个 G
-        // 还是要等很久」就是这里。这里直接按网络 URL 打开，但 extras 里
-        // 不放缓存参数由 controller 统一处理，路径本身 mpv 认。
+        // 缓存好的那条是磁盘上的 mp4，必须按本地文件打开，不能当网络源。
+        //
+        // 传 NetworkSource 会让 controller 走 `initBuffer()` 那套网络分支，
+        // 下发 `cache=yes` + `demuxer-max-bytes`（默认几十 MB）。mpv 拿到一个
+        // 普通本地路径却被要求开网络缓存，会先按网络流探测、分配流缓存，然后
+        // 才回落到本地文件打开——这就是「已经缓存了几百 MB，起播还是要等很久」
+        // 的直接原因。
+        //
+        // 不能硬套上游的 FileSource：它把路径写死成 `dir/typeTag/0.mp4`，
+        // 是 B 站下载目录的结构，我们是 `short_video/douyin_123.mp4` 单文件。
+        // 所以这里传路径本身，再让 controller 按「本地文件」处理
+        // （见 setDataSource 的 isLocalFile 参数）。
         NetworkSource(videoSource: media.url, audioSource: null),
         autoplay: true,
         isVertical: true,
+        isLocalFile: media.isLocal,
         // 本地文件时长已知，直接告诉播放器，省掉一次探测。
         duration: media.isLocal && entry.durationMs > 0
             ? Duration(milliseconds: entry.durationMs)
@@ -319,18 +335,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               bottom: 0,
               child: SafeArea(top: false, child: _bottomBar(entry)),
             ),
-            // 左滑返回。放在视频手势之外单独一层，只认「从左边 48px 起始的
-            // 横向拖动」，不影响视频区域的点按。
-            Positioned(
-              left: 0,
-              top: 96,
-              bottom: 96,
-              width: 48,
+            // 横向滑返回。整屏都能拖，不再限制在左边 48px 一条窄缝里。
+            //
+            // 之前只绑了 `Positioned(left: 0, width: 48)` 且只在
+            // `onHorizontalDragEnd` 里判断 `primaryVelocity > 0`：从屏幕中间
+            // 左滑不触发，慢慢拖（速度接近 0）也不触发，用户理解成「左滑返回
+            // 不了」。这里改成累计位移判断——手感更接近 iOS 的侧滑返回，
+            // 也不依赖一次拖动的瞬时速度。
+            Positioned.fill(
               child: GestureDetector(
+                // translucent：自己不画东西，但参与命中；让下面的视频点击
+                // 暂停仍然生效（点按不会变成水平拖动）。
                 behavior: HitTestBehavior.translucent,
-                onHorizontalDragEnd: (details) {
-                  if ((details.primaryVelocity ?? 0) > 0) _leave();
+                onHorizontalDragStart: (_) => _dragDx = 0,
+                onHorizontalDragUpdate: (details) {
+                  _dragDx += details.delta.dx;
                 },
+                onHorizontalDragEnd: (_) {
+                  // 向右拖超过屏宽 1/4 就返回。向右是 iOS 的「返回/后退」方向。
+                  final width = MediaQuery.sizeOf(context).width;
+                  if (_dragDx > width * 0.25) _leave();
+                  _dragDx = 0;
+                },
+                onHorizontalDragCancel: () => _dragDx = 0,
               ),
             ),
           ],
@@ -394,13 +421,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
   }
 
-  /// 控件层。包一层 [AbsorbPointer] 让手指落在按钮上时不再漏给下面的视频层。
+  /// 控件层。
+  ///
+  /// 这里曾经套过一层 `AbsorbPointer`，注释写的是「防止手指漏给视频层」，
+  /// 这是错的、而且后果很严重：`AbsorbPointer` 默认 `absorbing: true`，
+  /// 语义是「命中测试在本节点终止，子树拿不到任何指针事件」，也就是把整排
+  /// 控件（返回、暂停、上/下一条、画中画、随机）全部禁用掉。用户看到的就是
+  /// 「页面像卡死、按钮全失灵、返回不了」。
+  ///
+  /// 不需要任何拦截：控件层是 Stack 里位于视频层之上的独立 Positioned，
+  /// 本来就会吃掉自己区域内的触摸，命中测试按 Stack 逆序走，先到控件层。
   Widget _controls(Widget child) {
-    return AbsorbPointer(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        child: child,
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: child,
     );
   }
 

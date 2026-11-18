@@ -712,7 +712,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   String? mediaReferer;
 
   // offline
-  bool get isFileSource => dataSource is FileSource;
+  //
+  // 本地文件的判定要认两件事：上游的 [FileSource]（B 站下载目录结构），
+  // 以及调用方显式标记的 `isLocalFile`（抖音 / TikTok 的单文件缓存）。
+  // 只认前者会让后者被当成网络源处理。
+  bool _isLocalFile = false;
+  bool get isFileSource => dataSource is FileSource || _isLocalFile;
 
   // 初始化资源
   Future<void> setDataSource(
@@ -728,6 +733,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     Duration? duration,
     // 方向
     bool? isVertical,
+    // 这条数据源是不是本机上的文件。
+    //
+    // [FileSource] 只能表达 B 站下载目录那套 `dir/typeTag/0.mp4` 结构，
+    // 抖音 / TikTok 的缓存是 `short_video/douyin_123.mp4` 这种单文件，
+    // 塞不进去，才补了这个显式开关。作用是让 extras 走「本地文件」分支
+    // （`cache=no`），否则 mpv 会把本地路径当网络源开流缓存，白白慢一截。
+    bool isLocalFile = false,
     // 记录历史记录
     int? aid,
     String? bvid,
@@ -748,6 +760,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       this.width = width;
       this.height = height;
       this.dataSource = dataSource;
+      // 每条都要重置：上一条是抖音本地缓存、这一条是网络地址时必须落回来，
+      // 否则会带着「这是本地文件」的标记去开网络流（反过来也一样）。
+      _isLocalFile = isLocalFile;
       _autoPlay = autoplay;
       // 初始化数据加载状态
       dataStatus.value = DataStatus.loading;
@@ -947,7 +962,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
 
     final Map<String, String> extras = {
-      if (dataSource is FileSource)
+      if (dataSource is FileSource || _isLocalFile)
         'cache': 'no'
       else if (isLive)
         ...liveBuffer
@@ -986,7 +1001,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   Future<void>? refreshPlayer() {
-    if (dataSource is FileSource) {
+    // 本地文件不需要也不应该「重新拉一遍」——直接返回。
+    if (isFileSource) {
       return null;
     }
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
@@ -1725,6 +1741,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoPlayerController?.dispose();
     _videoPlayerController = null;
     _videoController = null;
+    _isLocalFile = false;
     _instance = null;
     videoPlayerServiceHandler?.clear();
   }
