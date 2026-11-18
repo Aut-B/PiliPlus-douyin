@@ -22,6 +22,8 @@ import 'package:PiliPlus/utils/device_utils.dart';
 import 'package:PiliPlus/utils/extension/core_palettes_ext.dart';
 import 'package:PiliPlus/utils/extension/theme_ext.dart';
 import 'package:PiliPlus/utils/font_utils.dart';
+import 'package:PiliPlus/pages/douyin/player.dart';
+import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/json_file_handler.dart';
 import 'package:PiliPlus/utils/max_screen_size.dart';
@@ -121,6 +123,16 @@ void main() async {
       setupServiceLocator(),
       if (Platform.isIOS) IOSPipHelper.init(),
     ]);
+    // 抖音 / TikTok / B 站收藏的播放页。播放列表、插队、播放入口最终都走这个构建器，
+    // 不注册的话点「播放」会抛「短视频播放页尚未注册」。
+    registerShortVideoPlayerPageBuilder(
+      (queue, index, {bool showImmediately = false}) =>
+          ShortVideoPlayerPage(
+            queue: queue,
+            index: index,
+            showImmediately: showImmediately,
+          ),
+    );
   } else if (Platform.isWindows) {
     if (await WebViewEnvironment.getAvailableVersion() != null) {
       webViewEnvironment = await WebViewEnvironment.create(

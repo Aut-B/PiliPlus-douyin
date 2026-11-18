@@ -234,6 +234,20 @@ class MainController extends GetxController
       navigationBars = navBarSort
           .map(NavigationBarType.values.elementAt)
           .toList();
+      // 老用户存过 navBarSort，里面没有后加的项（比如抖音）。
+      // 不补的话新入口永远不出现，用户会以为功能没做。
+      final missing = NavigationBarType.values
+          .where((e) => !navigationBars.contains(e))
+          .toList(growable: false);
+      if (missing.isNotEmpty) {
+        // 「我的」保持在最后，其它补在它前面。
+        final mineAt = navigationBars.indexOf(NavigationBarType.mine);
+        if (mineAt >= 0) {
+          navigationBars.insertAll(mineAt, missing);
+        } else {
+          navigationBars.addAll(missing);
+        }
+      }
     }
     this.navigationBars = navigationBars;
     final defPage = Pref.defaultHomePage;
