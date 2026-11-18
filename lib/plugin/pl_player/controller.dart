@@ -694,6 +694,23 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   bool _processing = false;
   bool get processing => _processing;
 
+  /// 覆盖 mpv 的 http UA / referer。
+  ///
+  /// 非 B 站来源（抖音、TikTok、本地文件）必须在 [setDataSource] 之前调用：
+  /// 播放器只在建 controller 时下发一次 header，之后再改对已打开的流无效。
+  /// 传 null 表示恢复上游默认（桌面 UA + B 站 referer）。
+  void overrideMediaHeader({String? userAgent, String? referer}) {
+    mediaUserAgent = userAgent;
+    mediaReferer = referer;
+    _videoPlayerController?.setMediaHeader(
+      userAgent: userAgent ?? BrowserUa.pc,
+      referer: referer ?? HttpString.baseUrl,
+    );
+  }
+
+  String? mediaUserAgent;
+  String? mediaReferer;
+
   // offline
   bool get isFileSource => dataSource is FileSource;
 
@@ -880,7 +897,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       player.setProperty('force-window', 'no');
     }
 
-    player.setMediaHeader(userAgent: BrowserUa.pc, referer: HttpString.baseUrl);
+    // 默认值只对 B 站网页成立。抖音 / TikTok 的 CDN 认的是各自网页的 UA 和
+    // referer，写死成桌面 UA + B 站 referer 会导致「有声音没画面」（只拿到
+    // 音频轨或低码率分片）甚至直接 403。调用方在开播前用
+    // [overrideMediaHeader] 覆盖成这一条自己的来源。
+    if (mediaUserAgent == null && mediaReferer == null) {
+      player.setMediaHeader(userAgent: BrowserUa.pc, referer: HttpString.baseUrl);
+    } else {
+      player.setMediaHeader(
+        userAgent: mediaUserAgent ?? BrowserUa.pc,
+        referer: mediaReferer ?? HttpString.baseUrl,
+      );
+    }
 
     _startListeners(player);
 

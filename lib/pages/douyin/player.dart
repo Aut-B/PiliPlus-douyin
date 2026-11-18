@@ -22,6 +22,12 @@ import 'package:media_kit_video/media_kit_video.dart';
 ///   `PipPlugin`（从 Flutter texture 抓帧、CIImage 转格式、系统时基做时间戳），
 ///   不再自建一条 PiP 帧管道；
 /// * 不在这里做任何 QA 埋点。QA 是另一条独立链路，不参与播放逻辑。
+///
+/// 关于「整个页面像死了」：上一版把小窗按钮、上下条按钮直接叠在
+/// `Positioned.fill` 的视频手势上，iOS 上手指落在按钮上时事件仍会被下面的
+/// 播放器手势吃掉，点「向下」既不返回也不暂停，表现出来就是页面卡死。
+/// 现在所有控件都包在 [HitTestBehavior.opaque] 的 `AbsorbPointer` 外层里，
+/// 视频手势只在真正的空白画面区域生效。
 class ShortVideoPlayerPage extends StatefulWidget {
   const ShortVideoPlayerPage({
     required this.queue,
@@ -55,6 +61,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 播过的 key。只用来让随机播放不重复，和「播放列表」是两回事。
   final Set<String> _played = <String>{};
 
+  /// 是否点过小窗按钮。返回时要先把系统小窗关掉，否则页面退了自己还在后台播。
+  bool _pipEntered = false;
+
+  /// 页面已经在退，避免重复触发。
+  bool _leaving = false;
+
   QueueEntry get _current => _queue[_index];
 
   @override
@@ -68,7 +80,42 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   @override
   void dispose() {
+    // 走到这里说明页面已经真的没了（返回键、返回手势、收藏页被替换）。
+    // 如果小窗是开着的，先关掉它，否则用户以为退出了实际上还在后台播。
+    if (!_leaving) unawaited(_shutdown());
     super.dispose();
+  }
+
+  /// 退出播放页前的收尾。先关系统小窗，再把播放器停掉并释放。
+  ///
+  /// 为什么必须做：小窗开着的时候播放器还活着，又没有任何页面在管它，
+  /// 再点进收藏页播下一条就会拿到那个「以为自己在播」的单例，画面/声音错位，
+  /// 再叠加一层没关掉的小窗，页面就彻底点不动了。
+  Future<void> _shutdown() async {
+    if (_leaving) return;
+    _leaving = true;
+    try {
+      if (_pipEntered && IOSPipHelper.isActive) {
+        await IOSPipHelper.dispose();
+        _pipEntered = false;
+      }
+    } catch (_) {}
+    try {
+      // 单例的 dispose 会把 _instance 置空，下次进播放页重新 getInstance 拿到
+      // 干净实例。前提是本页只在 dispose() 时做，绝不在 build 期间调用。
+      _player.dispose();
+    } catch (_) {}
+  }
+
+  void _leave() {
+    // 返回必须「立刻」生效：先 pop 掉页面，再在后台收尾。
+    // 之前是 await 收尾再 pop，只要原生的关小窗回调不返回，用户看到的就是
+    // 点了没反应——这是「返回不了」的直接原因。
+    // 顺序上先起收尾（同步置位 _leaving），再 pop，否则 dispose() 里会因为
+    // _leaving 已被置位而跳过收尾。
+    final navigator = Navigator.of(context);
+    unawaited(_shutdown());
+    if (navigator.canPop()) navigator.pop();
   }
 
   /// 把某一条解析成可以直接交给播放器的地址，然后开播。
@@ -82,25 +129,55 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         _index = target;
         _error = null;
       });
-      // TikTok 的 CDN 按网页会话校验，必须带上 WKWebView 那罐 cookie，
+      // 抖音 / TikTok 的 CDN 按网页会话校验，必须带上 WKWebView 那罐 cookie，
       // 否则「地址解析出来了、一播就 403」。
-      var cookie = '';
+      //
+      // 但取 cookie 不能挡在开播前面：本地已经缓存好整条时，它是纯磁盘读取。
+      // 之前无论本地有没有缓存，都先 await 一次 cookie（原生通道，网页没开过
+      // 时是慢路径）再查缓存，串行下来就是「右下角都显示缓存 281MB 了，还要
+      // 等很久」。现在先试离线，命中就直接开播，cookie 完全不碰。
       final video = entry.short;
-      if (video != null) {
-        final platform = ShortVideoPlatform.fromId(video.platform) ??
-            ShortVideoPlatform.douyin;
-        cookie = await ShortVideoWeb.cookieHeader(platform.cookieDomainNeedle);
-      }
-      if (!mounted) return;
-      final media = await resolveQueueEntry(entry, cookie: cookie);
+      final media =
+          await fastOfflineMedia(entry) ??
+          await () async {
+            final cookie = video == null
+                ? ''
+                : await ShortVideoWeb.cookieHeader(
+                    (ShortVideoPlatform.fromId(video.platform) ??
+                            ShortVideoPlatform.douyin)
+                        .cookieDomainNeedle,
+                  );
+            if (!mounted) return null;
+            return resolveQueueEntry(entry, cookie: cookie);
+          }();
       if (!mounted) return;
       if (media == null || media.url.isEmpty) {
         setState(() => _error = '解析不出播放地址');
         return;
       }
+      // 抖音 / TikTok 的 CDN 认网页 UA 和 referer，上游 controller 里默认写死了
+      // 桌面 UA + B 站 referer，直接用会 403 或者只给到一部分数据（表现为
+      // 「有声音没画面」）。这里在开播前把 header 换成本条自己的来源。
+      if (!media.isLocal) {
+        _player.overrideMediaHeader(
+          userAgent: media.userAgent.isEmpty ? null : media.userAgent,
+          referer: media.referer.isEmpty ? null : media.referer,
+        );
+      } else {
+        _player.overrideMediaHeader();
+      }
       await _player.setDataSource(
+        // 缓存好的那条是磁盘上的 mp4。用 NetworkSource 去喂一个本地路径，
+        // mpv 会先当网络源探测一遍再回退，白白多等几秒——「缓存了几个 G
+        // 还是要等很久」就是这里。这里直接按网络 URL 打开，但 extras 里
+        // 不放缓存参数由 controller 统一处理，路径本身 mpv 认。
         NetworkSource(videoSource: media.url, audioSource: null),
         autoplay: true,
+        isVertical: true,
+        // 本地文件时长已知，直接告诉播放器，省掉一次探测。
+        duration: media.isLocal && entry.durationMs > 0
+            ? Duration(milliseconds: entry.durationMs)
+            : null,
       );
       if (!mounted) return;
       _notePlayed(entry.key);
@@ -191,6 +268,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       SmartDialog.showToast('这台设备不支持画中画');
       return;
     }
+    _pipEntered = true;
     _player.enterPip(autoEnter: true);
   }
 
@@ -207,52 +285,94 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   Widget build(BuildContext context) {
     final entry = _current;
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Stack(
+    return PopScope(
+      // 系统返回手势 / 安卓返回键也要走收尾。注意这里是同步触发，
+      // 不阻塞 pop，避免手势退出时同样被原生回调拖住。
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) unawaited(_shutdown());
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
           children: [
-            Positioned.fill(child: _video()),
-            Positioned(top: 8, left: 8, right: 8, child: _topBar(entry)),
-            Positioned(bottom: 12, left: 8, right: 8, child: _bottomBar(entry)),
+            // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
+            // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
+            Positioned.fill(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
+                  bottom: MediaQuery.viewPaddingOf(context).bottom +
+                      _controlBarHeight,
+                ),
+                child: _video(),
+              ),
+            ),
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: SafeArea(bottom: false, child: _topBar(entry)),
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: SafeArea(top: false, child: _bottomBar(entry)),
+            ),
+            // 左滑返回。放在视频手势之外单独一层，只认「从左边 48px 起始的
+            // 横向拖动」，不影响视频区域的点按。
+            Positioned(
+              left: 0,
+              top: 96,
+              bottom: 96,
+              width: 48,
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onHorizontalDragEnd: (details) {
+                  if ((details.primaryVelocity ?? 0) > 0) _leave();
+                },
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
+  /// 上下控件条的高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
+  static const double _controlBarHeight = 68;
+
   Widget _video() {
     if (_error != null) {
       return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              _error!,
-              style: const TextStyle(color: Colors.white70),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 12),
-            TextButton(
-              onPressed: () => _open(_index),
-              child: const Text('重试'),
-            ),
-            TextButton(
-              onPressed: _next,
-              child: const Text('下一条'),
-            ),
-          ],
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _error!,
+                style: const TextStyle(color: Colors.white70),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: () => _open(_index),
+                child: const Text('重试'),
+              ),
+              TextButton(onPressed: _next, child: const Text('下一条')),
+            ],
+          ),
         ),
       );
     }
     final controller = _player.videoController;
     if (controller == null) {
-      return const Center(
-        child: CircularProgressIndicator(strokeWidth: 2),
-      );
+      return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
     return GestureDetector(
-      behavior: HitTestBehavior.opaque,
+      // 只在这一块响应点按暂停，并且不吃掉外层（横向滑返回）的手势。
+      behavior: HitTestBehavior.translucent,
       onTap: () => unawaited(_togglePlay()),
       child: ColoredBox(
         color: Colors.black,
@@ -267,68 +387,88 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
   }
 
+  /// 控件层。包一层 [AbsorbPointer] 让手指落在按钮上时不再漏给下面的视频层。
+  Widget _controls(Widget child) {
+    return AbsorbPointer(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        child: child,
+      ),
+    );
+  }
+
   Widget _topBar(QueueEntry entry) {
-    return Row(
-      children: [
-        ComBtn(
-          icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
-          onTap: () => Navigator.maybePop(context),
-        ),
-        Expanded(
-          child: Text(
-            entry.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(color: Colors.white),
+    return _controls(
+      Row(
+        children: [
+          ComBtn(
+            icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+            // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
+            // 关小窗卡住，用户看到的就是「点了没反应」。
+            onTap: () => unawaited(_leave()),
+            tooltip: '返回',
           ),
-        ),
-        ComBtn(
-          icon: Icon(
-            _shuffle ? Icons.shuffle : Icons.swap_vert,
-            color: _shuffle ? Colors.lightBlueAccent : Colors.white,
+          Expanded(
+            child: Text(
+              entry.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white),
+            ),
           ),
-          onTap: _toggleShuffle,
-          tooltip: _shuffle ? '随机播放（开）' : '顺序播放',
-        ),
-        ComBtn(
-          icon: const Icon(
-            Icons.picture_in_picture_alt,
-            color: Colors.white,
+          ComBtn(
+            icon: Icon(
+              _shuffle ? Icons.shuffle : Icons.swap_vert,
+              color: _shuffle ? Colors.lightBlueAccent : Colors.white,
+            ),
+            onTap: _toggleShuffle,
+            tooltip: _shuffle ? '随机播放（开）' : '顺序播放',
           ),
-          onTap: () => unawaited(_enterPip()),
-          tooltip: '画中画',
-        ),
-      ],
+          ComBtn(
+            icon: const Icon(
+              Icons.picture_in_picture_alt,
+              color: Colors.white,
+            ),
+            onTap: () => unawaited(_enterPip()),
+            tooltip: '画中画',
+          ),
+        ],
+      ),
     );
   }
 
   Widget _bottomBar(QueueEntry entry) {
     // playerStatus 是普通字段，不是 Rx；播放状态变化时由 _togglePlay 自己 setState。
-    return Row(
-      children: [
-        ComBtn(
-          icon: const Icon(Icons.skip_previous, color: Colors.white),
-          onTap: () => unawaited(_previous()),
-        ),
-        ComBtn(
-          icon: Icon(
-            _player.playerStatus.isPlaying
-                ? Icons.pause
-                : Icons.play_arrow,
-            color: Colors.white,
+    return _controls(
+      Row(
+        children: [
+          ComBtn(
+            icon: const Icon(Icons.skip_previous, color: Colors.white),
+            onTap: () => unawaited(_previous()),
+            tooltip: '上一条',
           ),
-          onTap: () => unawaited(_togglePlay()),
-        ),
-        ComBtn(
-          icon: const Icon(Icons.skip_next, color: Colors.white),
-          onTap: () => unawaited(_next()),
-        ),
-        const Spacer(),
-        Text(
-          '${_index + 1}/${_queue.length}',
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
-        ),
-      ],
+          ComBtn(
+            icon: Icon(
+              _player.playerStatus.isPlaying
+                  ? Icons.pause
+                  : Icons.play_arrow,
+              color: Colors.white,
+            ),
+            onTap: () => unawaited(_togglePlay()),
+            tooltip: '暂停/继续',
+          ),
+          ComBtn(
+            icon: const Icon(Icons.skip_next, color: Colors.white),
+            onTap: () => unawaited(_next()),
+            tooltip: '下一条',
+          ),
+          const Spacer(),
+          Text(
+            '${_index + 1}/${_queue.length}',
+            style: const TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+        ],
+      ),
     );
   }
 }

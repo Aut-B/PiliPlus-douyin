@@ -605,14 +605,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _videos.isEmpty ? _empty(theme) : _list(theme),
-          ),
-          _bottomBar(theme),
-        ],
-      ),
+      body: _videos.isEmpty ? _empty(theme) : _list(theme),
+      // 底栏原来放在 Column 里。问题在于主界面用 MainLayout 布局：body 按
+      // 整屏高度布局（bodyConstraints = 全高），底部导航栏是**叠画在 body
+      // 之上**的，不是挤压。所以 body 里最后那排按钮正好被底栏盖住，点不到。
+      // 放进 bottomNavigationBar 由 Scaffold 自己避让；同时因为 body 被
+      // 撑满整屏，Scaffold 算出来的 bottom padding 不可靠，_bottomBar 里
+      // 再按 MediaQuery.viewPadding 显式补一份。
+      bottomNavigationBar: _bottomBar(theme),
     );
   }
 
@@ -737,11 +737,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   Widget _bottomBar(ThemeData theme) {
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-        child: Column(
+    // 用 viewPadding 而不是 padding：外层 MainLayout 把 body 撑满整屏，底部
+    // 导航栏又叠画在上面，MediaQuery.padding.bottom 到这里已经是 0。取不到
+    // 系统安全区时按一个底部导航栏的高度（56）兜底，保证「打开网页 / 抓取」
+    // 「全部播放」不被压住。
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        8,
+        16,
+        bottomInset > 0 ? bottomInset + 8 : 56,
+      ),
+      child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -834,7 +842,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               ),
           ],
         ),
-      ),
     );
   }
 }

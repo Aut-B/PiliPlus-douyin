@@ -156,6 +156,20 @@ abstract final class QueueBus {
   static void clear() => _next.clear();
 }
 
+/// 不需要任何网络就能立刻开播的路径。没有就返回 null，调用方再走完整解析。
+///
+/// 「缓存了 281MB 还是要等很久」的成因：开播前一律先等 WKWebView 那罐 cookie
+/// （原生通道，网页没开过时是慢路径），再查本地文件。本地文件明明在盘上，
+/// 却要排在 cookie 后面。这里把「纯本地」的判断提前，让播放页可以先开播。
+Future<QueueMedia?> fastOfflineMedia(QueueEntry entry) async {
+  final video = entry.short;
+  if (video == null) return null;
+  final local = await ShortVideoMediaCache.localPath(video);
+  if (local == null) return null;
+  ShortVideoPlayStats.noteLocal(video.key, tiktok: video.platform == 'tiktok');
+  return QueueMedia(url: local, userAgent: '', referer: '', isLocal: true);
+}
+
 const _biliUserAgent =
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
     'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15';
