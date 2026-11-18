@@ -1,6 +1,10 @@
 name: Build for iOS
 
 on:
+  # 重建线：推到 rebuild/* 分支就自动打包，方便每一轮改动直接出未签名 IPA。
+  push:
+    branches:
+      - "rebuild/**"
   workflow_call:
     inputs:
       tag:
