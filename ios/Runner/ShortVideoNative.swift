@@ -997,6 +997,22 @@ final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
   }
 }
 
+/// 请求头。TikTok 的 CDN 就是按这个会话认人的。
+enum ShortVideoCookies {
+  static func header(for needle: String, completion: @escaping (String) -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      let picked = cookies.filter { needle.isEmpty || $0.domain.contains(needle) }
+      let header = picked.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+      completion(header)
+    }
+  }
+}
+
+/// 用 URLSession 把一条视频整段下下来。
+///
+/// 不用 Dart 的 HttpClient：它的 cookie 罐是独立的，TikTok 的 CDN 会按网页
+/// 会话校验，一个 cookie 都不带就是 403 / 0 字节。这里关掉 URLSession 自己的
+/// cookie 存储（否则会被空罐覆盖），改成显式写 `Cookie` 头。
 final class ShortVideoNativeDownloader: NSObject, URLSessionDownloadDelegate {
   private let urls: [String]
   private let destPath: String
