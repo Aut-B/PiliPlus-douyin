@@ -35,18 +35,35 @@ abstract final class ShortVideoMediaCache {
   /// 收藏夹 / 播放列表里这些 key 对应的文件不参与容量淘汰。
   static Set<String> _protectedKeys = const <String>{};
 
-  static Future<Directory> _ensureDir() async {
-    final cached = _dir;
-    if (cached != null && await cached.exists()) return cached;
+  /// 目录只解析一次。
+  ///
+  /// 原实现每次调用都 `await cached.exists()`，并且无条件把迁移挂到
+  /// `_migration` 链上再 await 它。缓存里有几百 MB 时，这条链上的
+  /// `_migrateLegacyCache` 会遍历整个临时目录、逐个 `copy`，而它排在
+  /// **开播前的关键路径**上（localPath → _fileFor → _ensureDir）。
+  /// 这就是「右下角都显示缓存 281MB 了，起播还要很久」的直接原因：
+  /// 不是读不到缓存，是读之前先等了一次全量目录迁移。
+  ///
+  /// 现在改成：初始化一次，之后立即返回；迁移只在第一次真正执行。
+  static Future<Directory> _ensureDir() {
+    final ready = _dirReady;
+    if (ready != null) return ready;
+    return _dirReady = _initDir();
+  }
+
+  static Future<Directory>? _dirReady;
+
+  static Future<Directory> _initDir() async {
     final dir = Directory(
       '$appSupportDirPath${Platform.pathSeparator}short_video',
     );
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
+    _dir = dir;
+    // 迁移放后台，不挡开播。失败也无所谓，只是旧缓存少一份。
     _migration = _migration.then((_) => _migrateLegacyCache(dir));
-    await _migration;
-    return _dir = dir;
+    return dir;
   }
 
   static Future<void> _migrateLegacyCache(Directory target) async {

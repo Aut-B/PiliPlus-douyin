@@ -80,6 +80,10 @@ class ShortVideoFavoritesPage extends StatefulWidget {
 }
 
 class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
+  /// 主界面底部导航栏的高度。它叠画在本页 body 之上，不吃布局，
+  /// 所以本页自己要留出这段高度，否则最后一行按钮会被压住点不到。
+  static const double _mainBottomNavHeight = 56;
+
   final List<ShortVideo> _videos = [];
   bool _syncing = false;
   String _status = '';
@@ -737,18 +741,20 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   Widget _bottomBar(ThemeData theme) {
-    // 用 viewPadding 而不是 padding：外层 MainLayout 把 body 撑满整屏，底部
-    // 导航栏又叠画在上面，MediaQuery.padding.bottom 到这里已经是 0。取不到
-    // 系统安全区时按一个底部导航栏的高度（56）兜底，保证「打开网页 / 抓取」
-    // 「全部播放」不被压住。
-    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+    // 两个间距都要加，不是二选一。
+    //
+    // 外层 MainLayout 把 body 按整屏高度布局，底部导航栏是叠画在 body 之上的，
+    // 不会挤压它。所以这里必须同时留出：
+    //   1. 系统底部安全区（6S 上有 home indicator，viewPadding.bottom 不为 0）
+    //   2. 主界面底部导航栏本身的高度
+    //
+    // 上一版写成了 `bottomInset > 0 ? bottomInset + 8 : 56`——6S 的
+    // viewPadding.bottom 正好不为 0，于是走了第一个分支，只留了安全区，
+    // 那 56px 的导航栏高度根本没留，按钮照样被压住。这就是用户说
+    // 「底栏挡住了下面两个按钮」一直没修好的原因。
+    final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
     return Padding(
-      padding: EdgeInsets.fromLTRB(
-        16,
-        8,
-        16,
-        bottomInset > 0 ? bottomInset + 8 : 56,
-      ),
+      padding: EdgeInsets.fromLTRB(16, 8, 16, safeBottom + _mainBottomNavHeight),
       child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,

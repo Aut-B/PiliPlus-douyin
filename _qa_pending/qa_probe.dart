@@ -91,17 +91,26 @@ abstract final class QaProbe {
   /// 按 tooltip 找：`player.dart` 的返回 `ComBtn` 是唯一带 `'返回'` tooltip 的。
   /// 找不到返回 null，由调用方记成「不确定」。
   ///
-  /// 注意不能用 `flutter_test` 的 `find.byTooltip` / `Finder`：那是测试专用包，
-  /// 打进 release 包会直接编译失败。这里走 Element 树自己找。
+  /// 注意不能用 `flutter_test` 的 `find.byTooltip` 和 `Finder`：那是测试专用包
+  /// （pubspec 里的 dev_dependency），release 包里根本不存在，一旦被 lib 引用，
+  /// 整个包直接编译失败。这里走 Element 树自己找。
+  ///
+  /// 只走 rootElements 里**可见**的那棵，并且设了节点上限：自检是旁路观测，
+  /// 不能为了找一个按钮把整棵树翻一遍拖慢主线程。
+  static const int _maxVisitNodes = 4000;
+
   static Element? _findBackButtonElement() {
     Element? found;
+    var visited = 0;
+
     void visit(Element element) {
-      if (found != null) return;
+      if (found != null || visited >= _maxVisitNodes) return;
+      visited++;
       final widget = element.widget;
       if (widget is Tooltip && widget.message == '返回') {
         found = element;
-        return;
       }
+      if (found != null) return;
       element.visitChildren(visit);
     }
 
@@ -146,24 +155,35 @@ abstract final class QaProbe {
   ///
   /// 用 `hitTestInView` 探视图在返回按钮中心点的命中链，只读，不触发任何回调。
   /// 结果原样回传，**不做归因**——归因由调用方谨慎处理。
+  ///
+  /// 写法照抄本仓库已验证的 `editable_text.dart`：`HitTestResult()` 无参构造 +
+  /// `WidgetsBinding.instance.hitTestInView(result, position, viewId)`。
+  /// 不要换成 `renderViews.first.hitTest(...)`——多视图（画中画、多窗口）下会
+  /// 探错视图。
   static Map<String, Object?> hitTestAtBackButton() {
-    final center = _backButtonCenter();
-    if (center == null) {
+    final element = _findBackButtonElement();
+    if (element == null) {
       return <String, Object?>{
         'available': false,
         'reason': 'no_back_button',
       };
     }
-    final binding = WidgetsBinding.instance;
-    if (binding.renderViews.isEmpty) {
+    final center = _backButtonCenter();
+    if (center == null) {
+      return <String, Object?>{
+        'available': false,
+        'reason': 'no_geometry',
+      };
+    }
+    final view = View.maybeOf(element);
+    if (view == null) {
       return <String, Object?>{
         'available': false,
         'reason': 'no_view',
       };
     }
-    final view = binding.renderViews.first;
-    final hit = HitTestResult(position: center);
-    view.hitTest(hit, center);
+    final hit = HitTestResult();
+    WidgetsBinding.instance.hitTestInView(hit, center, view.viewId);
     final chain = <String>[
       for (final entry in hit.path) '${entry.target.runtimeType}',
     ];
@@ -172,20 +192,15 @@ abstract final class QaProbe {
       'at': '${center.dx.toStringAsFixed(1)},${center.dy.toStringAsFixed(1)}',
       // true 只说明几何上盖着它，不代表事件一定送得到——
       // 拦截发生在命中之后的阶段。这里只报事实，不下结论。
-      'backButtonInChain': _chainSeesBackButton(hit),
+      'backButtonInChain': _chainSeesBackButton(hit, element),
       'chainLength': chain.length,
       'chainHead': chain.length <= 10 ? chain : chain.sublist(0, 10),
     };
   }
 
-  static bool _chainSeesBackButton(HitTestResult hit) {
-    final element = _findBackButtonElement();
-    if (element == null) return false;
+  static bool _chainSeesBackButton(HitTestResult hit, Element element) {
     final target = element.renderObject;
-    for (final entry in hit.path) {
-      if (identical(entry.target, target)) return true;
-    }
-    return false;
+    return hit.path.any((entry) => identical(entry.target, target));
   }
 
   static int _pointerId = 9000;

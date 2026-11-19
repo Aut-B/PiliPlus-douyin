@@ -100,8 +100,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 为什么必须做：小窗开着的时候播放器还活着，又没有任何页面在管它，
   /// 再点进收藏页播下一条就会拿到那个「以为自己在播」的单例，画面/声音错位，
   /// 再叠加一层没关掉的小窗，页面就彻底点不动了。
-  Future<void> _shutdown() async {
-    if (_leaving) return;
+  ///
+  /// [alreadyLeft] 表示调用方已经在 pop 之后了，这里不要再拦一次。
+  Future<void> _shutdown({bool alreadyLeft = false}) async {
+    if (_leaving && !alreadyLeft) return;
     _leaving = true;
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
@@ -117,14 +119,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   void _leave() {
-    // 返回必须「立刻」生效：先 pop 掉页面，再在后台收尾。
-    // 之前是 await 收尾再 pop，只要原生的关小窗回调不返回，用户看到的就是
-    // 点了没反应——这是「返回不了」的直接原因。
-    // 顺序上先起收尾（同步置位 _leaving），再 pop，否则 dispose() 里会因为
-    // _leaving 已被置位而跳过收尾。
+    // 返回必须「立刻」生效，所以顺序是：先 pop，再收尾。
+    //
+    // 这里踩过一个很隐蔽的坑：`_shutdown()` 虽然写了 async，但函数体里没有
+    // 任何 await，所以它是一个「同步跑完的 async 函数」。调用方写
+    // `unawaited(_shutdown())` 并不会让它变成后台任务——函数会一路同步执行
+    // 到 `_player.dispose()` 结束才返回。而 dispose() 里面是一串原生调用
+    // （关 PiP、WakelockPlus、销毁 video controller），全套跑完才轮到
+    // `navigator.pop()`，中间这段时间用户看到的就是「点了返回，没反应」。
+    //
+    // 现在把 pop 提到最前面，收尾推到下一帧之后，让「页面消失」和
+    // 「资源释放」彻底解耦。
     final navigator = Navigator.of(context);
-    unawaited(_shutdown());
     if (navigator.canPop()) navigator.pop();
+    // 先同步置位，避免 dispose() 里再跑一遍收尾。
+    _leaving = true;
+    // 等这一帧结束再释放：pop 已经开始，原生的销毁不会再挡住退场动画。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_shutdown(alreadyLeft: true));
+    });
   }
 
   /// 把某一条解析成可以直接交给播放器的地址，然后开播。
@@ -316,6 +329,36 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         backgroundColor: Colors.black,
         body: Stack(
           children: [
+            // 边缘滑返回。
+            //
+            // 三条硬约束，都是踩过的坑：
+            //
+            // 1. 必须放在 Stack 的「最下面」。命中测试是逆序遍历，排最后的
+            //    那个 Positioned.fill 会先接走整屏指针，下面的控件就全哑了
+            //    ——「按钮全点不动、画中画却正常」就是这么来的（画中画走原生
+            //    PiP，不经过 Flutter 这一层）。
+            // 2. 只用左边缘一小条，不要整屏。整屏的横向拖动会和按钮的 tap、
+            //    视频的 onClick 一起进手势仲裁，拖一下就把点击吃掉。
+            // 3. 上下要避开控件栏。返回按钮就在左上角，和边缘条在几何上
+            //    重叠的话，手指压到它左半边就没有反应。
+            Positioned(
+              left: 0,
+              top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
+              bottom: MediaQuery.viewPaddingOf(context).bottom + _controlBarHeight,
+              width: _edgeSwipeWidth,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragStart: (_) => _dragDx = 0,
+                onHorizontalDragUpdate: (details) {
+                  _dragDx += details.delta.dx;
+                },
+                onHorizontalDragEnd: (_) {
+                  if (_dragDx > 40) _leave();
+                  _dragDx = 0;
+                },
+                onHorizontalDragCancel: () => _dragDx = 0,
+              ),
+            ),
             // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
             // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
             Positioned.fill(
@@ -328,41 +371,42 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 child: _video(),
               ),
             ),
+            // 控件栏必须给死高度。
+            //
+            // 之前是 `Positioned(top/left/right)` 不给 height，Stack 会传一个
+            // 无界高度约束下来，里面的 Row 高度游离不定：控件区域算不准，
+            // 点按能落在哪儿也跟着不确定。给了明确高度之后布局是确定的，
+            // 命中测试区域也跟着确定。
+            //
+            // 安全区已经在 height 里算进去了，所以这里 SafeArea 只取方向、
+            // 不再重复扣 inset（否则控件会被挤出可视区域，点也点不准）。
             Positioned(
               top: 0,
               left: 0,
               right: 0,
-              child: SafeArea(bottom: false, child: _topBar(entry)),
+              height: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
+              child: SafeArea(
+                top: true,
+                bottom: false,
+                left: false,
+                right: false,
+                minimum: EdgeInsets.zero,
+                child: _topBar(entry),
+              ),
             ),
             Positioned(
               left: 0,
               right: 0,
               bottom: 0,
-              child: SafeArea(top: false, child: _bottomBar(entry)),
-            ),
-            // 横向滑返回。整屏都能拖，不再限制在左边 48px 一条窄缝里。
-            //
-            // 之前只绑了 `Positioned(left: 0, width: 48)` 且只在
-            // `onHorizontalDragEnd` 里判断 `primaryVelocity > 0`：从屏幕中间
-            // 左滑不触发，慢慢拖（速度接近 0）也不触发，用户理解成「左滑返回
-            // 不了」。这里改成累计位移判断——手感更接近 iOS 的侧滑返回，
-            // 也不依赖一次拖动的瞬时速度。
-            Positioned.fill(
-              child: GestureDetector(
-                // translucent：自己不画东西，但参与命中；让下面的视频点击
-                // 暂停仍然生效（点按不会变成水平拖动）。
-                behavior: HitTestBehavior.translucent,
-                onHorizontalDragStart: (_) => _dragDx = 0,
-                onHorizontalDragUpdate: (details) {
-                  _dragDx += details.delta.dx;
-                },
-                onHorizontalDragEnd: (_) {
-                  // 向右拖超过屏宽 1/4 就返回。向右是 iOS 的「返回/后退」方向。
-                  final width = MediaQuery.sizeOf(context).width;
-                  if (_dragDx > width * 0.25) _leave();
-                  _dragDx = 0;
-                },
-                onHorizontalDragCancel: () => _dragDx = 0,
+              height:
+                  MediaQuery.viewPaddingOf(context).bottom + _controlBarHeight,
+              child: SafeArea(
+                top: false,
+                bottom: true,
+                left: false,
+                right: false,
+                minimum: EdgeInsets.zero,
+                child: _bottomBar(entry),
               ),
             ),
           ],
@@ -373,6 +417,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   /// 上下控件条的高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
   static const double _controlBarHeight = 68;
+
+  /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
+  /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
+  static const double _edgeSwipeWidth = 20;
 
   Widget _video() {
     if (_error != null) {
@@ -409,16 +457,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       child: ColoredBox(
         color: Colors.black,
         child: Center(
-          // 和上游播放页一样用 FittedBox 把画面约束在可用区域内。
-          // 之前不套 FittedBox 时 SimpleVideo 拿到的是无约束的尺寸，
-          // 竖屏视频在 6S 上会被反复重新测量，主 isolate 被拖住，
-          // 表现就是「整页像卡死、按钮点了没反应」。
-          child: FittedBox(
-            fit: BoxFit.contain,
-            child: SimpleVideo(
-              controller: controller,
-              fill: Colors.black,
-              aspectRatio: null,
+          // 结构和上游 pl_player/view/view.dart 对齐：RepaintBoundary →
+          // FittedBox → SimpleVideo。
+          //
+          // RepaintBoundary 不是可有可无的：SimpleVideo 每帧都在
+          // ListenableBuilder 里重建，没有它就会把重绘范围扩散到整个页面，
+          // 6S 上表现为画面卡顿、主 isolate 被拖住。
+          //
+          // FittedBox 的 alignment 默认是 center，fit 用 contain，和上游
+          // videoFit 在竖屏下的 BoxFit.contain 一致；aspectRatio 传 null
+          // 表示按 texture 实际像素比（上游是 videoFit.aspectRatio，抖音这
+          // 条没有外部画质偏好，用真实比例最稳，避免拉伸）。
+          child: RepaintBoundary(
+            child: FittedBox(
+              fit: BoxFit.contain,
+              alignment: Alignment.center,
+              child: SimpleVideo(
+                controller: controller,
+                fill: Colors.black,
+                aspectRatio: null,
+              ),
             ),
           ),
         ),
@@ -446,6 +504,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Widget _topBar(QueueEntry entry) {
     return _controls(
       Row(
+        // 这两条控件栏挂在 `Positioned(top/left/right)` 下，Stack 给它们的高度
+        // 是**无界**的。Row 默认 mainAxisSize.max 只是横向撑满，高度方向会
+        // 尽量松，子项（Icon 是定值、Text 是单行）本来没事；但加上 SafeArea
+        // 之后不能再依赖默认行为，这里显式 min 掉，高度只取内容实际高度。
+        // 宽度不受影响：外层还是撑满的，Expanded 依旧能占满剩余宽度。
+        mainAxisSize: MainAxisSize.min,
         children: [
           ComBtn(
             icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
