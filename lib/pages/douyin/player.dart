@@ -89,11 +89,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   @override
   void dispose() {
-    // 走到这里说明页面已经真的没了（返回键、返回手势、收藏页被替换）。
-    // 如果小窗是开着的，先关掉它，否则用户以为退出了实际上还在后台播。
-    if (!_leaving) unawaited(_shutdown());
+    // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
+    // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
+    // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
+    //
+    // 注意不能写 `if (!_leaving)`：_leave() 会先置 _leaving = true 再 pop，
+    // 于是这里永远跳过，播放器就漏了。用 _disposed 单独记一次。
+    if (!_disposed) {
+      unawaited(_shutdown(alreadyLeft: true));
+    }
     super.dispose();
   }
+
+  /// 收尾是否已经执行过（避免 dispose 和 postFrame 回调各跑一次）。
+  bool _disposed = false;
 
   /// 退出播放页前的收尾。先关系统小窗，再把播放器停掉并释放。
   ///
@@ -103,8 +112,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   ///
   /// [alreadyLeft] 表示调用方已经在 pop 之后了，这里不要再拦一次。
   Future<void> _shutdown({bool alreadyLeft = false}) async {
+    // 已经跑过就直回：pop 后的 postFrame 回调与 dispose() 会各调一次，
+    // 但收尾只能做一次（重复 dispose 单例会连带把下一次的实例搞坏）。
+    if (_disposed) return;
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
+    _disposed = true;
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
         IOSPipHelper.dispose();
