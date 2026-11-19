@@ -231,14 +231,27 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     }
   }
 
+  /// 播放页打开期间置位，避免连点把两个播放页叠在一起。
+  bool _openingPlayer = false;
+
+  /// 把播放页 push 到收藏页上面，而不是替换掉当前路由。
+  ///
+  /// B 站收藏夹点进视频后退出会回到原列表（含滚动位置）；这里以前用
+  /// `Get.off` 把 MainApp 整条路由换掉，退出只能重建首页，收藏 Tab 也就丢了。
+  Future<void> _openQueue(List<QueueEntry> queue, int index) async {
+    if (_openingPlayer || queue.isEmpty) return;
+    _openingPlayer = true;
+    try {
+      await openShortVideoQueue(queue, index);
+    } finally {
+      _openingPlayer = false;
+    }
+  }
+
   void _play(int index) {
     if (_videos.isEmpty) return;
     unawaited(
-      openShortVideoQueue(
-        _videos.map(QueueEntry.fromShortVideo).toList(),
-        index,
-        replaceCurrent: true,
-      ),
+      _openQueue(_videos.map(QueueEntry.fromShortVideo).toList(), index),
     );
   }
 
@@ -254,13 +267,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _selecting = false;
       _selected.clear();
     });
-    unawaited(
-      openShortVideoQueue(
-        queue.map(QueueEntry.fromShortVideo).toList(),
-        0,
-        replaceCurrent: true,
-      ),
-    );
+    unawaited(_openQueue(queue.map(QueueEntry.fromShortVideo).toList(), 0));
   }
 
   void _toggleSelect(ShortVideo video) {

@@ -15,6 +15,7 @@ import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
+import 'package:get/get.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 /// 抖音 / TikTok / B 站收藏的整页播放器。
@@ -172,22 +173,37 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   void _leave() {
-    // 返回必须「立刻」生效，所以顺序是：先 pop，再收尾。
-    //
-    // 这里踩过一个很隐蔽的坑：`_shutdown()` 虽然写了 async，但函数体里没有
-    // 任何 await，所以它是一个「同步跑完的 async 函数」。调用方写
-    // `unawaited(_shutdown())` 并不会让它变成后台任务——函数会一路同步执行
-    // 到 `_player.dispose()` 结束才返回。而 dispose() 里面是一串原生调用
-    // （关 PiP、WakelockPlus、销毁 video controller），全套跑完才轮到
-    // `navigator.pop()`，中间这段时间用户看到的就是「点了返回，没反应」。
-    //
-    // 现在把 pop 提到最前面，收尾推到下一帧之后，让「页面消失」和
-    // 「资源释放」彻底解耦。
-    final navigator = Navigator.of(context);
-    if (navigator.canPop()) navigator.pop();
-    // 先同步置位，避免 dispose() 里再跑一遍收尾。
+    // 只退一次：连点两下、或者按钮和右滑同时触发时，第二次不能再 pop 掉
+    // 下面那一层（那会把首页也退掉）。
+    if (_leaving) return;
+    // 必须先置位再导航。`navigator.pop()` 会在同一个调用栈里回调
+    // `PopScope.onPopInvokedWithResult`，而 `_shutdown()` 虽然是 async，
+    // 函数体里却没有 await——它是一路同步跑到 `_player.dispose()` 才返回的。
+    // 没置位时，这串原生调用会卡在 pop 内部，返回按钮照样像死了一样。
+    // 置位后 PopScope 回调会直接返回，真正的收尾交给下面的 postFrame。
     _leaving = true;
-    // 等这一帧结束再释放：pop 已经开始，原生的销毁不会再挡住退场动画。
+
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) {
+      // 播放页压在首页或播放列表上：正常 pop，退场动画立刻开始。
+      navigator.pop();
+    } else {
+      // 这条才是「返回没反应」的根因。
+      //
+      // 收藏页是 MainApp 里的一个 Tab，不是独立路由；播放页是用
+      // `Get.off`（Navigator.pushReplacement）直接从首页路由换过来的，
+      // 所以导航栈里只剩播放页一条。`NavigatorState.canPop()` 在只剩一条
+      // 路由时恒为 false，上面那句 pop 什么都不会做——返回按钮和右滑都走
+      // `_leave`，于是两条路一起失灵，只能杀 App。
+      //
+      // 被替换掉的首页路由已经销毁，栈里没有「上一页」可 pop；用首页的
+      // 命名路由替换自己，把栈底重新变回 MainApp。`offNamed` 底层就是
+      // `pushReplacementNamed`，旧路由要等新路由转场结束才 dispose，
+      // 不会在这里同步跑播放器释放。
+      unawaited(Get.offNamed<void>('/', preventDuplicates: false));
+    }
+
+    // 收尾推到下一帧：导航动作已经开始，原生 dispose 不会再挡住退场动画。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_shutdown(alreadyLeft: true));
     });
@@ -410,14 +426,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         backgroundColor: Colors.black,
         body: Stack(
           children: [
-            // 边缘滑返回。
+            // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
+            // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
+            Positioned.fill(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
+                  bottom: MediaQuery.viewPaddingOf(context).bottom +
+                      _controlBarHeight,
+                ),
+                child: _video(),
+              ),
+            ),
+            // 边缘滑返回。放在视频层之后、控件栏之前：
             //
-            // 三条硬约束，都是踩过的坑：
-            //
-            // 1. 必须放在 Stack 的「最下面」。命中测试是逆序遍历，排最后的
-            //    那个 Positioned.fill 会先接走整屏指针，下面的控件就全哑了
-            //    ——「按钮全点不动、画中画却正常」就是这么来的（画中画走原生
-            //    PiP，不经过 Flutter 这一层）。
+            // 1. 命中测试是逆序遍历，必须排在 `Positioned.fill` 的视频层后面，
+            //    否则视频层会先接走这一条边缘上的指针，手势根本收不到。
+            //    但也不能排到控件栏上面，否则会盖住左上角的返回按钮。
             // 2. 只用左边缘一小条，不要整屏。整屏的横向拖动会和按钮的 tap、
             //    视频的 onClick 一起进手势仲裁，拖一下就把点击吃掉。
             // 3. 上下要避开控件栏。返回按钮就在左上角，和边缘条在几何上
@@ -438,18 +463,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                   _dragDx = 0;
                 },
                 onHorizontalDragCancel: () => _dragDx = 0,
-              ),
-            ),
-            // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
-            // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
-            Positioned.fill(
-              child: Padding(
-                padding: EdgeInsets.only(
-                  top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
-                  bottom: MediaQuery.viewPaddingOf(context).bottom +
-                      _controlBarHeight,
-                ),
-                child: _video(),
               ),
             ),
             // 控件栏必须给死高度。
