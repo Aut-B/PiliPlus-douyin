@@ -109,7 +109,7 @@ abstract final class PiliRootScan {
     for (final dir in await _candidateDirs()) {
       try {
         final file = File('${dir.path}/$fileName');
-        if (await file.exists()) return file.readAsString();
+        if (await file.exists()) return await file.readAsString();
       } catch (_) {}
     }
     return null;
@@ -242,3 +242,4 @@ abstract final class PiliRootScan {
     return issues;
   }
 }
+// TESTMARK
