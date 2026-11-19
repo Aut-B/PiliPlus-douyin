@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
+import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
@@ -66,13 +67,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   String? _error;
   bool _shuffle = false;
 
-  /// 当前这条是否已经真正开始播放。
+  /// 当前这条是否已经成功加载并起播。
   ///
-  /// 和 B 站播放页一样订阅 controller 的播放状态，但这里多一步「上膛」：
-  /// 每次 [_open] 主动切歌都先置 false，等新数据源真的开始播放
-  /// （[PlayerStatus.playing]）才置回 true。否则切歌期间旧媒体迟到的
-  /// completed 事件会被当成自然播完，一次点击就连跳两条。
+  /// 每次 [_open] 主动切歌都先置 false，只有本次加载的数据源确认
+  /// `loaded` 且 `play()` 成功后才重新置 true。旧媒体迟到的 `playing`
+  /// 事件不会再把标记打开，避免一次点击后连续跳条。
   bool _completionArmed = false;
+
+  /// [_open] 的会话号。异步加载期间如果又发生了新的切换，旧会话
+  /// 不再有资格起播或上膛。
+  int _openSession = 0;
+  int _armedSession = -1;
 
   /// 状态监听只挂一次、只摘一次。
   bool _statusListening = false;
@@ -192,6 +197,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Future<void> _open(int index) async {
     if (_opening || _queue.isEmpty) return;
     final target = index.clamp(0, _queue.length - 1);
+    final session = ++_openSession;
     _opening = true;
     _completionArmed = false;
     try {
@@ -262,7 +268,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             ? Duration(milliseconds: entry.durationMs)
             : null,
       );
-      if (!mounted) return;
+      if (!mounted || session != _openSession) return;
+      // `setDataSource(autoplay: true)` 内部的自动播放走的是静态
+      // `playIfExists()`，只有 B 站视频页 / 直播页注册了那个回调。
+      // 抖音页没有注册，只加载不会真正播放，这里在确认数据源就绪后
+      // 显式起播；首条和自动切出的下一条都会经过这里。
+      if (_player.dataStatus.value != DataStatus.loaded) return;
+      await _player.play();
+      if (!mounted || session != _openSession) return;
+      _completionArmed = true;
+      _armedSession = session;
+      setState(() {});
       _notePlayed(entry.key);
     } catch (error) {
       if (mounted) setState(() => _error = '播放失败：$error');
@@ -287,18 +303,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// [PlayerStatus.completed] 后回调到这里。
   ///
   /// 只有「上一条已经真正播起来」才允许自动下一条；主动切歌、解析失败、
-  /// 退出页面都不算完成。[_open] 在切歌开始时已经清掉标记，因此这里
-  /// 再收到旧媒体的迟到事件也不会重复跳转。
+  /// 退出页面都不算完成。上膛只发生在当前会话成功加载并起播之后，
+  /// 迟到的 `playing` 不会再打开标记。
   void _onPlayerStatus(PlayerStatus status) {
     if (status == PlayerStatus.completed) {
-      if (!_completionArmed) return;
+      if (!_completionArmed || _armedSession != _openSession) return;
+      if (_player.dataStatus.value != DataStatus.loaded) return;
       _completionArmed = false;
       if (_opening || _leaving || _disposed || !mounted) return;
       unawaited(_next());
-      return;
-    }
-    if (status.isPlaying) {
-      _completionArmed = true;
     }
   }
 
