@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
+import 'package:PiliPlus/pages/douyin/rootscan_view.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
@@ -576,6 +577,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       appBar: AppBar(
         title: Text(platform.title),
         actions: [
+          // 根因诊断入口。放在最前面，用户随时能打开看结论并截屏。
+          IconButton(
+            tooltip: '根因诊断',
+            onPressed: () => Get.to(() => const RootScanPage()),
+            icon: const Icon(Icons.monitor_heart_outlined),
+          ),
           IconButton(
             tooltip: '播放列表',
             onPressed: () => Get.to(() => const ShortVideoPlaylistPage()),

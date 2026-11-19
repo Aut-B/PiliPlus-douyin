@@ -24,6 +24,10 @@ abstract final class PiliRootScan {
   /// 扫描结果文件名。用户从「文件」App 里能直接找到。
   static const String fileName = 'rootscan.json';
 
+  /// 最近一次扫描结果，界面直接读它展示。
+  static Map<String, Object?>? _lastReport;
+  static Map<String, Object?>? get lastReport => _lastReport;
+
   /// 跑一次完整扫描并落盘，返回文件路径（失败返回 null）。
   ///
   /// [seconds] 是帧率采样时长。默认 3 秒，足够看出掉帧与主线程阻塞。
@@ -57,19 +61,58 @@ abstract final class PiliRootScan {
     report['dart'] = await _dartSnapshot();
 
     report['verdict'] = _verdict(report);
+    _lastReport = report;
 
-    // 三、落盘
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final file = File('${dir.path}/$fileName');
-      await file.writeAsString(
-        const JsonEncoder.withIndent('  ').convert(report),
-        flush: true,
-      );
-      return file.path;
-    } catch (_) {
-      return null;
+    // 三、落盘：多个位置都写一份，哪个能拿到用哪个
+    //
+    // 在 LiveContainer + SideStore 里跑时，App 的 Documents 既不出现在系统
+    // 「文件」App 里，容器路径也随 LC 的目录结构走，用户很难自己翻到。
+    // 所以这里同时写到两处，并把路径回传给调用方，由界面直接显示给用户看。
+    final paths = <String>[];
+    final json = const JsonEncoder.withIndent('  ').convert(report);
+
+    for (final dir in await _candidateDirs()) {
+      try {
+        final file = File('${dir.path}/$fileName');
+        await file.writeAsString(json, flush: true);
+        paths.add(file.path);
+      } catch (_) {}
     }
+
+    report['writtenTo'] = paths;
+    return paths.isEmpty ? null : paths.first;
+  }
+
+  /// 依次尝试的落盘目录。
+  ///
+  /// - Documents：常规安装在这里，Filza 能进
+  /// - 应用支持目录：LC 里通常也可写，而且和沙盒同源
+  /// - 临时目录：最后兜底，至少文件存在
+  static Future<List<Directory>> _candidateDirs() async {
+    final out = <Directory>[];
+    try {
+      out.add(await getApplicationDocumentsDirectory());
+    } catch (_) {}
+    try {
+      out.add(await getApplicationSupportDirectory());
+    } catch (_) {}
+    try {
+      out.add(Directory.systemTemp);
+    } catch (_) {}
+    return out;
+  }
+
+  /// 读取上一次扫描的结果，给界面直接展示用。
+  ///
+  /// 用户在 LC 里拿不到文件时，可以在这里复制全文，或者截屏发出来。
+  static Future<String?> readLast() async {
+    for (final dir in await _candidateDirs()) {
+      try {
+        final file = File('${dir.path}/$fileName');
+        if (await file.exists()) return file.readAsString();
+      } catch (_) {}
+    }
+    return null;
   }
 
   static double get _screenW {
