@@ -10,6 +10,7 @@ import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
@@ -82,9 +83,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_dumpViewHierarchy());
       unawaited(_open(_index));
       unawaited(_restoreShuffle());
     });
+  }
+
+  /// 进播放页时把原生视图层级落盘到 Documents/ui_hierarchy.txt。
+  ///
+  /// 目的：用户报「整页点不动、返回不了」时，我们一直在 Dart 侧猜是哪一层
+  /// 吃了事件。这份文件直接给出真实的 UIView 树——如果有一个不透明的原生
+  /// 视图盖在 Flutter 渲染视图上面，或者 Flutter 视图本身尺寸是 0，一眼可见。
+  ///
+  /// 只在 DEBUG 之外的诊断包里保留：失败静默，绝不影响播放。
+  Future<void> _dumpViewHierarchy() async {
+    try {
+      await const MethodChannel('piliplus/view_diag').invokeMethod('dump');
+    } catch (_) {}
   }
 
   @override

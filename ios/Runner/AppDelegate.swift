@@ -22,5 +22,10 @@ import UIKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "ShortVideoWebView") {
       ShortVideoWebViewPlugin.register(with: registrar)
     }
+    // 视图层级诊断。用户报「整页点不动」时用它把真实的 view 层级写出来，
+    // 直接判断是原生视图盖住了 Flutter，还是 Flutter 自己没处理事件。
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliViewDiag") {
+      PiliViewDiag.register(with: registrar)
+    }
   }
 }
