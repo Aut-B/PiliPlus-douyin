@@ -222,9 +222,9 @@ dependency_overrides:
       ref: native
   media_kit_video:
     git:
-      url: https://github.com/bggRGjQaUbCoE/media-kit.git
+      url: https://github.com/Aut-B/Kazumi-media-kit.git
       path: media_kit_video
-      ref: native
+      ref: pip-6s
 
 dev_dependencies:
   flutter_test:

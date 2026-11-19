@@ -1240,9 +1240,9 @@ packages:
     dependency: "direct main"
     description:
       path: media_kit_video
-      ref: native
-      resolved-ref: "85f0a69ea66b100882b27a3375c72e5155375343"
-      url: "https://github.com/bggRGjQaUbCoE/media-kit.git"
+      ref: pip-6s
+      resolved-ref: a0776ab3dab69da161c34f174c95cb9defd9d7c8
+      url: "https://github.com/Aut-B/Kazumi-media-kit.git"
     source: git
     version: "1.2.5"
   meta:
