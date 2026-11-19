@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
+import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:flutter/material.dart';
@@ -65,6 +66,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   String? _error;
   bool _shuffle = false;
 
+  /// 当前这条是否已经真正开始播放。
+  ///
+  /// 和 B 站播放页一样订阅 controller 的播放状态，但这里多一步「上膛」：
+  /// 每次 [_open] 主动切歌都先置 false，等新数据源真的开始播放
+  /// （[PlayerStatus.playing]）才置回 true。否则切歌期间旧媒体迟到的
+  /// completed 事件会被当成自然播完，一次点击就连跳两条。
+  bool _completionArmed = false;
+
+  /// 状态监听只挂一次、只摘一次。
+  bool _statusListening = false;
+
   /// 播过的 key。只用来让随机播放不重复，和「播放列表」是两回事。
   final Set<String> _played = <String>{};
 
@@ -83,6 +95,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   void initState() {
     super.initState();
+    _player.addStatusLister(_onPlayerStatus);
+    _statusListening = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_dumpViewHierarchy());
       unawaited(PiliRootScan.run());
@@ -135,6 +149,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    if (_statusListening) {
+      _statusListening = false;
+      _player.removeStatusLister(_onPlayerStatus);
+    }
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
         IOSPipHelper.dispose();
@@ -175,6 +193,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_opening || _queue.isEmpty) return;
     final target = index.clamp(0, _queue.length - 1);
     _opening = true;
+    _completionArmed = false;
     try {
       final entry = _queue[target];
       setState(() {
@@ -261,6 +280,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           played: _played,
         ),
       );
+    }
+  }
+
+  /// 复用 B 站播放页的完成监听：controller 把 mpv 的 completed 流转成
+  /// [PlayerStatus.completed] 后回调到这里。
+  ///
+  /// 只有「上一条已经真正播起来」才允许自动下一条；主动切歌、解析失败、
+  /// 退出页面都不算完成。[_open] 在切歌开始时已经清掉标记，因此这里
+  /// 再收到旧媒体的迟到事件也不会重复跳转。
+  void _onPlayerStatus(PlayerStatus status) {
+    if (status == PlayerStatus.completed) {
+      if (!_completionArmed) return;
+      _completionArmed = false;
+      if (_opening || _leaving || _disposed || !mounted) return;
+      unawaited(_next());
+      return;
+    }
+    if (status.isPlaying) {
+      _completionArmed = true;
     }
   }
 
@@ -481,9 +519,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
     return GestureDetector(
-      // 只在这一块响应点按暂停，并且不吃掉外层（横向滑返回）的手势。
+      // 和 B站播放页一致：双击暂停/播放，单击不触发任何播放操作。
+      //
+      // 这里刻意只挂 onDoubleTap、不挂 onTap：两者同时存在时，单击要等约
+      // 300ms 双击判定超时才会派发，控件层按钮的响应会跟着变慢。单击的
+      // 事件照旧透传（translucent），也不吃掉外层横向滑返回的手势。
       behavior: HitTestBehavior.translucent,
-      onTap: () => unawaited(_togglePlay()),
+      onDoubleTap: () => unawaited(_togglePlay()),
       child: ColoredBox(
         color: Colors.black,
         child: Center(
