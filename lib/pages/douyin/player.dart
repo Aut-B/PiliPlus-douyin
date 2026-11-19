@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
+import 'package:PiliPlus/pages/douyin/rootscan.dart';
 import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
@@ -84,6 +85,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_dumpViewHierarchy());
+      unawaited(PiliRootScan.run());
       unawaited(_open(_index));
       unawaited(_restoreShuffle());
     });

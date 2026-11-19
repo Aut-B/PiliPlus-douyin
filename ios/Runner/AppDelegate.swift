@@ -27,5 +27,10 @@ import UIKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliViewDiag") {
       PiliViewDiag.register(with: registrar)
     }
+    // 根因扫描器。一次性采集视图层级、命中测试、帧率、主线程阻塞，
+    // 全部导成一个 JSON，避免再靠读代码猜「到底哪一层吃了事件」。
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "PiliRootScan") {
+      PiliRootScan.register(with: registrar)
+    }
   }
 }

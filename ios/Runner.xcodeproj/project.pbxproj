@@ -15,6 +15,7 @@
 		B7D3A9F12FCB1A0000C0D3E1 /* PipPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7D3A9F02FCB1A0000C0D3E1 /* PipPlugin.swift */; };
 		C4E1A7B32F0D4C8A9B6E5D21 /* ShortVideoNative.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4E1A7B22F0D4C8A9B6E5D21 /* ShortVideoNative.swift */; };
 		D5F2B8C43A1E4D6F8C7E9B13 /* PiliViewDiag.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F2B8C33A1E4D6F8C7E9B13 /* PiliViewDiag.swift */; };
+		E6A3C9D54B2F5E7A9D8F1C24 /* PiliRootScan.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6A3C9D44B2F5E7A9D8F1C24 /* PiliRootScan.swift */; };
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
@@ -47,6 +48,7 @@
 		B7D3A9F02FCB1A0000C0D3E1 /* PipPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipPlugin.swift; sourceTree = "<group>"; };
 		C4E1A7B22F0D4C8A9B6E5D21 /* ShortVideoNative.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortVideoNative.swift; sourceTree = "<group>"; };
 		D5F2B8C33A1E4D6F8C7E9B13 /* PiliViewDiag.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiliViewDiag.swift; sourceTree = "<group>"; };
+		E6A3C9D44B2F5E7A9D8F1C24 /* PiliRootScan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiliRootScan.swift; sourceTree = "<group>"; };
 		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Release.xcconfig; path = Flutter/Release.xcconfig; sourceTree = "<group>"; };
 		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Debug.xcconfig; path = Flutter/Debug.xcconfig; sourceTree = "<group>"; };
 		9740EEB31CF90195004384FC /* Generated.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Generated.xcconfig; path = Flutter/Generated.xcconfig; sourceTree = "<group>"; };
@@ -121,6 +123,7 @@
 				B7D3A9F02FCB1A0000C0D3E1 /* PipPlugin.swift */,
 				C4E1A7B22F0D4C8A9B6E5D21 /* ShortVideoNative.swift */,
 				D5F2B8C33A1E4D6F8C7E9B13 /* PiliViewDiag.swift */,
+				E6A3C9D44B2F5E7A9D8F1C24 /* PiliRootScan.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
 			);
 			path = Runner;
@@ -309,6 +312,7 @@
 				B7D3A9F12FCB1A0000C0D3E1 /* PipPlugin.swift in Sources */,
 				C4E1A7B32F0D4C8A9B6E5D21 /* ShortVideoNative.swift in Sources */,
 				D5F2B8C43A1E4D6F8C7E9B13 /* PiliViewDiag.swift in Sources */,
+				E6A3C9D54B2F5E7A9D8F1C24 /* PiliRootScan.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
