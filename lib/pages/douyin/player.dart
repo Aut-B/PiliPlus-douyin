@@ -127,6 +127,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       ValueNotifier<_GestureHint?>(null);
   Timer? _gestureHintTimer;
 
+  /// 画中画状态推送的节拍器。
+  ///
+  /// iOS 的 AVSampleBufferDisplayLayer 用 timebase 给每帧打 PTS，而原生
+  /// timebase 只有收到带 position 的 update 才会推进。此前抖音页从不推送，
+  /// timebase 停在 0，老机型会把后续帧当成重复帧，画中画卡在第一帧。
+  Timer? _pipTicker;
+
   QueueEntry get _current => _queue[_index];
 
   @override
@@ -134,6 +141,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     super.initState();
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
+    _startPipTicker();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -159,6 +167,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   @override
   void dispose() {
+    _stopPipTicker();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
     // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
@@ -190,6 +199,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    _stopPipTicker();
     if (_statusListening) {
       _statusListening = false;
       _player.removeStatusLister(_onPlayerStatus);
@@ -225,6 +235,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     // 置位后 PopScope 回调会直接返回，真正的收尾交给下面的 postFrame。
     _leaving = true;
 
+    _stopPipTicker();
     final navigator = Navigator.of(context);
     if (navigator.canPop()) {
       // 播放页压在首页或播放列表上：正常 pop，退场动画立刻开始。
@@ -334,6 +345,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (_player.dataStatus.value != DataStatus.loaded) return;
       await _player.play();
       if (!mounted || session != _openSession) return;
+      _publishPipState();
       _completionArmed = true;
       _armedSession = session;
       setState(() {});
@@ -364,6 +376,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 退出页面都不算完成。上膛只发生在当前会话成功加载并起播之后，
   /// 迟到的 `playing` 不会再打开标记。
   void _onPlayerStatus(PlayerStatus status) {
+    _publishPipState();
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
       if (_player.dataStatus.value != DataStatus.loaded) return;
@@ -433,6 +446,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     } else {
       await _player.play();
     }
+    _publishPipState();
     if (mounted) setState(() {});
   }
 
@@ -443,6 +457,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     }
     _pipEntered = true;
     _player.enterPip(autoEnter: true);
+    _publishPipState();
+  }
+
+  /// 启动画中画状态推送。播放中每 500ms 推一次 position，原生 timebase
+  /// 才会前进；只在进入画中画时推一次的话，老机型依旧会卡帧。
+  void _startPipTicker() {
+    _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _publishPipState();
+    });
+  }
+
+  void _stopPipTicker() {
+    _pipTicker?.cancel();
+    _pipTicker = null;
+  }
+
+  /// 字段形状与 pl_player 的 `_iosPipState()` 对齐；position/duration 用毫秒。
+  void _publishPipState([int? positionMs]) {
+    if (_disposed || !mounted || !IOSPipHelper.needsUpdate) return;
+    IOSPipHelper.update(<String, Object>{
+      'isPlaying': _player.playerStatus.isPlaying,
+      'isBuffering': _player.isBuffering.value,
+      'isLive': _player.isLive,
+      'position': positionMs ?? _player.positionInMilliseconds,
+      'duration': _player.durationInMilliseconds,
+      'speed': _player.playbackSpeed,
+    });
   }
 
   void _toggleShuffle() {
@@ -683,6 +724,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _seekDragging = false;
     _player.position.value = _seekTargetMs ~/ 1000;
     unawaited(_player.seekTo(Duration(milliseconds: _seekTargetMs)));
+    _publishPipState(_seekTargetMs);
     _hideHintSoon();
   }
 
@@ -1011,6 +1053,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 unawaited(
                   _player.seekTo(Duration(milliseconds: milliseconds)),
                 );
+                _publishPipState(milliseconds);
               },
             );
           }),
