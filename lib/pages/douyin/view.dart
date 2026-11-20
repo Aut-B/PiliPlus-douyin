@@ -28,6 +28,56 @@ class ShortVideoPage extends StatefulWidget {
 class _ShortVideoPageState extends State<ShortVideoPage> {
   ShortVideoPlatform _platform = ShortVideoPlatform.douyin;
 
+  /// 多选状态放在两个平台之上，切换 Tab 时选择不丢。
+  ///
+  /// 这里存的是 `ShortVideo` 本身而不只是 key：切到另一个 Tab 后，
+  /// 当前页拿不到另一边的 `_videos`，批量加入播放列表还得靠这些对象。
+  bool _selecting = false;
+  final Map<String, ShortVideo> _selected = <String, ShortVideo>{};
+
+  void _setSelecting(bool value) {
+    setState(() {
+      _selecting = value;
+      if (!value) _selected.clear();
+    });
+  }
+
+  void _toggleSelect(ShortVideo video) {
+    setState(() {
+      if (_selected.remove(video.key) == null) {
+        _selected[video.key] = video;
+      }
+    });
+  }
+
+  /// 全选只作用于当前 Tab：已经选中的另一平台条目保留。
+  void _toggleAll(Iterable<ShortVideo> videos) {
+    final list = videos.toList(growable: false);
+    if (list.isEmpty) return;
+    final allSelected = list.every((e) => _selected.containsKey(e.key));
+    setState(() {
+      if (allSelected) {
+        for (final video in list) {
+          _selected.remove(video.key);
+        }
+      } else {
+        for (final video in list) {
+          _selected[video.key] = video;
+        }
+      }
+      if (_selected.isEmpty) _selecting = false;
+    });
+  }
+
+  void _removeSelected(Iterable<ShortVideo> videos) {
+    setState(() {
+      for (final video in videos) {
+        _selected.remove(video.key);
+      }
+      if (_selected.isEmpty) _selecting = false;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -62,6 +112,12 @@ class _ShortVideoPageState extends State<ShortVideoPage> {
       body: ShortVideoFavoritesPage(
         key: ValueKey(_platform.id),
         platform: _platform,
+        selecting: _selecting,
+        selected: _selected,
+        onSelectingChanged: _setSelecting,
+        onToggleSelect: _toggleSelect,
+        onToggleAll: _toggleAll,
+        onRemoveSelected: _removeSelected,
       ),
     );
   }
@@ -72,9 +128,24 @@ class _ShortVideoPageState extends State<ShortVideoPage> {
 /// 抓取本身在原生 WKWebView 里做（网页登录 + 旁观接口返回），这里只负责
 /// 展示、播放和 WebDAV 同步。
 class ShortVideoFavoritesPage extends StatefulWidget {
-  const ShortVideoFavoritesPage({super.key, required this.platform});
+  const ShortVideoFavoritesPage({
+    super.key,
+    required this.platform,
+    required this.selecting,
+    required this.selected,
+    required this.onSelectingChanged,
+    required this.onToggleSelect,
+    required this.onToggleAll,
+    required this.onRemoveSelected,
+  });
 
   final ShortVideoPlatform platform;
+  final bool selecting;
+  final Map<String, ShortVideo> selected;
+  final ValueChanged<bool> onSelectingChanged;
+  final ValueChanged<ShortVideo> onToggleSelect;
+  final ValueChanged<Iterable<ShortVideo>> onToggleAll;
+  final ValueChanged<Iterable<ShortVideo>> onRemoveSelected;
 
   @override
   State<ShortVideoFavoritesPage> createState() => _ShortVideoFavoritesPageState();
@@ -92,10 +163,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 原生一共回传了多少段响应（不等于视频条数）。
   int _rawCount = 0;
 
-  /// 多选：全选 / 播放所选。
-  bool _selecting = false;
-  final Set<String> _selected = {};
-
   /// 正在把选中的条目下到本地。
   bool _caching = false;
 
@@ -103,6 +170,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   int _cacheBytes = 0;
 
   ShortVideoPlatform get platform => widget.platform;
+
+  bool get _selecting => widget.selecting;
+  Iterable<ShortVideo> get _selectedVideos => widget.selected.values;
+  int get _selectedCount => widget.selected.length;
+
+  /// 当前 Tab 里被选中的条目。缓存 / 删除只对它生效。
+  List<ShortVideo> get _localSelected => _selectedVideos
+      .where((e) => e.platform == platform.id)
+      .toList(growable: false);
+
+  bool get _allLocalSelected =>
+      _videos.isNotEmpty &&
+      _videos.every((e) => widget.selected.containsKey(e.key));
 
   @override
   void initState() {
@@ -217,17 +297,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     // 重新抓到了就撤掉删除墓碑，让它重新回到列表。
     ShortVideoRepo.unmarkDeleted(platform, parsed.map((e) => e.key));
     ShortVideoRepo.save(platform, _videos);
-    // 抓到的每一条同时归档进「播放列表」。那是另一份存储：删收藏、清空收藏
-    // 都不会动它，误删之后还能从播放列表里接着听/看，不用重新登录抓一遍。
-    final archived = ShortVideoPlaylistRepo.add(
-      parsed.map(PlaylistItem.fromShortVideo),
-    );
     ShortVideoAutoCache.schedule();
     if (mounted) {
-      setState(
-        () => _status = '已抓取 ${_videos.length} 条'
-            '${archived > 0 ? '，播放列表 +$archived' : ''}',
-      );
+      setState(() => _status = '已抓取 ${_videos.length} 条');
     }
   }
 
@@ -255,45 +327,22 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 只播选中的这些（顺序按列表顺序）。
+  /// 只播选中的这些（按勾选顺序，可跨抖音 / TikTok）。
   void _playSelected() {
-    if (_selected.isEmpty) {
+    final queue = _selectedVideos.toList(growable: false);
+    if (queue.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
     }
-    final queue = _videos.where((e) => _selected.contains(e.key)).toList();
-    if (queue.isEmpty) return;
-    setState(() {
-      _selecting = false;
-      _selected.clear();
-    });
+    widget.onSelectingChanged(false);
     unawaited(_openQueue(queue.map(QueueEntry.fromShortVideo).toList(), 0));
   }
 
-  void _toggleSelect(ShortVideo video) {
-    setState(() {
-      if (!_selected.remove(video.key)) _selected.add(video.key);
-    });
-  }
+  void _toggleSelect(ShortVideo video) => widget.onToggleSelect(video);
 
-  void _toggleSelectMode() {
-    setState(() {
-      _selecting = !_selecting;
-      if (!_selecting) _selected.clear();
-    });
-  }
+  void _toggleSelectMode() => widget.onSelectingChanged(!_selecting);
 
-  void _selectAll() {
-    setState(() {
-      if (_selected.length == _videos.length) {
-        _selected.clear();
-      } else {
-        _selected
-          ..clear()
-          ..addAll(_videos.map((e) => e.key));
-      }
-    });
-  }
+  void _selectAll() => widget.onToggleAll(_videos);
 
   void _playAll() => _play(0);
 
@@ -303,10 +352,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final positions = List<int>.generate(videos.length, (i) => i);
     setState(() {
       _videos.clear();
-      _selected.clear();
-      _selecting = false;
       _status = '已清空，可重新抓取';
     });
+    widget.onSelectingChanged(false);
     ShortVideoRepo.save(platform, const []);
     // 留墓碑：否则下一次同步会把这些条目从远端并回来。
     ShortVideoRepo.markDeleted(platform, keys);
@@ -335,9 +383,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final position = _videos.indexWhere((e) => e.key == video.key);
     setState(() {
       _videos.removeWhere((e) => e.key == video.key);
-      _selected.remove(video.key);
       _status = '已删除 1 条，本地 ${_videos.length} 条';
     });
+    widget.onRemoveSelected([video]);
     ShortVideoRepo.save(platform, _videos);
     ShortVideoRepo.markDeleted(platform, [video.key]);
     if (!ShortVideoPlaylistRepo.contains('short:${video.key}')) {
@@ -350,11 +398,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   /// 多选删除。
   Future<void> _deleteSelected() async {
-    if (_selected.isEmpty) {
+    final targets = _localSelected;
+    if (targets.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
     }
-    final targets = _videos.where((e) => _selected.contains(e.key)).toList();
     final confirmed = await showConfirmDialog(
       context: context,
       title: Text('删除所选的 ${targets.length} 条？'),
@@ -369,11 +417,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         _videos.indexWhere((e) => e.key == video.key),
     ];
     setState(() {
-      _videos.removeWhere((e) => _selected.contains(e.key));
+      _videos.removeWhere((e) => targets.any((t) => t.key == e.key));
       _status = '已删除 ${targets.length} 条，本地 ${_videos.length} 条';
-      _selected.clear();
-      _selecting = false;
     });
+    widget.onRemoveSelected(targets);
     ShortVideoRepo.save(platform, _videos);
     ShortVideoRepo.markDeleted(platform, targets.map((e) => e.key));
     for (final video in targets) {
@@ -520,11 +567,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   void _cacheSelected() {
-    if (_selected.isEmpty) {
+    final targets = _localSelected;
+    if (targets.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
     }
-    _cacheVideos(_videos.where((e) => _selected.contains(e.key)).toList());
+    _cacheVideos(targets);
   }
 
   static String _fmtBytes(int bytes) {
@@ -548,33 +596,38 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   /// 加进「播放列表」（B 站 / 抖音 / TikTok 混在一起播的那份）。
   void _addToPlaylist(Iterable<ShortVideo> videos) {
+    final list = videos.toList(growable: false);
+    if (list.isEmpty) return;
     final added = ShortVideoPlaylistRepo.add(
-      videos.map(PlaylistItem.fromShortVideo),
+      list.map(PlaylistItem.fromShortVideo),
     );
     if (added == 0) {
       SmartDialog.showToast('这些已经在播放列表里了');
       return;
     }
     ShortVideoAutoCache.schedule();
+    final skipped = list.length - added;
     SmartDialog.showToast(
-      '已加入播放列表（共 ${ShortVideoPlaylistRepo.length} 条）',
+      skipped > 0 ? '已加入 $added 条，$skipped 条重复已跳过' : '已加入 $added 条',
     );
   }
 
   void _addSelectedToPlaylist() {
-    if (_selected.isEmpty) {
+    final selected = _selectedVideos.toList(growable: false);
+    if (selected.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
     }
-    _addToPlaylist(_videos.where((e) => _selected.contains(e.key)));
+    _addToPlaylist(selected);
   }
 
   void _queueSelectedNext() {
-    if (_selected.isEmpty) {
+    final selected = _selectedVideos.toList(growable: false);
+    if (selected.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
     }
-    _queueNext(_videos.where((e) => _selected.contains(e.key)));
+    _queueNext(selected);
   }
 
   @override
@@ -613,8 +666,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           ),
           IconButton(
             tooltip: _selecting ? '退出多选' : '多选',
-            onPressed: _videos.isEmpty ? null : _toggleSelectMode,
-            icon: Icon(_selecting ? Icons.close : Icons.checklist),
+            onPressed: _videos.isEmpty && !_selecting
+                ? null
+                : _toggleSelectMode,
+            icon: Badge(
+              isLabelVisible: _selecting && _selectedCount > 0,
+              label: Text('$_selectedCount'),
+              child: Icon(_selecting ? Icons.close : Icons.checklist),
+            ),
           ),
           IconButton(
             tooltip: '全部播放',
@@ -680,11 +739,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
-        final checked = _selected.contains(video.key);
+        final checked = widget.selected.containsKey(video.key);
         return ListTile(
           onTap: () => _selecting ? _toggleSelect(video) : _play(index),
           onLongPress: () {
-            if (!_selecting) setState(() => _selecting = true);
+            if (!_selecting) widget.onSelectingChanged(true);
             _toggleSelect(video);
           },
           selected: _selecting && checked,
@@ -767,6 +826,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     // 那 56px 的导航栏高度根本没留，按钮照样被压住。这就是用户说
     // 「底栏挡住了下面两个按钮」一直没修好的原因。
     final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
+    final localSelected = _localSelected;
     return Padding(
       padding: EdgeInsets.fromLTRB(16, 8, 16, safeBottom + _mainBottomNavHeight),
       child: Column(
@@ -806,40 +866,36 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   OutlinedButton.icon(
                     onPressed: _videos.isEmpty ? null : _selectAll,
                     icon: const Icon(Icons.select_all),
-                    label: Text(
-                      _selected.length == _videos.length && _videos.isNotEmpty
-                          ? '取消全选'
-                          : '全选',
-                    ),
+                    label: Text(_allLocalSelected ? '取消全选' : '全选'),
                   ),
                   FilledButton.icon(
-                    onPressed: _playSelected,
+                    onPressed: _selectedCount == 0 ? null : _playSelected,
                     icon: const Icon(Icons.playlist_play),
-                    label: Text('播放所选 ${_selected.length} 条'),
+                    label: Text('播放所选 $_selectedCount 条'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: _selected.isEmpty ? null : _queueSelectedNext,
+                    onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
                     icon: const Icon(Icons.queue_play_next),
-                    label: Text('下一首 ${_selected.length} 条'),
+                    label: Text('下一首 $_selectedCount 条'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: _selected.isEmpty
+                    onPressed: _selectedCount == 0
                         ? null
                         : _addSelectedToPlaylist,
                     icon: const Icon(Icons.playlist_add),
-                    label: Text('加入列表 ${_selected.length} 条'),
+                    label: Text('加入列表 $_selectedCount 条'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: _selected.isEmpty || _caching
+                    onPressed: localSelected.isEmpty || _caching
                         ? null
                         : _cacheSelected,
                     icon: const Icon(Icons.download_for_offline_outlined),
-                    label: Text('缓存 ${_selected.length} 条'),
+                    label: Text('缓存 ${localSelected.length} 条'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: _selected.isEmpty ? null : _deleteSelected,
+                    onPressed: localSelected.isEmpty ? null : _deleteSelected,
                     icon: const Icon(Icons.delete_outline),
-                    label: Text('删除 ${_selected.length} 条'),
+                    label: Text('删除 ${localSelected.length} 条'),
                   ),
                 ],
               )
