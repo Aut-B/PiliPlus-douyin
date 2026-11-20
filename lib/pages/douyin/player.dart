@@ -563,7 +563,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return;
     }
     _pipEntered = true;
-    _player.enterPip(autoEnter: true);
+    // 手动按钮立即启动画中画并退后台，和 B 站播放页一致；autoEnter 只 arm
+    // 不 start，用户点了按钮却留在前台会看起来什么都没发生。
+    _player.enterPip(autoEnter: false);
     _publishPipState();
   }
 

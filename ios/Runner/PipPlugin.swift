@@ -182,6 +182,12 @@ private final class PipSession: NSObject {
   private var backgroundOnStart = false
   private var frameInFlight = false
   private var lastFrameTime: CFTimeInterval = 0
+  private var frameInFlightSince: CFTimeInterval = 0
+  private var frameGeneration = 0
+  private var textureCallbackCount = 0
+  private var frameInFlightDropCount = 0
+  private var throttleDropCount = 0
+  private var enqueuedFrameCount = 0
   /// Whether a frame has been enqueued, PiP shows a black window otherwise.
   private var hasFrame = false
 
@@ -290,19 +296,32 @@ private final class PipSession: NSObject {
   }
 
   func update(_ args: [String: Any]) {
+    let position = (args["position"] as? NSNumber)?.int64Value
+    let isBuffering = args["isBuffering"] as? Bool ?? false
+    let durationMs = (args["duration"] as? NSNumber)?.int64Value
     if let value = args["isPlaying"] as? Bool { isPlaying = value }
     if let value = args["isLive"] as? Bool { isLive = value }
-    if let value = (args["duration"] as? NSNumber)?.int64Value {
+    if let value = durationMs {
       duration = CMTime(value: value, timescale: 1000)
     }
     if let value = (args["speed"] as? NSNumber)?.doubleValue { speed = value }
-    if let position = (args["position"] as? NSNumber)?.int64Value {
-      let isBuffering = args["isBuffering"] as? Bool ?? false
-      CMTimebaseSetRateAndAnchorTime(
+    PipTrace.log(
+      "update: position=\(position.map { String($0) } ?? "nil")ms isPlaying=\(isPlaying) "
+        + "isBuffering=\(isBuffering) speed=\(speed) "
+        + "duration=\(durationMs.map { String($0) } ?? "nil")ms"
+    )
+    if let position {
+      let rate = isPlaying && !isBuffering ? speed : 0
+      let status = CMTimebaseSetRateAndAnchorTime(
         timebase,
-        rate: isPlaying && !isBuffering ? speed : 0,
+        rate: rate,
         anchorTime: CMTime(value: position, timescale: 1000),
         immediateSourceTime: CMClockGetTime(CMClockGetHostTimeClock())
+      )
+      let timebaseTime = CMTimebaseGetTime(timebase)
+      PipTrace.log(
+        "timebase: rate=\(rate) time=\(timebaseTime.seconds) status=\(status) "
+          + "anchor=\(position)ms"
       )
     }
     controller.invalidatePlaybackState()
@@ -356,13 +375,22 @@ private final class PipSession: NSObject {
     // The content source retains its playback delegate (`self`).
     controller.contentSource = nil
     sourceView.removeFromSuperview()
+    PipTrace.log(
+      "summary: textureCallbacks=\(textureCallbackCount) "
+        + "frameInFlightDrops=\(frameInFlightDropCount) "
+        + "throttleDrops=\(throttleDropCount) enqueued=\(enqueuedFrameCount)"
+    )
   }
 
   // MARK: Frames
 
   /// Must be called on the main thread.
   func frameAvailable(force: Bool = false) {
-    guard !frameInFlight else { return }
+    textureCallbackCount += 1
+    guard !frameInFlight else {
+      frameInFlightDropCount += 1
+      return
+    }
     guard let texture = TextureTracker.texture(for: textureId) else {
       // 这里返回意味着 textureId 对不上：画中画永远拿不到帧。
       PipTrace.log("frameAvailable: no texture for id=\(textureId) (this is fatal)")
@@ -370,27 +398,52 @@ private final class PipSession: NSObject {
     }
     let now = CACurrentMediaTime()
     if !force && !isActive && now - lastFrameTime < Self.idleFrameInterval {
+      throttleDropCount += 1
       return
     }
-    guard let source = texture.copyPixelBuffer()?.takeRetainedValue() else { return }
+    guard let source = texture.copyPixelBuffer()?.takeRetainedValue() else {
+      PipTrace.log("frameAvailable: copyPixelBuffer returned nil for id=\(textureId)")
+      return
+    }
     lastFrameTime = now
     frameInFlight = true
+    frameInFlightSince = CACurrentMediaTime()
+    frameGeneration &+= 1
+    let generation = frameGeneration
+    // A blocked copy/render/enqueue would otherwise leave the flag set and
+    // silently drop every later frame without a trace.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      guard let self, self.frameInFlight, self.frameGeneration == generation else {
+        return
+      }
+      let stuckMs = Int((CACurrentMediaTime() - self.frameInFlightSince) * 1000)
+      self.frameInFlight = false
+      PipTrace.log("watchdog: frameInFlight cleared after \(stuckMs)ms")
+    }
     // The source buffer is reused by mpv a few frames later, so it is copied
     // (and downscaled if needed) instead of being handed to the layer as is.
     frameQueue.async { [weak self] in
       guard let self else { return }
+      var stage = "copy"
       var enqueued = false
-      if let copy = self.copy(source), let sampleBuffer = self.makeSampleBuffer(copy) {
-        enqueued = self.enqueue(sampleBuffer)
+      if let copy = self.copy(source, stage: &stage),
+        let sampleBuffer = self.makeSampleBuffer(copy, stage: &stage)
+      {
+        enqueued = self.enqueue(sampleBuffer, stage: &stage)
       }
       let layerStatus = self.displayLayer.status.rawValue
       let ready = self.displayLayer.isReadyForMoreMediaData
       PipTrace.log(
-        "frame: enqueued=\(enqueued) layerStatus=\(layerStatus) ready=\(ready) "
-          + "size=\(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))"
+        "frame: enqueued=\(enqueued) stage=\(stage) layerStatus=\(layerStatus) "
+          + "ready=\(ready) size=\(CVPixelBufferGetWidth(source))x"
+          + "\(CVPixelBufferGetHeight(source))"
       )
       DispatchQueue.main.async {
+        guard self.frameGeneration == generation else { return }
         self.frameInFlight = false
+        if enqueued {
+          self.enqueuedFrameCount += 1
+        }
         if enqueued && !self.hasFrame {
           self.hasFrame = true
           self.updateAutoEnter()
@@ -400,10 +453,17 @@ private final class PipSession: NSObject {
     }
   }
 
-  private func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+  private func copy(_ source: CVPixelBuffer, stage: inout String) -> CVPixelBuffer? {
+    stage = "size"
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
     let sourceHeight = Double(CVPixelBufferGetHeight(source))
-    guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+    guard sourceWidth > 0, sourceHeight > 0 else {
+      PipTrace.log(
+        "copy: zero source size \(CVPixelBufferGetWidth(source))x"
+          + "\(CVPixelBufferGetHeight(source))"
+      )
+      return nil
+    }
     var scale = min(1, Self.maxDimension / max(sourceWidth, sourceHeight))
     if renderSize.width > 0 && renderSize.height > 0 {
       // No need for more pixels than the PiP window has.
@@ -427,14 +487,35 @@ private final class PipSession: NSObject {
         kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         kCVPixelBufferMetalCompatibilityKey: true,
       ]
-      CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
+      let status = CVPixelBufferPoolCreate(
+        nil,
+        nil,
+        attributes as CFDictionary,
+        &pool
+      )
+      if status != kCVReturnSuccess || pool == nil {
+        pool = nil
+        PipTrace.log(
+          "copy: pool create failed status=\(status) "
+            + "size=\(Int(size.width))x\(Int(size.height))"
+        )
+        return nil
+      }
     }
     guard let pool else { return nil }
 
+    stage = "pixelBuffer"
     var output: CVPixelBuffer?
-    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
-    guard let output else { return nil }
+    let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
+    guard let output else {
+      PipTrace.log(
+        "copy: pixel buffer create failed status=\(status) "
+          + "size=\(Int(size.width))x\(Int(size.height))"
+      )
+      return nil
+    }
 
+    stage = "render"
     var image = CIImage(cvPixelBuffer: source)
     if scale < 1 {
       image = image.transformed(
@@ -445,38 +526,60 @@ private final class PipSession: NSObject {
       )
     }
     ciContext.render(image, to: output)
+    stage = "done"
     return output
   }
 
-  private func makeSampleBuffer(_ pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+  private func makeSampleBuffer(
+    _ pixelBuffer: CVPixelBuffer,
+    stage: inout String
+  ) -> CMSampleBuffer? {
+    stage = "format"
     let matches =
       formatDescription.map {
         CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: pixelBuffer)
       } ?? false
     if !matches {
       formatDescription = nil
-      CMVideoFormatDescriptionCreateForImageBuffer(
+      let status = CMVideoFormatDescriptionCreateForImageBuffer(
         allocator: nil,
         imageBuffer: pixelBuffer,
         formatDescriptionOut: &formatDescription
       )
+      if status != 0 {
+        PipTrace.log("makeSampleBuffer: format description failed status=\(status)")
+      }
     }
     guard let formatDescription else { return nil }
 
+    stage = "sample"
+    let pts = CMTimebaseGetTime(timebase)
     var timing = CMSampleTimingInfo(
       duration: .invalid,
-      presentationTimeStamp: CMTimebaseGetTime(timebase),
+      presentationTimeStamp: pts,
       decodeTimeStamp: .invalid
     )
     var sampleBuffer: CMSampleBuffer?
-    CMSampleBufferCreateReadyWithImageBuffer(
+    let status = CMSampleBufferCreateReadyWithImageBuffer(
       allocator: nil,
       imageBuffer: pixelBuffer,
       formatDescription: formatDescription,
       sampleTiming: &timing,
       sampleBufferOut: &sampleBuffer
     )
-    guard let sampleBuffer else { return nil }
+    guard let sampleBuffer else {
+      PipTrace.log(
+        "makeSampleBuffer: sample buffer failed status=\(status) pts=\(pts.seconds)"
+      )
+      return nil
+    }
+    let now = CMTimebaseGetTime(timebase)
+    let deltaMs =
+      pts.isValid && now.isValid
+      ? CMTimeSubtract(now, pts).seconds * 1000 : Double.nan
+    PipTrace.log(
+      "pts: value=\(pts.seconds) timebase=\(now.seconds) deltaMs=\(deltaMs)"
+    )
 
     // Frames are already paced by mpv.
     if let attachments = CMSampleBufferGetSampleAttachmentsArray(
@@ -493,24 +596,65 @@ private final class PipSession: NSObject {
         Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
       )
     }
+    stage = "done"
     return sampleBuffer
   }
 
-  private func enqueue(_ sampleBuffer: CMSampleBuffer) -> Bool {
+  private func enqueue(_ sampleBuffer: CMSampleBuffer, stage: inout String) -> Bool {
+    stage = "enqueue"
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let before = CMTimebaseGetTime(timebase)
+    let ptsAgeMs =
+      pts.isValid && before.isValid
+      ? CMTimeSubtract(before, pts).seconds * 1000 : Double.nan
+    let began = CACurrentMediaTime()
+    let enqueued: Bool
     if #available(iOS 17.0, *) {
       let renderer = displayLayer.sampleBufferRenderer
+      PipTrace.log(
+        "enqueue(before): isReadyForMoreMediaData="
+          + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
+          + "layerStatus=\(displayLayer.status.rawValue) "
+          + "requiresFlush=\(renderer.requiresFlushToResumeDecoding) "
+          + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
+      )
       if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
         renderer.flush()
       }
       renderer.enqueue(sampleBuffer)
-      return renderer.status != .failed
+      enqueued = renderer.status != .failed
+      let elapsedMs = Int((CACurrentMediaTime() - began) * 1000)
+      PipTrace.log(
+        "enqueue(after): isReadyForMoreMediaData="
+          + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
+          + "layerStatus=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
+          + "elapsedMs=\(elapsedMs)"
+      )
     } else {
+      PipTrace.log(
+        "enqueue(before): isReadyForMoreMediaData="
+          + "\(displayLayer.isReadyForMoreMediaData) "
+          + "status=\(displayLayer.status.rawValue) "
+          + "requiresFlush=\(displayLayer.requiresFlushToResumeDecoding) "
+          + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
+      )
       if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
         displayLayer.flush()
       }
       displayLayer.enqueue(sampleBuffer)
-      return displayLayer.status != .failed
+      enqueued = displayLayer.status != .failed
+      let elapsedMs = Int((CACurrentMediaTime() - began) * 1000)
+      PipTrace.log(
+        "enqueue(after): isReadyForMoreMediaData="
+          + "\(displayLayer.isReadyForMoreMediaData) "
+          + "status=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
+          + "elapsedMs=\(elapsedMs)"
+      )
     }
+    if enqueued {
+      stage = "done"
+    }
+    return enqueued
   }
 
   /// Same as the home gesture. There is no public API for this, `suspend` is
