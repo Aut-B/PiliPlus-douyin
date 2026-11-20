@@ -554,13 +554,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       onDoubleTap: () => unawaited(_togglePlay()),
       child: ColoredBox(
         color: Colors.black,
-        child: Center(
+        child: SizedBox.expand(
           // 结构和上游 pl_player/view/view.dart 对齐：RepaintBoundary →
           // FittedBox → SimpleVideo。
           //
           // RepaintBoundary 不是可有可无的：SimpleVideo 每帧都在
           // ListenableBuilder 里重建，没有它就会把重绘范围扩散到整个页面，
           // 6S 上表现为画面卡顿、主 isolate 被拖住。
+          //
+          // 这里不能再套 Center：Center 会把约束放松成 loose，FittedBox
+          // 于是收缩成 SimpleVideo 的「原始尺寸」（texture 像素 / DPR），
+          // 15PM 上就只剩屏幕中间一小块。SizedBox.expand 给 FittedBox 一个
+          // 撑满可用区域的紧约束，contain 再把画面等比放大到区域内：既不
+          // 拉伸，也不会出现四边大片黑边。
           //
           // FittedBox 的 alignment 默认是 center，fit 用 contain，和上游
           // videoFit 在竖屏下的 BoxFit.contain 一致；aspectRatio 传 null
