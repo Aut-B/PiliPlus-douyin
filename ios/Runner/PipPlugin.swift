@@ -49,6 +49,7 @@ final class PipPlugin: NSObject, FlutterPlugin {
       return
     }
     let args = call.arguments as? [String: Any] ?? [:]
+    PipTrace.log("handle(\(call.method)) args=\(args.keys.sorted())")
     switch call.method {
     case "isAvailable":
       result(AVPictureInPictureController.isPictureInPictureSupported())
@@ -112,6 +113,39 @@ final class PipPlugin: NSObject, FlutterPlugin {
 }
 
 // MARK: - Session
+
+
+// MARK: - PiP trace
+//
+// 6S 画中画卡帧查了多轮都没定位到具体断点，因为关键状态全在内存里、取不出来。
+// 这里把每一步的实际值写到 Documents/pip_trace.log：用户进一次播放页、点一次
+// 画中画、回一次主屏，就能拿到完整链路，不用再猜。
+// 只写不读，任何异常都吞掉，绝不影响播放。
+enum PipTrace {
+  private static let queue = DispatchQueue(label: "com.example.piliplus.piptrace")
+  private static var fileURL: URL? = {
+    guard
+      let dir = FileManager.default.urls(
+        for: .documentDirectory, in: .userDomainMask
+      ).first
+    else { return nil }
+    return dir.appendingPathComponent("pip_trace.log")
+  }()
+
+  static func log(_ message: String) {
+    let line = "[\(Date().timeIntervalSince1970)] \(message)\n"
+    queue.async {
+      guard let url = fileURL, let data = line.data(using: .utf8) else { return }
+      if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+      } else {
+        try? data.write(to: url)
+      }
+    }
+  }
+}
 
 @available(iOS 15.0, *)
 private final class PipSession: NSObject {
@@ -225,7 +259,10 @@ private final class PipSession: NSObject {
   /// Places the (hidden) source layer where the player usually is, so the
   /// system's start/stop animation roughly matches the inline video.
   func configure(width: Double, height: Double) {
-    guard let window = Self.hostWindow() else { return }
+    guard let window = Self.hostWindow() else {
+      PipTrace.log("configure: hostWindow nil -> give up")
+      return
+    }
     if sourceView.superview !== window {
       // Below the Flutter view: it must be in the window, but not visible.
       window.insertSubview(sourceView, at: 0)
@@ -244,6 +281,10 @@ private final class PipSession: NSObject {
       y: y,
       width: size.width,
       height: size.height
+    )
+    PipTrace.log(
+      "configure: side=\(size.width)x\(size.height) inWindow=\(sourceView.superview === window) "
+        + "possible=\(controller.isPictureInPicturePossible) hasFrame=\(hasFrame)"
     )
     frameAvailable(force: true)
   }
@@ -286,6 +327,10 @@ private final class PipSession: NSObject {
   }
 
   private func startIfPending() {
+    PipTrace.log(
+      "startIfPending: pending=\(pendingStart) hasFrame=\(hasFrame) "
+        + "possible=\(controller.isPictureInPicturePossible)"
+    )
     guard pendingStart, hasFrame, controller.isPictureInPicturePossible else { return }
     pendingStart = false
     controller.startPictureInPicture()
@@ -317,7 +362,10 @@ private final class PipSession: NSObject {
 
   /// Must be called on the main thread.
   func frameAvailable(force: Bool = false) {
-    guard !frameInFlight, let texture = TextureTracker.texture(for: textureId) else {
+    guard !frameInFlight else { return }
+    guard let texture = TextureTracker.texture(for: textureId) else {
+      // 这里返回意味着 textureId 对不上：画中画永远拿不到帧。
+      PipTrace.log("frameAvailable: no texture for id=\(textureId) (this is fatal)")
       return
     }
     let now = CACurrentMediaTime()
@@ -335,6 +383,12 @@ private final class PipSession: NSObject {
       if let copy = self.copy(source), let sampleBuffer = self.makeSampleBuffer(copy) {
         enqueued = self.enqueue(sampleBuffer)
       }
+      let layerStatus = self.displayLayer.status.rawValue
+      let ready = self.displayLayer.isReadyForMoreMediaData
+      PipTrace.log(
+        "frame: enqueued=\(enqueued) layerStatus=\(layerStatus) ready=\(ready) "
+          + "size=\(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))"
+      )
       DispatchQueue.main.async {
         self.frameInFlight = false
         if enqueued && !self.hasFrame {
@@ -482,6 +536,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     isActive = true
     stopRequested = false
     restoring = false
+    PipTrace.log("WILL start: sourceViewInTree=\(sourceView.superview != nil)")
     frameAvailable(force: true)
     sendEvent("onStateChanged", ["active": true])
   }
@@ -489,6 +544,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
   func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
+    PipTrace.log("DID start: layerInTree=\(displayLayer.superlayer != nil) hasFrame=\(hasFrame)")
     if backgroundOnStart {
       backgroundOnStart = false
       Self.moveToBackground()
@@ -501,6 +557,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
   ) {
     isActive = false
     backgroundOnStart = false
+    PipTrace.log("FAILED to start: \(error.localizedDescription)")
     sendEvent("onStateChanged", ["active": false, "error": error.localizedDescription])
     DispatchQueue.main.async { [weak self] in self?.onStop?() }
   }

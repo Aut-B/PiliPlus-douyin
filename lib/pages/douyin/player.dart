@@ -112,6 +112,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   _SwipeTarget? _swipeTarget;
   double _swipeStartY = 0;
   double _swipeStartValue = 0;
+  /// 拖动时每像素对应多少比例；开始拖的时候算一次，避免每帧查 MediaQuery。
+  double _swipeRange = 1;
 
   double _brightness = 1;
   double _volume = 1;
@@ -124,6 +126,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 横向拖动的起点/预览目标，单位毫秒。
   int _seekStartMs = 0;
   int _seekTargetMs = 0;
+  /// 开始横拖时缓存的屏宽，避免拖动途中每帧查 MediaQuery。
+  double _seekWidth = 0;
   bool _seekDragging = false;
 
   /// 画面顺时针旋转的 90° 次数（0..3）。只旋转渲染层，不改原生屏幕方向。
@@ -742,11 +746,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   }
 
   void _onVerticalDragStart(DragStartDetails details) {
-    final isLeft =
-        details.localPosition.dx < MediaQuery.sizeOf(context).width / 2;
+    final size = MediaQuery.sizeOf(context);
+    final isLeft = details.localPosition.dx < size.width / 2;
     _swipeTarget = isLeft ? _SwipeTarget.brightness : _SwipeTarget.volume;
     _swipeStartY = details.localPosition.dy;
     _swipeStartValue = isLeft ? _brightness : _volume;
+    // 在开始拖时算一次，拖动过程中不要再查 MediaQuery。
+    _swipeRange = size.height * (isLeft ? 0.6 : 0.5);
     _publishSwipeHint(_swipeStartValue);
   }
 
@@ -754,15 +760,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final target = _swipeTarget;
     if (target == null) return;
     final isBrightness = target == _SwipeTarget.brightness;
-    final range =
-        MediaQuery.sizeOf(context).height * (isBrightness ? 0.6 : 0.5);
+    final range = _swipeRange;
     final max = isBrightness ? 1.0 : _player.maxVolume;
     final value =
         (_swipeStartValue - (details.localPosition.dy - _swipeStartY) / range)
             .clamp(0.0, max)
             .toDouble();
     if (isBrightness) {
-      unawaited(_applyBrightness(value));
+      // 拖动途中只改本地值，松手才写系统亮度。
+      //
+      // 之前这里每帧都调一次 setSystemScreenBrightness：那是带原生往返的
+      // 系统级调用，6S 上按 60Hz 拖动等于每 16ms 打一次原生，整机都跟着卡。
+      _brightness = value;
+      _player.brightness.value = value;
     } else {
       _volume = value;
       unawaited(_player.setVolume(value, showIndicator: false));
@@ -792,13 +802,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (start <= 0) start = _player.position.value * 1000;
     _seekStartMs = start.clamp(0, durationMs).toInt();
     _seekTargetMs = _seekStartMs;
+    // 同样在开始拖时缓存，拖动途中不查 MediaQuery。
+    _seekWidth = MediaQuery.sizeOf(context).width;
     _showSeekHint();
   }
 
   void _onHorizontalDragUpdate(DragUpdateDetails details) {
     if (!_seekDragging) return;
     final durationMs = _player.durationInMilliseconds;
-    final width = MediaQuery.sizeOf(context).width;
+    final width = _seekWidth;
     if (durationMs <= 0 || width <= 0) return;
     final deltaMs = (details.delta.dx / width * durationMs).round();
     _seekTargetMs = (_seekTargetMs + deltaMs).clamp(0, durationMs).toInt();
