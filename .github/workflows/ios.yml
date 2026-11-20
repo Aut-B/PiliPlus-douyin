@@ -68,25 +68,25 @@ jobs:
           ln -sf ./build/ios/iphoneos Payload
           # make AltSign happy...
           find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
-          zip -r9 PiliPlus_ios_${{env.version}}.ipa Payload/Runner.app
-
-      - name: Fix executable bits and repack IPA
-        run: |
-          set -euo pipefail
-          # zip 只记录源文件权限；Flutter 产出的 App.framework/App 可能是 0644，
-          # 这里统一补 755 后重新打包，否则 TrollStore 安装会闪退。
+          # 在打包之前就把可执行位补好：zip 只记录源文件当时的权限，
+          # Flutter 产出的 App.framework/App 常常是 0644，TrollStore 装上会闪退。
+          # 放在这里做，下面只需打一次包，不用打完再删再重打。
           chmod 755 Payload/Runner.app/Runner
           chmod 755 Payload/Runner.app/Frameworks/App.framework/App
+          chmod 755 Payload/Runner.app/Frameworks/Flutter.framework/Flutter
           for framework in Payload/Runner.app/Frameworks/*.framework; do
             binary="$framework/$(basename "$framework" .framework)"
             if [ -f "$binary" ]; then
               chmod 755 "$binary"
             fi
           done
-          find Payload/Runner.app -type f -name "*.dylib" -exec chmod 755 {} +
-          test -x Payload/Runner.app/Frameworks/App.framework/App
-          rm -f "PiliPlus_ios_${{env.version}}.ipa"
-          zip -r9 "PiliPlus_ios_${{env.version}}.ipa" Payload/Runner.app
+          zip -r9 PiliPlus_ios_${{env.version}}.ipa Payload/Runner.app
+
+      - name: Verify executable bits inside IPA
+        run: |
+          set -euo pipefail
+          # 只做校验，不重新打包：chmod 已经在 Build 步骤里完成。
+          # 这里读 IPA 里真实的 unix 权限，确认 755 真的写进去了。
           python3 - "PiliPlus_ios_${{env.version}}.ipa" <<'PY'
           import sys
           import zipfile
@@ -97,13 +97,17 @@ jobs:
               "Payload/Runner.app/Frameworks/Flutter.framework/Flutter",
           )
           with zipfile.ZipFile(sys.argv[1]) as z:
+              modes = {name: oct(z.getinfo(name).external_attr >> 16) for name in required}
               bad = [
-                  (name, oct(z.getinfo(name).external_attr >> 16))
-                  for name in required
+                  (name, mode)
+                  for name, mode in modes.items()
                   if ((z.getinfo(name).external_attr >> 16) & 0o777) != 0o755
               ]
+          for name, mode in modes.items():
+              print("mode %s %s" % (mode, name))
           if bad:
               sys.exit("IPA modes are not 755: %r" % bad)
+          print("IPA modes verified: 755")
           PY
 
       - name: Release
