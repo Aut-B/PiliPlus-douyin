@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:PiliPlus/common/widgets/player_bar.dart';
+import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
@@ -116,6 +118,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   int _seekStartMs = 0;
   int _seekTargetMs = 0;
   bool _seekDragging = false;
+
+  /// 画面顺时针旋转的 90° 次数（0..3）。只旋转渲染层，不改原生屏幕方向。
+  int _quarterTurns = 0;
 
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
@@ -468,9 +473,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             Positioned.fill(
               child: Padding(
                 padding: EdgeInsets.only(
-                  top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
-                  bottom: MediaQuery.viewPaddingOf(context).bottom +
-                      _controlBarHeight,
+                  top: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
+                  bottom:
+                      MediaQuery.viewPaddingOf(context).bottom +
+                      _bottomBarHeight,
                 ),
                 child: _video(),
               ),
@@ -489,8 +495,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             //    重叠的话，手指压到它左半边就没有反应。
             Positioned(
               left: 0,
-              top: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
-              bottom: MediaQuery.viewPaddingOf(context).bottom + _controlBarHeight,
+              top: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
+              bottom:
+                  MediaQuery.viewPaddingOf(context).bottom + _bottomBarHeight,
               width: _edgeSwipeWidth,
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
@@ -518,7 +525,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               top: 0,
               left: 0,
               right: 0,
-              height: MediaQuery.viewPaddingOf(context).top + _controlBarHeight,
+              height: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
               child: SafeArea(
                 top: true,
                 bottom: false,
@@ -533,14 +540,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               right: 0,
               bottom: 0,
               height:
-                  MediaQuery.viewPaddingOf(context).bottom + _controlBarHeight,
+                  MediaQuery.viewPaddingOf(context).bottom + _bottomBarHeight,
               child: SafeArea(
                 top: false,
                 bottom: true,
                 left: false,
                 right: false,
                 minimum: EdgeInsets.zero,
-                child: _bottomBar(entry),
+                child: _bottomBar(),
               ),
             ),
           ],
@@ -549,8 +556,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     );
   }
 
-  /// 上下控件条的高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
-  static const double _controlBarHeight = 68;
+  /// 顶部控件条高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
+  static const double _topBarHeight = 56;
+
+  /// 底部控件条高度：进度条 + 一排按钮。15PM 的底部安全区会再吃掉 34pt，
+  /// 所以这里把进度条和按钮算进去后留出余量，避免 15PM 上溢出。
+  static const double _bottomBarHeight = 96;
 
   /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
@@ -620,8 +631,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         MediaQuery.sizeOf(context).height * (isBrightness ? 0.6 : 0.5);
     final max = isBrightness ? 1.0 : _player.maxVolume;
     final value =
-        (_swipeStartValue -
-                (details.localPosition.dy - _swipeStartY) / range)
+        (_swipeStartValue - (details.localPosition.dy - _swipeStartY) / range)
             .clamp(0.0, max)
             .toDouble();
     if (isBrightness) {
@@ -795,14 +805,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           // videoFit 在竖屏下的 BoxFit.contain 一致；aspectRatio 传 null
           // 表示按 texture 实际像素比（上游是 videoFit.aspectRatio，抖音这
           // 条没有外部画质偏好，用真实比例最稳，避免拉伸）。
-          child: RepaintBoundary(
-            child: FittedBox(
-              fit: BoxFit.contain,
-              alignment: Alignment.center,
-              child: SimpleVideo(
-                controller: controller,
-                fill: Colors.black,
-                aspectRatio: null,
+          child: RotatedBox(
+            quarterTurns: _quarterTurns,
+            child: RepaintBoundary(
+              child: FittedBox(
+                fit: BoxFit.contain,
+                alignment: Alignment.center,
+                child: SimpleVideo(
+                  controller: controller,
+                  fill: Colors.black,
+                  aspectRatio: null,
+                ),
               ),
             ),
           ),
@@ -902,80 +915,548 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   Widget _topBar(QueueEntry entry) {
     return _controls(
-      Row(
-        // 这两条控件栏挂在 `Positioned(top/left/right)` 下，Stack 给它们的高度
-        // 是**无界**的。Row 默认 mainAxisSize.max 只是横向撑满，高度方向会
-        // 尽量松，子项（Icon 是定值、Text 是单行）本来没事；但加上 SafeArea
-        // 之后不能再依赖默认行为，这里显式 min 掉，高度只取内容实际高度。
-        // 宽度不受影响：外层还是撑满的，Expanded 依旧能占满剩余宽度。
+      // 和 B站播放页一样用 PlayerBar：返回在左、标题居中、操作在右。
+      // Center 负责在上下控件条里垂直居中；宽度约束仍然是撑满的。
+      Center(
+        child: PlayerBar(
+          left: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ComBtn(
+                icon: const Icon(
+                  Icons.keyboard_arrow_down,
+                  color: Colors.white,
+                ),
+                // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
+                // 关小窗卡住，用户看到的就是「点了没反应」。_leave 是同步的，
+                // 收尾在它内部以 unawaited 方式启动。
+                onTap: _leave,
+                tooltip: '返回',
+              ),
+            ],
+          ),
+          title: Text(
+            entry.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white),
+          ),
+          right: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ComBtn(
+                icon: Icon(
+                  _shuffle ? Icons.shuffle : Icons.swap_vert,
+                  color: _shuffle ? Colors.lightBlueAccent : Colors.white,
+                ),
+                onTap: _toggleShuffle,
+                tooltip: _shuffle ? '随机播放（开）' : '顺序播放',
+              ),
+              ComBtn(
+                icon: const Icon(
+                  Icons.picture_in_picture_alt,
+                  color: Colors.white,
+                ),
+                onTap: () => unawaited(_enterPip()),
+                tooltip: '画中画',
+              ),
+              ComBtn(
+                icon: const Icon(
+                  Icons.more_vert_outlined,
+                  color: Colors.white,
+                ),
+                onTap: () => unawaited(_showMoreSheet()),
+                tooltip: '更多设置',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bottomBar() {
+    // playerStatus 是普通字段，不是 Rx；播放状态变化时由 _togglePlay 自己 setState。
+    // 进度、缓冲、时长是 Rx，放进 Obx 里按秒刷新。
+    return _controls(
+      Column(
+        mainAxisAlignment: MainAxisAlignment.end,
         mainAxisSize: MainAxisSize.min,
         children: [
-          ComBtn(
-            icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
-            // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
-            // 关小窗卡住，用户看到的就是「点了没反应」。_leave 是同步的，
-            // 收尾在它内部以 unawaited 方式启动。
-            onTap: _leave,
-            tooltip: '返回',
-          ),
-          Expanded(
-            child: Text(
-              entry.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(color: Colors.white),
-            ),
-          ),
-          ComBtn(
-            icon: Icon(
-              _shuffle ? Icons.shuffle : Icons.swap_vert,
-              color: _shuffle ? Colors.lightBlueAccent : Colors.white,
-            ),
-            onTap: _toggleShuffle,
-            tooltip: _shuffle ? '随机播放（开）' : '顺序播放',
-          ),
-          ComBtn(
-            icon: const Icon(
-              Icons.picture_in_picture_alt,
-              color: Colors.white,
-            ),
-            onTap: () => unawaited(_enterPip()),
-            tooltip: '画中画',
+          Obx(() {
+            final total = _player.duration.value;
+            final progress = total <= 0
+                ? 0
+                : _player.position.value.clamp(0, total).toInt();
+            final buffered = total <= 0
+                ? 0
+                : _player.buffered.value.clamp(0, total).toInt();
+            return ProgressBar(
+              progress: progress,
+              buffered: buffered,
+              total: total,
+              baseBarColor: const Color(0x33FFFFFF),
+              progressBarColor: Colors.white,
+              bufferedBarColor: Colors.white24,
+              thumbColor: Colors.white,
+              thumbGlowColor: Colors.white24,
+              barHeight: 3.5,
+              thumbRadius: 7,
+              thumbGlowRadius: 25,
+              // RenderProgressBar 只有 onDragStart/onHover 非空时才参与命中
+              // 测试，否则整条进度条点不动。这里给一个空回调，只为了可拖。
+              onDragStart: (_) {},
+              onSeek: (milliseconds) {
+                _player.position.value = milliseconds ~/ 1000;
+                unawaited(
+                  _player.seekTo(Duration(milliseconds: milliseconds)),
+                );
+              },
+            );
+          }),
+          const SizedBox(height: 2),
+          Row(
+            children: [
+              ComBtn(
+                icon: const Icon(Icons.skip_previous, color: Colors.white),
+                onTap: () => unawaited(_previous()),
+                tooltip: '上一条',
+                width: 30,
+                height: 30,
+              ),
+              ComBtn(
+                icon: Icon(
+                  _player.playerStatus.isPlaying
+                      ? Icons.pause
+                      : Icons.play_arrow,
+                  color: Colors.white,
+                ),
+                onTap: () => unawaited(_togglePlay()),
+                tooltip: '暂停/继续',
+                width: 30,
+                height: 30,
+              ),
+              ComBtn(
+                icon: const Icon(Icons.skip_next, color: Colors.white),
+                onTap: () => unawaited(_next()),
+                tooltip: '下一条',
+                width: 30,
+                height: 30,
+              ),
+              Padding(
+                padding: const EdgeInsets.only(left: 6),
+                child: Obx(
+                  () => Text(
+                    '${DurationUtils.formatDuration(_player.position.value)}'
+                    ' / '
+                    '${DurationUtils.formatDuration(_player.duration.value)}',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              // 右侧五个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              Expanded(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _speedButton(),
+                        _qualityButton(),
+                        Obx(() {
+                          final volume = _player.volume.value;
+                          return ComBtn(
+                            icon: Icon(
+                              volume <= 0
+                                  ? Icons.volume_off
+                                  : volume < 0.5
+                                  ? Icons.volume_down
+                                  : Icons.volume_up,
+                              color: Colors.white,
+                              size: 20,
+                            ),
+                            onTap: _showVolumeSheet,
+                            tooltip: '音量',
+                            width: 30,
+                            height: 30,
+                          );
+                        }),
+                        ComBtn(
+                          icon: const Icon(
+                            Icons.screen_rotation_alt,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          onTap: _rotateVideo,
+                          tooltip: '画面旋转',
+                          width: 30,
+                          height: 30,
+                        ),
+                        ComBtn(
+                          icon: const Icon(
+                            Icons.more_vert_outlined,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          onTap: () => unawaited(_showMoreSheet()),
+                          tooltip: '更多设置',
+                          width: 30,
+                          height: 30,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  Widget _bottomBar(QueueEntry entry) {
-    // playerStatus 是普通字段，不是 Rx；播放状态变化时由 _togglePlay 自己 setState。
-    return _controls(
-      Row(
-        children: [
-          ComBtn(
-            icon: const Icon(Icons.skip_previous, color: Colors.white),
-            onTap: () => unawaited(_previous()),
-            tooltip: '上一条',
-          ),
-          ComBtn(
-            icon: Icon(
-              _player.playerStatus.isPlaying
-                  ? Icons.pause
-                  : Icons.play_arrow,
-              color: Colors.white,
+  Widget _speedButton() {
+    return Obx(
+      () => PopupMenuButton<double>(
+        tooltip: '倍速',
+        requestFocus: false,
+        padding: EdgeInsets.zero,
+        initialValue: _player.playbackSpeed,
+        color: Colors.black.withValues(alpha: 0.8),
+        onSelected: (speed) => unawaited(_player.setPlaybackSpeed(speed)),
+        itemBuilder: (context) => _player.speedList
+            .map(
+              (speed) => PopupMenuItem<double>(
+                height: 35,
+                padding: const EdgeInsets.only(left: 30),
+                value: speed,
+                child: Text(
+                  '${speed}X',
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+            )
+            .toList(),
+        child: SizedBox(
+          width: 34,
+          height: 30,
+          child: Center(
+            child: Text(
+              '${_player.playbackSpeed}X',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
-            onTap: () => unawaited(_togglePlay()),
-            tooltip: '暂停/继续',
           ),
-          ComBtn(
-            icon: const Icon(Icons.skip_next, color: Colors.white),
-            onTap: () => unawaited(_next()),
-            tooltip: '下一条',
+        ),
+      ),
+    );
+  }
+
+  /// 抖音/TikTok 的播放地址没有清晰度字段，这里不伪造档位：显示当前值
+  /// 「默认」并置灰，点开只说明原因。
+  Widget _qualityButton() {
+    return PopupMenuButton<int>(
+      tooltip: '画质',
+      requestFocus: false,
+      padding: EdgeInsets.zero,
+      color: Colors.black.withValues(alpha: 0.8),
+      itemBuilder: (context) => const [
+        PopupMenuItem<int>(
+          enabled: false,
+          height: 35,
+          child: Text(
+            '接口未提供分辨率',
+            style: TextStyle(color: Colors.white54, fontSize: 12),
           ),
-          const Spacer(),
+        ),
+      ],
+      child: const SizedBox(
+        width: 34,
+        height: 30,
+        child: Center(
+          child: Text(
+            '默认',
+            style: TextStyle(color: Colors.white54, fontSize: 12),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _rotateVideo() {
+    setState(() => _quarterTurns = (_quarterTurns + 1) % 4);
+  }
+
+  Widget _sheetHeader(String title, {VoidCallback? onBack}) {
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          if (onBack != null)
+            IconButton(
+              onPressed: onBack,
+              icon: const Icon(
+                Icons.arrow_back_ios_new,
+                size: 16,
+                color: Colors.white70,
+              ),
+            )
+          else
+            const SizedBox(width: 16),
           Text(
-            '${_index + 1}/${_queue.length}',
-            style: const TextStyle(color: Colors.white54, fontSize: 12),
+            title,
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sheetTile({
+    required IconData icon,
+    required String title,
+    String? subtitle,
+    bool enabled = true,
+    VoidCallback? onTap,
+  }) {
+    return ListTile(
+      dense: true,
+      enabled: enabled,
+      onTap: onTap,
+      leading: Icon(
+        icon,
+        size: 20,
+        color: enabled ? Colors.white70 : Colors.white24,
+      ),
+      title: Text(
+        title,
+        style: TextStyle(
+          color: enabled ? Colors.white : Colors.white38,
+          fontSize: 14,
+        ),
+      ),
+      subtitle: subtitle == null
+          ? null
+          : Text(
+              subtitle,
+              style: const TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+      trailing: onTap == null
+          ? null
+          : const Icon(
+              Icons.chevron_right,
+              size: 18,
+              color: Colors.white38,
+            ),
+    );
+  }
+
+  void _showVolumeSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (_) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _sheetHeader('音量'),
+              _volumeBody(setSheetState: setSheetState),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _volumeBody({required StateSetter setSheetState}) {
+    final max = _player.maxVolume;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Text(
+                '媒体音量',
+                style: TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+              const Spacer(),
+              Text(
+                '${(_volume * 100).round()}%',
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+              ),
+            ],
+          ),
+          Slider(
+            value: _volume.clamp(0.0, max).toDouble(),
+            max: max,
+            activeColor: Colors.white,
+            inactiveColor: Colors.white24,
+            onChanged: (value) {
+              _volume = value;
+              unawaited(_player.setVolume(value, showIndicator: false));
+              setSheetState(() {});
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showMoreSheet() {
+    return showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (_) {
+        // 0 = 更多设置，1 = 倍速，2 = 音量。子页留在同一个 sheet 里，
+        // 避免「关一个再开一个」时和路由动画打架。
+        var page = 0;
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final Widget body;
+            switch (page) {
+              case 1:
+                body = _speedListBody(
+                  onBack: () => setSheetState(() => page = 0),
+                );
+              case 2:
+                body = Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _sheetHeader(
+                      '音量',
+                      onBack: () => setSheetState(() => page = 0),
+                    ),
+                    _volumeBody(setSheetState: setSheetState),
+                  ],
+                );
+              default:
+                body = _moreListBody(
+                  onSpeed: () => setSheetState(() => page = 1),
+                  onVolume: () => setSheetState(() => page = 2),
+                  onRotate: () {
+                    _rotateVideo();
+                    setSheetState(() {});
+                  },
+                  onShuffle: () {
+                    _toggleShuffle();
+                    setSheetState(() {});
+                  },
+                );
+            }
+            return SafeArea(top: false, child: body);
+          },
+        );
+      },
+    );
+  }
+
+  Widget _moreListBody({
+    required VoidCallback onSpeed,
+    required VoidCallback onVolume,
+    required VoidCallback onRotate,
+    required VoidCallback onShuffle,
+  }) {
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('更多设置'),
+          _sheetTile(
+            icon: Icons.speed,
+            title: '倍速',
+            subtitle: '${_player.playbackSpeed}X',
+            onTap: onSpeed,
+          ),
+          _sheetTile(
+            icon: Icons.high_quality_outlined,
+            title: '画质',
+            subtitle: '默认 · 接口未提供分辨率',
+            enabled: false,
+          ),
+          _sheetTile(
+            icon: Icons.volume_up_outlined,
+            title: '音量',
+            subtitle: '${(_volume * 100).round()}%',
+            onTap: onVolume,
+          ),
+          _sheetTile(
+            icon: Icons.screen_rotation_alt,
+            title: '画面旋转',
+            subtitle: '${_quarterTurns * 90}°',
+            onTap: onRotate,
+          ),
+          _sheetTile(
+            icon: _shuffle ? Icons.shuffle : Icons.swap_vert,
+            title: '播放模式',
+            subtitle: _shuffle ? '随机播放' : '顺序播放',
+            onTap: onShuffle,
+          ),
+          _sheetTile(
+            icon: Icons.picture_in_picture_alt_outlined,
+            title: '画中画',
+            onTap: () {
+              Get.back();
+              unawaited(_enterPip());
+            },
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  Widget _speedListBody({required VoidCallback onBack}) {
+    return SizedBox(
+      height: 300,
+      child: Column(
+        children: [
+          _sheetHeader('倍速', onBack: onBack),
+          Expanded(
+            child: Obx(
+              () => ListView.builder(
+                itemCount: _player.speedList.length,
+                itemBuilder: (context, index) {
+                  final speed = _player.speedList[index];
+                  final selected = _player.playbackSpeed == speed;
+                  return ListTile(
+                    dense: true,
+                    onTap: () {
+                      unawaited(_player.setPlaybackSpeed(speed));
+                      Get.back();
+                    },
+                    title: Text(
+                      '${speed}X',
+                      style: TextStyle(
+                        color: selected ? Colors.lightBlueAccent : Colors.white,
+                        fontSize: 14,
+                      ),
+                    ),
+                    trailing: selected
+                        ? const Icon(
+                            Icons.check,
+                            size: 18,
+                            color: Colors.lightBlueAccent,
+                          )
+                        : null,
+                  );
+                },
+              ),
+            ),
           ),
         ],
       ),
