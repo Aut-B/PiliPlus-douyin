@@ -11,12 +11,15 @@ import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
+import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
+import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
 
 /// 抖音 / TikTok / B 站收藏的整页播放器。
 ///
@@ -96,6 +99,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 不依赖瞬时速度——慢速拖动也应该能返回。
   double _dragDx = 0;
 
+  /// 视频层竖向手势当前调的是亮度还是音量。null 表示没在竖向拖动。
+  _SwipeTarget? _swipeTarget;
+  double _swipeStartY = 0;
+  double _swipeStartValue = 0;
+
+  double _brightness = 1;
+  double _volume = 1;
+  bool _brightnessPrimed = false;
+  bool _volumePrimed = false;
+
+  /// 系统亮度不可写时退回应用亮度，退出播放页要把它复位。
+  bool _brightnessIsApplication = false;
+
+  /// 横向拖动的起点/预览目标，单位毫秒。
+  int _seekStartMs = 0;
+  int _seekTargetMs = 0;
+  bool _seekDragging = false;
+
+  /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
+  final ValueNotifier<_GestureHint?> _gestureHint =
+      ValueNotifier<_GestureHint?>(null);
+  Timer? _gestureHintTimer;
+
   QueueEntry get _current => _queue[_index];
 
   @override
@@ -103,6 +129,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     super.initState();
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
+    unawaited(_primeBrightness());
+    unawaited(_primeVolume());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_dumpViewHierarchy());
       unawaited(PiliRootScan.run());
@@ -135,6 +163,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (!_disposed) {
       unawaited(_shutdown(alreadyLeft: true));
     }
+    _gestureHintTimer?.cancel();
+    _gestureHint.dispose();
     super.dispose();
   }
 
@@ -170,6 +200,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       // 干净实例。前提是本页只在 dispose() 时做，绝不在 build 期间调用。
       _player.dispose();
     } catch (_) {}
+    if (_brightnessIsApplication) {
+      _brightnessIsApplication = false;
+      try {
+        await ScreenBrightnessPlatform.instance
+            .resetApplicationScreenBrightness();
+      } catch (_) {}
+    }
   }
 
   void _leave() {
@@ -438,6 +475,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 child: _video(),
               ),
             ),
+            // 亮度/音量/进度提示。IgnorePointer 保证它只负责显示，
+            // 命中测试继续落到下面的视频手势层。
+            _gestureOverlay(),
             // 边缘滑返回。放在视频层之后、控件栏之前：
             //
             // 1. 命中测试是逆序遍历，必须排在 `Positioned.fill` 的视频层后面，
@@ -516,6 +556,177 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
   static const double _edgeSwipeWidth = 20;
 
+  Future<void> _primeBrightness() async {
+    if (_brightnessPrimed) return;
+    try {
+      double value;
+      try {
+        value = await ScreenBrightnessPlatform.instance.system;
+        _brightnessIsApplication = false;
+      } catch (_) {
+        value = await ScreenBrightnessPlatform.instance.application;
+        _brightnessIsApplication = true;
+      }
+      if (!mounted) return;
+      _brightnessPrimed = true;
+      _brightness = value.clamp(0.0, 1.0).toDouble();
+      _player.brightness.value = _brightness;
+    } catch (_) {}
+  }
+
+  Future<void> _primeVolume() async {
+    if (_volumePrimed) return;
+    try {
+      final value = await FlutterVolumeController.getVolume();
+      if (!mounted || value == null) return;
+      _volumePrimed = true;
+      _volume = value.clamp(0.0, _player.maxVolume).toDouble();
+      _player.volume.value = _volume;
+    } catch (_) {}
+  }
+
+  /// 亮度统一走 ScreenBrightnessPlatform：iOS 直接改系统亮度，
+  /// 系统亮度不可写（例如安卓没给 WRITE_SETTINGS）时退回应用内亮度。
+  Future<void> _applyBrightness(double value) async {
+    _brightness = value;
+    _player.brightness.value = value;
+    try {
+      await ScreenBrightnessPlatform.instance.setSystemScreenBrightness(value);
+      _brightnessIsApplication = false;
+    } catch (_) {
+      try {
+        await ScreenBrightnessPlatform.instance.setApplicationScreenBrightness(
+          value,
+        );
+        _brightnessIsApplication = true;
+      } catch (_) {}
+    }
+  }
+
+  void _onVerticalDragStart(DragStartDetails details) {
+    final isLeft =
+        details.localPosition.dx < MediaQuery.sizeOf(context).width / 2;
+    _swipeTarget = isLeft ? _SwipeTarget.brightness : _SwipeTarget.volume;
+    _swipeStartY = details.localPosition.dy;
+    _swipeStartValue = isLeft ? _brightness : _volume;
+    _publishSwipeHint(_swipeStartValue);
+  }
+
+  void _onVerticalDragUpdate(DragUpdateDetails details) {
+    final target = _swipeTarget;
+    if (target == null) return;
+    final isBrightness = target == _SwipeTarget.brightness;
+    final range =
+        MediaQuery.sizeOf(context).height * (isBrightness ? 0.6 : 0.5);
+    final max = isBrightness ? 1.0 : _player.maxVolume;
+    final value =
+        (_swipeStartValue -
+                (details.localPosition.dy - _swipeStartY) / range)
+            .clamp(0.0, max)
+            .toDouble();
+    if (isBrightness) {
+      unawaited(_applyBrightness(value));
+    } else {
+      _volume = value;
+      unawaited(_player.setVolume(value, showIndicator: false));
+    }
+    _publishSwipeHint(value);
+  }
+
+  void _onVerticalDragEnd(DragEndDetails details) {
+    if (_swipeTarget == _SwipeTarget.brightness) {
+      unawaited(_applyBrightness(_brightness));
+    }
+    _swipeTarget = null;
+    _hideHintSoon();
+  }
+
+  void _onVerticalDragCancel() {
+    _swipeTarget = null;
+    _hideHintSoon();
+  }
+
+  /// 横向拖动只更新预览，松手才真正 seek，避免拖动途中反复冲缓冲。
+  void _onHorizontalDragStart(DragStartDetails details) {
+    final durationMs = _player.durationInMilliseconds;
+    _seekDragging = durationMs > 0;
+    if (!_seekDragging) return;
+    var start = _player.positionInMilliseconds;
+    if (start <= 0) start = _player.position.value * 1000;
+    _seekStartMs = start.clamp(0, durationMs).toInt();
+    _seekTargetMs = _seekStartMs;
+    _showSeekHint();
+  }
+
+  void _onHorizontalDragUpdate(DragUpdateDetails details) {
+    if (!_seekDragging) return;
+    final durationMs = _player.durationInMilliseconds;
+    final width = MediaQuery.sizeOf(context).width;
+    if (durationMs <= 0 || width <= 0) return;
+    final deltaMs = (details.delta.dx / width * durationMs).round();
+    _seekTargetMs = (_seekTargetMs + deltaMs).clamp(0, durationMs).toInt();
+    _showSeekHint();
+  }
+
+  void _onHorizontalDragEnd(DragEndDetails details) {
+    if (!_seekDragging) return;
+    _seekDragging = false;
+    _player.position.value = _seekTargetMs ~/ 1000;
+    unawaited(_player.seekTo(Duration(milliseconds: _seekTargetMs)));
+    _hideHintSoon();
+  }
+
+  void _onHorizontalDragCancel() {
+    if (!_seekDragging) return;
+    _seekDragging = false;
+    _hideHintSoon();
+  }
+
+  void _publishSwipeHint(double value) {
+    final target = _swipeTarget;
+    if (target == null) return;
+    _gestureHintTimer?.cancel();
+    if (target == _SwipeTarget.brightness) {
+      _gestureHint.value = _GestureHint(
+        icon: Icons.brightness_6,
+        title: '亮度',
+        detail: '${(value * 100).round()}%',
+        progress: value,
+      );
+    } else {
+      _gestureHint.value = _GestureHint(
+        icon: value <= 0 ? Icons.volume_off : Icons.volume_up,
+        title: '音量',
+        detail: '${(value * 100).round()}%',
+        progress: value,
+      );
+    }
+  }
+
+  void _showSeekHint() {
+    final durationMs = _player.durationInMilliseconds;
+    if (durationMs <= 0) return;
+    final deltaMs = _seekTargetMs - _seekStartMs;
+    final deltaText = DurationUtils.formatDuration(deltaMs.abs() ~/ 1000);
+    _gestureHintTimer?.cancel();
+    _gestureHint.value = _GestureHint(
+      icon: deltaMs >= 0 ? Icons.fast_forward : Icons.fast_rewind,
+      title: '进度',
+      detail:
+          '${DurationUtils.formatDuration(_seekTargetMs ~/ 1000)}'
+          ' / ${DurationUtils.formatDuration(durationMs ~/ 1000)}'
+          '  ${deltaMs >= 0 ? '+' : '-'}$deltaText',
+      progress: (_seekTargetMs / durationMs).clamp(0.0, 1.0).toDouble(),
+    );
+  }
+
+  void _hideHintSoon() {
+    _gestureHintTimer?.cancel();
+    _gestureHintTimer = Timer(const Duration(milliseconds: 700), () {
+      if (mounted) _gestureHint.value = null;
+    });
+  }
+
   Widget _video() {
     if (_error != null) {
       return Center(
@@ -550,8 +761,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       // 这里刻意只挂 onDoubleTap、不挂 onTap：两者同时存在时，单击要等约
       // 300ms 双击判定超时才会派发，控件层按钮的响应会跟着变慢。单击的
       // 事件照旧透传（translucent），也不吃掉外层横向滑返回的手势。
+      //
+      // 竖向/横向拖动和双击可以共存：点击不产生位移，拖动在手势仲裁里
+      // 按主轴方向胜出，双击判定不会被抢走。左边缘那 20pt 的滑返回由
+      // Stack 上层独立处理，命中测试到不了这里，所以横拖调进度不会误触退出。
       behavior: HitTestBehavior.translucent,
       onDoubleTap: () => unawaited(_togglePlay()),
+      onVerticalDragStart: _onVerticalDragStart,
+      onVerticalDragUpdate: _onVerticalDragUpdate,
+      onVerticalDragEnd: _onVerticalDragEnd,
+      onVerticalDragCancel: _onVerticalDragCancel,
+      onHorizontalDragStart: _onHorizontalDragStart,
+      onHorizontalDragUpdate: _onHorizontalDragUpdate,
+      onHorizontalDragEnd: _onHorizontalDragEnd,
+      onHorizontalDragCancel: _onHorizontalDragCancel,
       child: ColoredBox(
         color: Colors.black,
         child: SizedBox.expand(
@@ -583,6 +806,78 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _gestureOverlay() {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ValueListenableBuilder<_GestureHint?>(
+          valueListenable: _gestureHint,
+          builder: (context, hint, child) {
+            if (hint == null) return const SizedBox.shrink();
+            return Center(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.72),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 14,
+                  ),
+                  child: SizedBox(
+                    width: 200,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(hint.icon, color: Colors.white, size: 20),
+                            const SizedBox(width: 8),
+                            Text(
+                              hint.title,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          hint.detail,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                          ),
+                        ),
+                        if (hint.progress case final progress?) ...[
+                          const SizedBox(height: 10),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(2),
+                            child: LinearProgressIndicator(
+                              value: progress,
+                              minHeight: 3,
+                              backgroundColor: Colors.white24,
+                              valueColor: const AlwaysStoppedAnimation<Color>(
+                                Colors.white,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
         ),
       ),
     );
@@ -686,6 +981,22 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       ),
     );
   }
+}
+
+enum _SwipeTarget { brightness, volume }
+
+class _GestureHint {
+  const _GestureHint({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    this.progress,
+  });
+
+  final IconData icon;
+  final String title;
+  final String detail;
+  final double? progress;
 }
 
 /// 播放页构建器注册。`startPipQaIfRequested` 之类的外部入口靠它拿到页面。
