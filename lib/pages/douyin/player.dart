@@ -643,26 +643,30 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             // 2. 只用左边缘一小条，不要整屏。整屏的横向拖动会和按钮的 tap、
             //    视频的 onClick 一起进手势仲裁，拖一下就把点击吃掉。
             // 3. 上下要避开控件栏。返回按钮就在左上角，和边缘条在几何上
-            //    重叠的话，手指压到它左半边就没有反应。
-            if (_chromeVisible)
-              Positioned(
-                left: 0,
-                top: topInset,
-                bottom: bottomInset,
-                width: _edgeSwipeWidth,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onHorizontalDragStart: (_) => _dragDx = 0,
-                  onHorizontalDragUpdate: (details) {
-                    _dragDx += details.delta.dx;
-                  },
-                  onHorizontalDragEnd: (_) {
-                    if (_dragDx > 40) _leave();
-                    _dragDx = 0;
-                  },
-                  onHorizontalDragCancel: () => _dragDx = 0,
-                ),
+            //    重叠的话，手指压到它左半边就没有反应。沉浸式下 topInset /
+            //    bottomInset 都是 0，这一条自然铺满整个高度。
+            // 4. 沉浸式下也保留：控件收起后如果连侧滑都没有，用户只能先点
+            //    画面唤回控件再滑，等于多一道手续。用 translucent 而不是
+            //    opaque，这一条只拦横向拖动，轻点仍会落到视频层去切换控件，
+            //    竖滑调亮度也照样能进视频层。
+            Positioned(
+              left: 0,
+              top: topInset,
+              bottom: bottomInset,
+              width: _edgeSwipeWidth,
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) => _dragDx = 0,
+                onHorizontalDragUpdate: (details) {
+                  _dragDx += details.delta.dx;
+                },
+                onHorizontalDragEnd: (_) {
+                  if (_dragDx > 40) _leave();
+                  _dragDx = 0;
+                },
+                onHorizontalDragCancel: () => _dragDx = 0,
               ),
+            ),
             // 控件栏必须给死高度。
             //
             // 之前是 `Positioned(top/left/right)` 不给 height，Stack 会传一个
@@ -1688,7 +1692,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             icon: Icons.picture_in_picture_alt_outlined,
             title: '画中画',
             onTap: () {
-              // 关掉的是这一层的 sheet，不能靠 Get.back() 猜栈顶：
+              // 关掉的是这一层的 sheet，不能靠 Get.back 猜栈顶：
               // bottom sheet 现在挂在 root navigator 上，Get.back 在有别的
               // 路由叠着时可能关错页面。
               Navigator.of(context).pop();
@@ -1718,7 +1722,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     dense: true,
                     onTap: () {
                       unawaited(_player.setPlaybackSpeed(speed));
-                      // 同上：只关这一层 sheet，不用 Get.back() 猜栈顶。
+                      // 同上：只关这一层 sheet，不用 Get.back 猜栈顶。
                       Navigator.of(context).pop();
                     },
                     title: Text(
