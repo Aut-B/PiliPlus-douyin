@@ -70,6 +70,42 @@ jobs:
           find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
           zip -r9 PiliPlus_ios_${{env.version}}.ipa Payload/Runner.app
 
+      - name: Fix executable bits and repack IPA
+        run: |
+          set -euo pipefail
+          # zip 只记录源文件权限；Flutter 产出的 App.framework/App 可能是 0644，
+          # 这里统一补 755 后重新打包，否则 TrollStore 安装会闪退。
+          chmod 755 Payload/Runner.app/Runner
+          chmod 755 Payload/Runner.app/Frameworks/App.framework/App
+          for framework in Payload/Runner.app/Frameworks/*.framework; do
+            binary="$framework/$(basename "$framework" .framework)"
+            if [ -f "$binary" ]; then
+              chmod 755 "$binary"
+            fi
+          done
+          find Payload/Runner.app -type f -name "*.dylib" -exec chmod 755 {} +
+          test -x Payload/Runner.app/Frameworks/App.framework/App
+          rm -f "PiliPlus_ios_${{env.version}}.ipa"
+          zip -r9 "PiliPlus_ios_${{env.version}}.ipa" Payload/Runner.app
+          python3 - "PiliPlus_ios_${{env.version}}.ipa" <<'PY'
+          import sys
+          import zipfile
+
+          required = (
+              "Payload/Runner.app/Runner",
+              "Payload/Runner.app/Frameworks/App.framework/App",
+              "Payload/Runner.app/Frameworks/Flutter.framework/Flutter",
+          )
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              bad = [
+                  (name, oct(z.getinfo(name).external_attr >> 16))
+                  for name in required
+                  if ((z.getinfo(name).external_attr >> 16) & 0o777) != 0o755
+              ]
+          if bad:
+              sys.exit("IPA modes are not 755: %r" % bad)
+          PY
+
       - name: Release
         if: ${{ github.event.inputs.tag != '' }}
         uses: softprops/action-gh-release@v3
