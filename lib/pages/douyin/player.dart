@@ -133,6 +133,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 画面顺时针旋转的 90° 次数（0..3）。只旋转渲染层，不改原生屏幕方向。
   int _quarterTurns = 0;
 
+  /// 控件是否显示。和 B 站播放页一致：点一下画面切换沉浸式。
+  ///
+  /// 沉浸式下顶部条、底部条整块隐藏（不是变透明），同时视频区扩展到全屏。
+  bool _chromeVisible = true;
+
+  /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
+  Timer? _chromeTimer;
+
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
       ValueNotifier<_GestureHint?>(null);
@@ -153,6 +161,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
     _startPipTicker();
+    _scheduleChromeHide();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -179,6 +188,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   void dispose() {
     _stopPipTicker();
+    _chromeTimer?.cancel();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
     // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
@@ -461,11 +471,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 打开播放列表。列表里调序会回调 [_applyPlaylistOrder]，
   /// 点条目会回调 [_playFromPlaylist]，两边保持同一份顺序。
   Future<void> _openPlaylist() async {
-    await Get.to<void>(
-      () => ShortVideoPlaylistPage(
-        currentKey: _current.key,
-        onReorder: _applyPlaylistOrder,
-        onPlay: _playFromPlaylist,
+    // 不能靠 Get.to 猜 Navigator：播放页可能是被 Get.off 直接换到首页路由
+    // 上的，也可能是嵌在收藏页 Tab 的内层 Navigator 里。走当前 context 的
+    // Navigator.of 会拿到播放页自己所在的栈，push 上去的页面才一定会盖在
+    // 播放页上面，而不是被播放页挡住——那正是「点了播放列表没反应」。
+    final navigator = Navigator.of(context, rootNavigator: true);
+    await navigator.push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => ShortVideoPlaylistPage(
+          currentKey: _current.key,
+          onReorder: _applyPlaylistOrder,
+          onPlay: _playFromPlaylist,
+        ),
       ),
     );
   }
@@ -589,6 +606,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   Widget build(BuildContext context) {
     final entry = _current;
+    final viewPadding = MediaQuery.viewPaddingOf(context);
+    final topInset = _chromeVisible ? viewPadding.top + _topBarHeight : 0.0;
+    final bottomInset = _chromeVisible
+        ? viewPadding.bottom + _bottomBarHeight
+        : 0.0;
     return PopScope(
       // 系统返回手势 / 安卓返回键也要走收尾。注意这里是同步触发，
       // 不阻塞 pop，避免手势退出时同样被原生回调拖住。
@@ -601,14 +623,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           children: [
             // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
             // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
+            //
+            // 沉浸式（_chromeVisible 为 false）时上下两条都归零，视频铺满
+            // 整个屏幕，和 B 站点一下画面进入沉浸式是同一个效果。
             Positioned.fill(
               child: Padding(
-                padding: EdgeInsets.only(
-                  top: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
-                  bottom:
-                      MediaQuery.viewPaddingOf(context).bottom +
-                      _bottomBarHeight,
-                ),
+                padding: EdgeInsets.only(top: topInset, bottom: bottomInset),
                 child: _video(),
               ),
             ),
@@ -624,25 +644,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             //    视频的 onClick 一起进手势仲裁，拖一下就把点击吃掉。
             // 3. 上下要避开控件栏。返回按钮就在左上角，和边缘条在几何上
             //    重叠的话，手指压到它左半边就没有反应。
-            Positioned(
-              left: 0,
-              top: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
-              bottom:
-                  MediaQuery.viewPaddingOf(context).bottom + _bottomBarHeight,
-              width: _edgeSwipeWidth,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onHorizontalDragStart: (_) => _dragDx = 0,
-                onHorizontalDragUpdate: (details) {
-                  _dragDx += details.delta.dx;
-                },
-                onHorizontalDragEnd: (_) {
-                  if (_dragDx > 40) _leave();
-                  _dragDx = 0;
-                },
-                onHorizontalDragCancel: () => _dragDx = 0,
+            if (_chromeVisible)
+              Positioned(
+                left: 0,
+                top: topInset,
+                bottom: bottomInset,
+                width: _edgeSwipeWidth,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onHorizontalDragStart: (_) => _dragDx = 0,
+                  onHorizontalDragUpdate: (details) {
+                    _dragDx += details.delta.dx;
+                  },
+                  onHorizontalDragEnd: (_) {
+                    if (_dragDx > 40) _leave();
+                    _dragDx = 0;
+                  },
+                  onHorizontalDragCancel: () => _dragDx = 0,
+                ),
               ),
-            ),
             // 控件栏必须给死高度。
             //
             // 之前是 `Positioned(top/left/right)` 不给 height，Stack 会传一个
@@ -652,38 +672,62 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             //
             // 安全区已经在 height 里算进去了，所以这里 SafeArea 只取方向、
             // 不再重复扣 inset（否则控件会被挤出可视区域，点也点不准）。
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              height: MediaQuery.viewPaddingOf(context).top + _topBarHeight,
-              child: SafeArea(
-                top: true,
-                bottom: false,
-                left: false,
-                right: false,
-                minimum: EdgeInsets.zero,
-                child: _topBar(entry),
+            if (_chromeVisible)
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                height: viewPadding.top + _topBarHeight,
+                child: _chromeBackdrop(
+                  child: SafeArea(
+                    top: true,
+                    bottom: false,
+                    left: false,
+                    right: false,
+                    minimum: EdgeInsets.zero,
+                    child: _topBar(entry),
+                  ),
+                ),
               ),
-            ),
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              height:
-                  MediaQuery.viewPaddingOf(context).bottom + _bottomBarHeight,
-              child: SafeArea(
-                top: false,
-                bottom: true,
-                left: false,
-                right: false,
-                minimum: EdgeInsets.zero,
-                child: _bottomBar(),
+            if (_chromeVisible)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                height: viewPadding.bottom + _bottomBarHeight,
+                child: _chromeBackdrop(
+                  bottom: true,
+                  child: SafeArea(
+                    top: false,
+                    bottom: true,
+                    left: false,
+                    right: false,
+                    minimum: EdgeInsets.zero,
+                    child: _bottomBar(),
+                  ),
+                ),
               ),
-            ),
           ],
         ),
       ),
+    );
+  }
+
+  /// 控件条底色。
+  ///
+  /// 以前控件条直接压在白底视频上：6S 是 375pt 宽，右上一个「更多设置」
+  /// 图标本来就小，白色图标落在浅色画面上等于看不见，用户会当成「按了没用」。
+  /// 现在上下各加一层很薄的黑色渐变，只做可读性，不做满屏蒙版。
+  Widget _chromeBackdrop({required Widget child, bool bottom = false}) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: bottom ? Alignment.bottomCenter : Alignment.topCenter,
+          end: bottom ? Alignment.topCenter : Alignment.bottomCenter,
+          colors: const [Color(0xCC000000), Color(0x00000000)],
+        ),
+      ),
+      child: child,
     );
   }
 
@@ -906,16 +950,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
     return GestureDetector(
-      // 和 B站播放页一致：双击暂停/播放，单击不触发任何播放操作。
+      // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
       //
-      // 这里刻意只挂 onDoubleTap、不挂 onTap：两者同时存在时，单击要等约
-      // 300ms 双击判定超时才会派发，控件层按钮的响应会跟着变慢。单击的
-      // 事件照旧透传（translucent），也不吃掉外层横向滑返回的手势。
-      //
-      // 竖向/横向拖动和双击可以共存：点击不产生位移，拖动在手势仲裁里
-      // 按主轴方向胜出，双击判定不会被抢走。左边缘那 20pt 的滑返回由
-      // Stack 上层独立处理，命中测试到不了这里，所以横拖调进度不会误触退出。
-      behavior: HitTestBehavior.translucent,
+      // 单击不直接控制播放：抖音/TikTok 用户习惯点一下看控件，直接暂停会
+      // 和「双击暂停」打架。onTap 和 onDoubleTap 同时存在时，单击要等
+      // 约 300ms 双击判定超时才派发——这里可以接受，因为单击只影响控件条，
+      // 不影响播放是否继续。
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggleChrome,
       onDoubleTap: () => unawaited(_togglePlay()),
       onVerticalDragStart: _onVerticalDragStart,
       onVerticalDragUpdate: _onVerticalDragUpdate,
@@ -1349,6 +1391,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     setState(() => _quarterTurns = (_quarterTurns + 1) % 4);
   }
 
+  /// 点击画面：切换沉浸式。
+  ///
+  /// 只挂在视频层的 onTap 上。视频层和控件条在几何上不重叠，所以点按钮
+  /// 不会顺带把控件收起来（B 站播放页那套是整屏一层手势，这里刻意不这么写）。
+  void _toggleChrome() {
+    setState(() => _chromeVisible = !_chromeVisible);
+    _scheduleChromeHide();
+  }
+
+  /// 控件显示后 4 秒自动收起。用户又点一下可以立刻再收。
+  void _scheduleChromeHide() {
+    _chromeTimer?.cancel();
+    if (!_chromeVisible) return;
+    _chromeTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted || !_chromeVisible) return;
+      setState(() => _chromeVisible = false);
+    });
+  }
+
   Widget _sheetHeader(String title, {VoidCallback? onBack}) {
     return SizedBox(
       height: 44,
@@ -1425,6 +1486,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         ShortVideoPlatform.douyin;
     return showModalBottomSheet<void>(
       context: context,
+      useRootNavigator: true,
       backgroundColor: const Color(0xFF1A1A1A),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
@@ -1473,6 +1535,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   void _showVolumeSheet() {
     showModalBottomSheet<void>(
       context: context,
+      useRootNavigator: true,
       backgroundColor: const Color(0xFF1A1A1A),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
@@ -1531,6 +1594,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Future<void> _showMoreSheet() {
     return showModalBottomSheet<void>(
       context: context,
+      useRootNavigator: true,
       backgroundColor: const Color(0xFF1A1A1A),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
@@ -1624,7 +1688,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
             icon: Icons.picture_in_picture_alt_outlined,
             title: '画中画',
             onTap: () {
-              Get.back();
+              // 关掉的是这一层的 sheet，不能靠 Get.back() 猜栈顶：
+              // bottom sheet 现在挂在 root navigator 上，Get.back 在有别的
+              // 路由叠着时可能关错页面。
+              Navigator.of(context).pop();
               unawaited(_enterPip());
             },
           ),
@@ -1651,7 +1718,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     dense: true,
                     onTap: () {
                       unawaited(_player.setPlaybackSpeed(speed));
-                      Get.back();
+                      // 同上：只关这一层 sheet，不用 Get.back() 猜栈顶。
+                      Navigator.of(context).pop();
                     },
                     title: Text(
                       '${speed}X',
