@@ -152,9 +152,16 @@ class ShortVideoFavoritesPage extends StatefulWidget {
 }
 
 class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
-  /// 主界面底部导航栏的高度。它叠画在本页 body 之上，不吃布局，
+  /// 主界面底部导航栏的遮挡高度。它叠画在本页 body 之上，不吃布局，
   /// 所以本页自己要留出这段高度，否则最后一行按钮会被压住点不到。
-  static const double _mainBottomNavHeight = 56;
+  ///
+  /// 两种形态都要覆盖：
+  /// * 悬浮导航栏：64 的胶囊 + 8 的底部内边距 = 72；
+  /// * 默认的 Material NavigationBar：80。
+  ///
+  /// 取 88 是为了在较高的那种上面再留一点呼吸空间。这里不是 56：
+  /// 56 只够旧的 BottomNavigationBar，默认的 M3 导航栏比它高 24。
+  static const double _mainBottomNavHeight = 88;
 
   final List<ShortVideo> _videos = [];
   bool _syncing = false;
@@ -582,6 +589,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     return '${mb.toStringAsFixed(mb >= 10 ? 0 : 1)} MB';
   }
 
+  /// 状态信息按句分行，避免长句和缓存按钮挤在同一行。
+  Iterable<String> get _statusLines {
+    final lines = _status
+        .split(RegExp(r'[；;\n]'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList(growable: false);
+    return lines.isEmpty ? const ['就绪'] : lines;
+  }
+
   /// 插到「下一首播放」：正在播的 B 站 / 抖音队列播完这一条就接上它。
   void _queueNext(Iterable<ShortVideo> videos) {
     final entries = videos.map(QueueEntry.fromShortVideo);
@@ -635,50 +652,60 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: Text(platform.title),
+        title: Text(
+          platform.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        titleSpacing: 12,
         actions: [
           // 根因诊断入口。放在最前面，用户随时能打开看结论并截屏。
-          IconButton(
-            tooltip: '根因诊断',
-            onPressed: () => Get.to(() => const RootScanPage()),
-            icon: const Icon(Icons.monitor_heart_outlined),
+          _headAction(
+            label: '诊断',
+            icon: const Icon(Icons.monitor_heart_outlined, size: 20),
+            onTap: () => Get.to(() => const RootScanPage()),
           ),
-          IconButton(
-            tooltip: '播放列表',
-            onPressed: () => Get.to(() => const ShortVideoPlaylistPage()),
-            icon: const Icon(Icons.queue_music),
+          _headAction(
+            label: '列表',
+            icon: const Icon(Icons.queue_music, size: 20),
+            onTap: () => Get.to(() => const ShortVideoPlaylistPage()),
           ),
-          IconButton(
-            tooltip: 'WebDAV 同步',
-            onPressed: _syncing ? null : () => _sync(),
+          // 管理类操作和上面的「查看」分开，避免一排图标挤在一起分不清。
+          Container(
+            width: 1,
+            height: 22,
+            margin: const EdgeInsets.symmetric(horizontal: 3),
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.6),
+          ),
+          _headAction(
+            label: '同步',
+            onTap: _syncing ? null : () => _sync(),
             icon: _syncing
                 ? const SizedBox(
                     width: 18,
                     height: 18,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.sync),
+                : const Icon(Icons.sync, size: 20),
           ),
-          IconButton(
-            tooltip: '清空',
-            onPressed: _videos.isEmpty ? null : _clear,
-            icon: const Icon(Icons.delete_outline),
+          _headAction(
+            label: '清空',
+            icon: const Icon(Icons.delete_outline, size: 20),
+            onTap: _videos.isEmpty ? null : _clear,
           ),
-          IconButton(
-            tooltip: _selecting ? '退出多选' : '多选',
-            onPressed: _videos.isEmpty && !_selecting
+          _headAction(
+            label: _selecting ? '退出' : '多选',
+            onTap: _videos.isEmpty && !_selecting
                 ? null
                 : _toggleSelectMode,
             icon: Badge(
               isLabelVisible: _selecting && _selectedCount > 0,
-              label: Text('$_selectedCount'),
-              child: Icon(_selecting ? Icons.close : Icons.checklist),
+              label: Text('$_selectedCount', style: const TextStyle(fontSize: 10)),
+              child: Icon(
+                _selecting ? Icons.close : Icons.checklist,
+                size: 20,
+              ),
             ),
-          ),
-          IconButton(
-            tooltip: '全部播放',
-            onPressed: _videos.isEmpty ? null : _playAll,
-            icon: const Icon(Icons.play_arrow),
           ),
         ],
       ),
@@ -690,6 +717,47 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       // 撑满整屏，Scaffold 算出来的 bottom padding 不可靠，_bottomBar 里
       // 再按 MediaQuery.viewPadding 显式补一份。
       bottomNavigationBar: _bottomBar(theme),
+    );
+  }
+
+  /// 顶部操作：图标下面带文字，单独看一个图标也知道是干什么的。
+  ///
+  /// 保留 tooltip 是为了读屏和长按提示，但不再依赖它——用户第一眼要能
+  /// 看到「诊断 / 列表 / 同步 / 清空 / 多选」。
+  Widget _headAction({
+    required String label,
+    required Widget icon,
+    required VoidCallback? onTap,
+  }) {
+    return Tooltip(
+      message: label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Opacity(
+          opacity: onTap == null ? 0.38 : 1,
+          child: SizedBox(
+            width: 42,
+            height: 48,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: Center(child: icon),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  label,
+                  maxLines: 1,
+                  style: const TextStyle(fontSize: 10, height: 1.1),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -828,35 +896,53 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
     final localSelected = _localSelected;
     return Padding(
-      padding: EdgeInsets.fromLTRB(16, 8, 16, safeBottom + _mainBottomNavHeight),
+      padding: EdgeInsets.fromLTRB(
+        16,
+        8,
+        16,
+        safeBottom + _mainBottomNavHeight + 4,
+      ),
       child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _status,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
+            // 同步结果里常有「已同步：…；本页 N 条」两段信息。原来和缓存
+            // 按钮挤在同一个 Row 里，窄屏上被压成一坨；现在一段一行。
+            for (final line in _statusLines)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text(
+                  line,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
-                if (_cacheBytes > 0)
-                  TextButton(
-                    onPressed: _caching ? null : _clearCache,
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
+              ),
+            if (_cacheBytes > 0 || _selecting)
+              Row(
+                children: [
+                  if (_selecting)
+                    Text(
+                      '已选 $_selectedCount 条',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                      ),
                     ),
-                    child: Text(
-                      '缓存 ${_fmtBytes(_cacheBytes)}',
-                      style: theme.textTheme.bodySmall,
+                  const Spacer(),
+                  if (_cacheBytes > 0)
+                    TextButton(
+                      onPressed: _caching ? null : _clearCache,
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                      child: Text(
+                        '缓存 ${_fmtBytes(_cacheBytes)}',
+                        style: theme.textTheme.bodySmall,
+                      ),
                     ),
-                  ),
-              ],
-            ),
+                ],
+              ),
             const SizedBox(height: 8),
             if (_selecting)
               Wrap(

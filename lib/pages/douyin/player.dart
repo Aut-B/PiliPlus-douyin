@@ -1192,7 +1192,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                 ),
               ),
               const SizedBox(width: 4),
-              // 右侧五个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              // 右侧六个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
               Expanded(
                 child: Align(
                   alignment: Alignment.centerRight,
@@ -1203,6 +1203,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                       children: [
                         _speedButton(),
                         _qualityButton(),
+                        ComBtn(
+                          icon: const Icon(
+                            Icons.chat_bubble_outline,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          onTap: () => unawaited(_showCommentsSheet()),
+                          tooltip: '评论',
+                          width: 30,
+                          height: 30,
+                        ),
                         Obx(() {
                           final volume = _player.volume.value;
                           return ComBtn(
@@ -1387,6 +1398,63 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               size: 18,
               color: Colors.white38,
             ),
+    );
+  }
+
+  /// 评论入口。
+  ///
+  /// 抖音 / TikTok 的收藏抓取接口只返回视频元数据，没有评论列表；B 站播放页
+  /// 那个「发弹幕」的位置在这里换成评论，但没有数据时只显示「暂无评论」，
+  /// 不编造、也不额外请求接口。
+  Future<void> _showCommentsSheet() {
+    final entry = _current;
+    final platform =
+        ShortVideoPlatform.fromId(entry.short?.platform) ??
+        ShortVideoPlatform.douyin;
+    return showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+      ),
+      builder: (_) => SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _sheetHeader('评论'),
+              const SizedBox(height: 6),
+              Text(
+                entry.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+              const SizedBox(height: 20),
+              const Icon(
+                Icons.chat_bubble_outline,
+                size: 32,
+                color: Colors.white24,
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '暂无评论',
+                style: TextStyle(color: Colors.white70, fontSize: 14),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${platform.album}的收藏接口不返回评论数据，'
+                '这里只显示本地能拿到的内容。',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
