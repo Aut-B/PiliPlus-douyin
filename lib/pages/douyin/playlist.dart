@@ -228,7 +228,21 @@ abstract final class ShortVideoPlaylistRepo {
 
 /// 播放列表页：看、删、清空、整张开播。
 class ShortVideoPlaylistPage extends StatefulWidget {
-  const ShortVideoPlaylistPage({super.key});
+  const ShortVideoPlaylistPage({
+    super.key,
+    this.currentKey,
+    this.onPlay,
+    this.onReorder,
+  });
+
+  /// 当前正在播的条目 key，用来高亮。
+  final String? currentKey;
+
+  /// 在播放页里打开时，点条目把整份列表交回播放页；为空则自己开播放页。
+  final void Function(List<QueueEntry> entries, int index)? onPlay;
+
+  /// 调序后把新顺序交回播放页，让播放队列跟着变。
+  final void Function(List<PlaylistItem> items)? onReorder;
 
   @override
   State<ShortVideoPlaylistPage> createState() => _ShortVideoPlaylistPageState();
@@ -261,12 +275,15 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
       SmartDialog.showToast('列表里没有可播放的条目');
       return;
     }
+    final at = start.clamp(0, entries.length - 1);
+    final onPlay = widget.onPlay;
+    if (onPlay != null) {
+      onPlay(entries, at);
+      Navigator.of(context).maybePop();
+      return;
+    }
     unawaited(
-      openShortVideoQueue(
-        entries,
-        start.clamp(0, entries.length - 1),
-        replaceCurrent: true,
-      ),
+      openShortVideoQueue(entries, at, replaceCurrent: true),
     );
   }
 
@@ -275,7 +292,7 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
     _reload();
   }
 
-  /// 上移 / 下移。顺序就是播放顺序，所以这里直接改存储。
+  /// 拖动调序。顺序就是播放顺序，所以这里直接改存储。
   void _move(int from, int to) {
     if (from < 0 || from >= _items.length) return;
     if (to < 0 || to >= _items.length) return;
@@ -285,6 +302,7 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
     ShortVideoPlaylistRepo.save(next);
     ShortVideoPlaylistRepo.onChanged?.call();
     setState(() => _items = next);
+    widget.onReorder?.call(next);
   }
 
   Future<void> _clear() async {
@@ -310,32 +328,56 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
       ),
       body: _items.isEmpty
           ? _empty(theme)
-          : ListView.builder(
+          : ReorderableListView.builder(
+              buildDefaultDragHandles: false,
               itemCount: _items.length,
+              onReorderItem: _move,
               itemBuilder: (context, index) {
                 final item = _items[index];
+                final isCurrent = item.key == widget.currentKey;
                 return ListTile(
+                  key: ValueKey(item.key),
                   onTap: () => _play(index),
-                  leading: ClipRRect(
-                    borderRadius: BorderRadius.circular(6),
-                    child: SizedBox(
-                      width: 48,
-                      height: 64,
-                      child: item.cover.isEmpty
-                          ? Container(
-                              color: theme.dividerColor.withValues(alpha: 0.1),
-                            )
-                          : Image.network(
-                              item.cover,
-                              fit: BoxFit.cover,
-                              cacheWidth: 180,
-                              errorBuilder: (_, _, _) => Container(
-                                color: theme.dividerColor.withValues(
-                                  alpha: 0.1,
+                  selected: isCurrent,
+                  selectedTileColor: theme.colorScheme.primary.withValues(
+                    alpha: 0.12,
+                  ),
+                  leading: Stack(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: SizedBox(
+                          width: 48,
+                          height: 64,
+                          child: item.cover.isEmpty
+                              ? Container(
+                                  color: theme.dividerColor.withValues(
+                                    alpha: 0.1,
+                                  ),
+                                )
+                              : Image.network(
+                                  item.cover,
+                                  fit: BoxFit.cover,
+                                  cacheWidth: 180,
+                                  errorBuilder: (_, _, _) => Container(
+                                    color: theme.dividerColor.withValues(
+                                      alpha: 0.1,
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                    ),
+                          ),
+                        ),
+                      if (isCurrent)
+                        const Positioned(
+                          right: 2,
+                          bottom: 2,
+                          child: Icon(
+                            Icons.play_circle_fill,
+                            size: 16,
+                            color: Colors.white,
+                          ),
+                        ),
+                    ],
                   ),
                   title: Text(
                     item.title,
@@ -343,6 +385,7 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
                     overflow: TextOverflow.ellipsis,
                   ),
                   subtitle: Text(
+                    '${isCurrent ? '正在播放 · ' : ''}'
                     '${item.platformLabel} · ${item.durationText}'
                     '${item.author.isEmpty ? '' : ' · ${item.author}'}',
                     maxLines: 1,
@@ -351,31 +394,15 @@ class _ShortVideoPlaylistPageState extends State<ShortVideoPlaylistPage> {
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      IconButton(
-                        tooltip: '上移',
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(
-                          minWidth: 34,
-                          minHeight: 34,
+                      ReorderableDragStartListener(
+                        index: index,
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 8,
+                          ),
+                          child: Icon(Icons.drag_handle, size: 20),
                         ),
-                        onPressed: index == 0
-                            ? null
-                            : () => _move(index, index - 1),
-                        icon: const Icon(Icons.keyboard_arrow_up, size: 18),
-                      ),
-                      IconButton(
-                        tooltip: '下移',
-                        visualDensity: VisualDensity.compact,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(
-                          minWidth: 34,
-                          minHeight: 34,
-                        ),
-                        onPressed: index >= _items.length - 1
-                            ? null
-                            : () => _move(index, index + 1),
-                        icon: const Icon(Icons.keyboard_arrow_down, size: 18),
                       ),
                       IconButton(
                         tooltip: '移出播放列表',

@@ -4,6 +4,7 @@ import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/rootscan.dart';
 import 'package:PiliPlus/pages/douyin/shuffle_store.dart';
@@ -70,6 +71,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   String _deckSignature = '';
 
   bool _opening = false;
+
+  /// 加载期间在播放列表里点下的目标条目；当前 [_open] 收尾后补跳。
+  ///
+  /// 不加这个字段的话，`_opening` 为真时那次点击会被直接丢掉：列表页
+  /// 已经 pop 掉了，用户看到列表关闭、视频却没换。
+  int? _pendingOpenIndex;
   String? _error;
   bool _shuffle = false;
 
@@ -354,6 +361,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
       _opening = false;
+      // 加载期间用户在播放列表里点过别的条目：现在补跳过去，否则那次
+      // 点击会石沉大海（列表已经关了，屏幕上什么都没变）。
+      final pending = _pendingOpenIndex;
+      _pendingOpenIndex = null;
+      if (pending != null && mounted && !_leaving && !_disposed) {
+        unawaited(_open(pending));
+      }
     }
   }
 
@@ -438,6 +452,78 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   Future<void> _previous() async {
     if (_queue.length <= 1) return;
     await _open((_index - 1 + _queue.length) % _queue.length);
+  }
+
+  /// 打开播放列表。列表里调序会回调 [_applyPlaylistOrder]，
+  /// 点条目会回调 [_playFromPlaylist]，两边保持同一份顺序。
+  Future<void> _openPlaylist() async {
+    await Get.to<void>(
+      () => ShortVideoPlaylistPage(
+        currentKey: _current.key,
+        onReorder: _applyPlaylistOrder,
+        onPlay: _playFromPlaylist,
+      ),
+    );
+  }
+
+  /// 播放列表调序后，把当前队列里同样存在的条目按新顺序重排。
+  ///
+  /// 队列和播放列表未必完全一样（收藏页直接开播时列表可能是空的），
+  /// 所以只重排在两边的条目，其余条目留在原位，不改变队列长度。
+  void _applyPlaylistOrder(List<PlaylistItem> items) {
+    if (items.isEmpty || _queue.isEmpty) return;
+    final incoming = <String, QueueEntry>{
+      for (final entry in _queue) entry.key: entry,
+    };
+    final playlistKeys = items.map((item) => item.key).toSet();
+    final positions = <int>[];
+    for (var i = 0; i < _queue.length; i++) {
+      if (playlistKeys.contains(_queue[i].key)) {
+        positions.add(i);
+      }
+    }
+    if (positions.isEmpty) return;
+    final ordered = <QueueEntry>[];
+    for (final item in items) {
+      final entry = incoming[item.key];
+      if (entry != null) ordered.add(entry);
+    }
+    if (ordered.length != positions.length) return;
+    final currentKey = _current.key;
+    final next = List<QueueEntry>.of(_queue);
+    for (var i = 0; i < positions.length; i++) {
+      next[positions[i]] = ordered[i];
+    }
+    setState(() {
+      _queue
+        ..clear()
+        ..addAll(next);
+      final at = _queue.indexWhere((e) => e.key == currentKey);
+      if (at >= 0) _index = at;
+    });
+  }
+
+  /// 播放列表里点了一条：整份列表成为新的播放队列，并从这条开始播。
+  void _playFromPlaylist(List<QueueEntry> entries, int index) {
+    if (entries.isEmpty) return;
+    final target = index.clamp(0, entries.length - 1);
+    final key = entries[target].key;
+    final wasCurrentKey = _current.key;
+    setState(() {
+      _queue
+        ..clear()
+        ..addAll(entries);
+      _index = target;
+    });
+    // 点的就是当前这条：只把队列换成列表顺序，不重新加载打断播放。
+    if (key == wasCurrentKey) return;
+    // 正在解析/加载上一条时不能直接丢弃这次点击：列表已经关了，用户点了却
+    // 什么都没发生。记下来，等当前这次 _open 收尾时补跳。
+    if (_opening) {
+      _pendingOpenIndex = target;
+      return;
+    }
+    unawaited(_open(target));
   }
 
   Future<void> _togglePlay() async {
@@ -986,6 +1072,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           right: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              ComBtn(
+                icon: const Icon(Icons.queue_music, color: Colors.white),
+                onTap: () => unawaited(_openPlaylist()),
+                tooltip: '播放列表',
+              ),
               ComBtn(
                 icon: Icon(
                   _shuffle ? Icons.shuffle : Icons.swap_vert,
