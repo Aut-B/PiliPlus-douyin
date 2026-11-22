@@ -12,9 +12,11 @@ import 'package:path_provider/path_provider.dart';
 
 /// 全量诊断开关。
 ///
-/// 诊断包编译时传 `--dart-define=PILIPLUS_DIAG=true`；普通包不传或传
-/// `false`，所有采样、切条探针与导出入口都会直接 return，不产生任何文件。
-const bool kDiagEnabled = bool.fromEnvironment('PILIPLUS_DIAG');
+/// 默认开启。历史上多次出现「构建时忘了传 --dart-define → 证据一条没写 →
+/// 又白测一轮」的坑，所以这里反转为默认 ON：除非显式传
+/// `--dart-define=PILIPLUS_DIAG_OFF=true`，否则采样、切条探针与导出入口全部生效。
+/// 诊断阶段结束后再改成默认关闭。
+const bool kDiagEnabled = !bool.fromEnvironment('PILIPLUS_DIAG_OFF');
 
 /// mpv 解码/渲染侧需要入证的指标。读不到就记 null，不抛错。
 const List<String> kMpvDiagKeys = <String>[
