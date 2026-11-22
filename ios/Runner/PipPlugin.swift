@@ -174,6 +174,8 @@ private final class PipSession: NSObject {
   private var isPlaying = false
   private var isLive = false
   private var speed = 1.0
+  /// Latest playback position pushed by Dart, in milliseconds.
+  private var positionMs: Int64 = 0
   private var duration = CMTime.zero
   private var pendingStart = false
   private var stopRequested = false
@@ -214,8 +216,11 @@ private final class PipSession: NSObject {
       sourceClock: CMClockGetHostTimeClock(),
       timebaseOut: &timebase
     )
-    // Drives the progress shown in the PiP window.
-    displayLayer.controlTimebase = timebase
+    // Every sample is marked DisplayImmediately, so frames are shown on
+    // arrival instead of on a PTS timeline. Mode: displayImmediately with
+    // controlTimebase=nil; the timebase object is kept for the PiP playback
+    // delegate (setPlaying / skipByInterval) only.
+    displayLayer.controlTimebase = nil
 
     self.textureId = textureId
     self.sendEvent = sendEvent
@@ -223,6 +228,10 @@ private final class PipSession: NSObject {
     self.displayLayer = displayLayer
     self.timebase = timebase!
     super.init()
+    PipTrace.log(
+      "mode: displayImmediately, layerTimebase=nil, timebase=delegate-only "
+        + "texture=\(textureId)"
+    )
 
     controller = AVPictureInPictureController(
       contentSource: .init(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self)
@@ -311,6 +320,7 @@ private final class PipSession: NSObject {
         + "duration=\(durationMs.map { String($0) } ?? "nil")ms"
     )
     if let position {
+      positionMs = position
       let rate = isPlaying && !isBuffering ? speed : 0
       let status = CMTimebaseSetRateAndAnchorTime(
         timebase,
@@ -776,10 +786,12 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     skipByInterval skipInterval: CMTime,
     completion completionHandler: @escaping () -> Void
   ) {
+    let current = CMTime(value: positionMs, timescale: 1000)
     let target = CMTimeClampToRange(
-      CMTimeAdd(CMTimebaseGetTime(timebase), skipInterval),
+      CMTimeAdd(current, skipInterval),
       range: CMTimeRange(start: .zero, duration: duration)
     )
+    positionMs = Int64((target.seconds * 1000).rounded())
     CMTimebaseSetTime(timebase, time: target)
     sendEvent("skip", Int((skipInterval.seconds * 1000).rounded()))
     completionHandler()
