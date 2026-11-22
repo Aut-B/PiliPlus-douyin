@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
+import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
@@ -160,6 +161,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     super.initState();
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
+    // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
+    // 普通包头一行就会 return，不产生文件。
+    DiagProbe.startSampling();
     _startPipTicker();
     _scheduleChromeHide();
     unawaited(_primeBrightness());
@@ -220,6 +224,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    DiagProbe.stop();
     _stopPipTicker();
     if (_statusListening) {
       _statusListening = false;
@@ -290,8 +295,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     final session = ++_openSession;
     _opening = true;
     _completionArmed = false;
+    String? openError;
     try {
       final entry = _queue[target];
+      // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
+      // 是新纹理，无法判断「换了纹理但没画面」。
+      DiagProbe.beginOpen(
+        index: target,
+        key: entry.key,
+        oldTextureId: _player.videoController?.id.value,
+      );
       setState(() {
         _index = target;
         _error = null;
@@ -319,6 +332,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           }();
       if (!mounted) return;
       if (media == null || media.url.isEmpty) {
+        openError = 'no-media';
         setState(() => _error = '解析不出播放地址');
         return;
       }
@@ -372,8 +386,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       setState(() {});
       _notePlayed(entry.key);
     } catch (error) {
+      openError = '$error';
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
+      DiagProbe.endOpen(error: openError);
       _opening = false;
       // 加载期间用户在播放列表里点过别的条目：现在补跳过去，否则那次
       // 点击会石沉大海（列表已经关了，屏幕上什么都没变）。
@@ -567,6 +583,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     // 不 start，用户点了按钮却留在前台会看起来什么都没发生。
     _player.enterPip(autoEnter: false);
     _publishPipState();
+  }
+
+  /// 诊断包专用：把 Documents 里的 trace / 采样打成 zip 并弹系统分享面板。
+  Future<void> _exportDiagnostics() async {
+    final path = await DiagProbe.exportAndShare();
+    if (!mounted) return;
+    SmartDialog.showToast(
+      path == null ? '没有可导出的诊断文件' : '诊断包已生成：${path.split('/').last}',
+    );
   }
 
   /// 启动画中画状态推送。播放中每 500ms 推一次 position，原生 timebase
@@ -1701,6 +1726,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               unawaited(_enterPip());
             },
           ),
+          if (kDiagEnabled)
+            _sheetTile(
+              icon: Icons.ios_share,
+              title: '导出诊断',
+              subtitle: 'pip_trace / 播放采样 / rootscan',
+              onTap: () {
+                Navigator.of(context).pop();
+                unawaited(_exportDiagnostics());
+              },
+            ),
           const SizedBox(height: 8),
         ],
       ),

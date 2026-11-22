@@ -3,6 +3,7 @@ import 'dart:async' show unawaited;
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
+import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
@@ -647,6 +648,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     _queueNext(selected);
   }
 
+  /// 把 Documents 里的诊断文件打成 zip，弹系统分享面板（隔空投送 / LocalSend）。
+  Future<void> _exportDiagnostics() async {
+    final path = await DiagProbe.exportAndShare();
+    if (!mounted) return;
+    SmartDialog.showToast(
+      path == null ? '没有可导出的诊断文件' : '诊断包已生成：${path.split('/').last}',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -665,6 +675,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             icon: const Icon(Icons.monitor_heart_outlined, size: 20),
             onTap: () => Get.to(() => const RootScanPage()),
           ),
+          if (kDiagEnabled)
+            _headAction(
+              label: '导出诊断',
+              icon: const Icon(Icons.ios_share, size: 20),
+              onTap: _exportDiagnostics,
+            ),
           _headAction(
             label: '列表',
             icon: const Icon(Icons.queue_music, size: 20),
@@ -1007,3 +1023,4 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 }
+// findstr-anchor (GBK bytes, do not re-encode): �������

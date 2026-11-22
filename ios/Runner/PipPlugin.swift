@@ -21,6 +21,25 @@ final class PipPlugin: NSObject, FlutterPlugin {
     let instance = PipPlugin(channel: channel)
     registrar.addMethodCallDelegate(instance, channel: channel)
     TextureTracker.install(on: registrar.textures())
+    // 注册即落一行 session start：只要文件存在，就说明原生插件真的被注册过。
+    // 反过来，如果用户报「PiP 卡」但连这行都没有，问题根本不在帧链路，
+    // 而是 App 没进到原生插件（或装错了版本）。
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "unknown"
+    let build = info?["CFBundleVersion"] as? String ?? "unknown"
+    PipTrace.log(
+      "session start: version=\(version)(\(build)) system=\(UIDevice.current.systemVersion) "
+        + "model=\(deviceModelIdentifier())"
+    )
+  }
+
+  /// `UIDevice.model` 只说 "iPhone"，这里取真正的硬件标识（如 iPhone12,1）。
+  private static func deviceModelIdentifier() -> String {
+    var info = utsname()
+    _ = uname(&info)
+    return withUnsafeBytes(of: &info.machine) { raw in
+      String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+    }
   }
 
   private let channel: FlutterMethodChannel
@@ -239,7 +258,11 @@ private final class PipSession: NSObject {
     controller.delegate = self
     controller.canStartPictureInPictureAutomaticallyFromInline = false
     possibleObservation = controller.observe(\.isPictureInPicturePossible) {
-      [weak self] _, _ in
+      [weak self] pipController, _ in
+      PipTrace.log(
+        "observation: possible=\(pipController.isPictureInPicturePossible) "
+          + "active=\(pipController.isPictureInPictureActive)"
+      )
       DispatchQueue.main.async { self?.startIfPending() }
     }
     // The video is shown inline again once the app is back in the foreground.
@@ -299,7 +322,8 @@ private final class PipSession: NSObject {
     )
     PipTrace.log(
       "configure: side=\(size.width)x\(size.height) inWindow=\(sourceView.superview === window) "
-        + "possible=\(controller.isPictureInPicturePossible) hasFrame=\(hasFrame)"
+        + "possible=\(controller.isPictureInPicturePossible) hasFrame=\(hasFrame) "
+        + "windowCount=\(Self.windowCount()) superview=\(String(describing: sourceView.superview))"
     )
     frameAvailable(force: true)
   }
@@ -680,6 +704,14 @@ private final class PipSession: NSObject {
     return windows.first { $0.rootViewController is FlutterViewController }
       ?? windows.first { $0.isKeyWindow }
   }
+
+  /// 宿主窗口总数。configure 后如果 sourceView 没进树，这里通常是 0 或
+  /// 只剩一个空窗口，和 superview 描述一起就能区分「没插进去」与「插错层」。
+  private static func windowCount() -> Int {
+    UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .reduce(0) { $0 + $1.windows.count }
+  }
 }
 
 @available(iOS 15.0, *)
@@ -721,6 +753,9 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler:
       @escaping (Bool) -> Void
   ) {
+    PipTrace.log(
+      "restore requested: active=\(isActive) sourceViewInTree=\(sourceView.superview != nil)"
+    )
     restoring = true
     completionHandler(true)
   }
@@ -731,6 +766,10 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     isActive = false
     // Neither restored nor stopped by the app: closed from the PiP window.
     let closed = !restoring && !stopRequested
+    PipTrace.log(
+      "DID stop: closed=\(closed) restoring=\(restoring) stopRequested=\(stopRequested) "
+        + "sourceViewInTree=\(sourceView.superview != nil)"
+    )
     stopRequested = false
     restoring = false
     sendEvent("onStateChanged", ["active": false, "closed": closed])

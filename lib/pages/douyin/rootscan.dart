@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' show PlatformDispatcher;
 
+import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -35,6 +36,10 @@ abstract final class PiliRootScan {
     final report = <String, Object?>{};
     report['schema'] = 1;
     report['at'] = DateTime.now().toIso8601String();
+    // 用户装了哪一版、画面到底走没走硬件解码：版本号与 mpv 解码指标必须
+    // 和扫描结果落在同一份 JSON 里，否则拿到日志也无法确认现象对应哪一版。
+    // appInfo 读原生 mainBundle（通道缺失时回落到 package_info_plus）。
+    report['app'] = await DiagProbe.appInfo();
 
     // 一、原生层
     try {
@@ -57,13 +62,17 @@ abstract final class PiliRootScan {
       report['native'] = {'error': '$error'};
     }
 
-    // 二、Dart 层
+    // 二、解码指标：放在 3 秒原生采样之后读，播放器此时通常已起播，
+    // 才拿得到真实的 hwdec / 分辨率 / 丢帧数。
+    report['mpv'] = DiagProbe.snapshot();
+
+    // 三、Dart 层
     report['dart'] = await _dartSnapshot();
 
     report['verdict'] = _verdict(report);
     _lastReport = report;
 
-    // 三、落盘：多个位置都写一份，哪个能拿到用哪个
+    // 四、落盘：多个位置都写一份，哪个能拿到用哪个
     //
     // 在 LiveContainer + SideStore 里跑时，App 的 Documents 既不出现在系统
     // 「文件」App 里，容器路径也随 LC 的目录结构走，用户很难自己翻到。
