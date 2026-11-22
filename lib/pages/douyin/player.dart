@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
+import 'package:PiliPlus/models_new/video/video_detail/page.dart' show Part;
 import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
@@ -15,6 +16,7 @@ import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
+import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:flutter/material.dart';
@@ -61,7 +63,8 @@ class ShortVideoPlayerPage extends StatefulWidget {
   State<ShortVideoPlayerPage> createState() => _ShortVideoPlayerPageState();
 }
 
-class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
+class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
+    with WidgetsBindingObserver {
   late final List<QueueEntry> _queue = List<QueueEntry>.of(widget.queue);
   late int _index = widget.index.clamp(0, _queue.length - 1);
 
@@ -101,6 +104,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   /// 是否点过小窗按钮。返回时要先把系统小窗关掉，否则页面退了自己还在后台播。
   bool _pipEntered = false;
+
+  /// 后台保活。B站链路由 video 页写入 audio_service 的 mediaItem，
+  /// `onUpdateState` 才会驱动 Now Playing / 音频会话；抖音页此前一条
+  /// mediaItem 都没有，iOS 进后台后 Flutter texture 会被冻结，PiP 只能
+  /// 反复显示最后一帧。这里复用现有的 audio_service，不新增依赖。
+  late final String _bgTag =
+      'douyin-short:${DateTime.now().microsecondsSinceEpoch}';
+  bool _bgKeepAliveApplied = false;
+  bool? _savedEnableBackgroundPlay;
+  int? _bgTextureId;
 
   /// 页面已经在退，避免重复触发。
   bool _leaving = false;
@@ -171,6 +184,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
@@ -203,6 +217,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stopPipTicker();
     _chromeTimer?.cancel();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
@@ -253,6 +268,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       // 干净实例。前提是本页只在 dispose() 时做，绝不在 build 期间调用。
       _player.dispose();
     } catch (_) {}
+    // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
+    // 收尾后再恢复用户原来的开关，避免污染 B站配置。
+    _releaseBackgroundKeepAlive();
     if (_brightnessIsApplication) {
       _brightnessIsApplication = false;
       try {
@@ -321,6 +339,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
         _index = target;
         _error = null;
       });
+      // 必须先于 setDataSource/play：audio_service 只有在 _item 非空时
+      // 才会真正写入后台播放状态。
+      _applyBackgroundKeepAlive();
       // 抖音 / TikTok 的 CDN 按网页会话校验，必须带上 WKWebView 那罐 cookie，
       // 否则「地址解析出来了、一播就 403」。
       //
@@ -653,6 +674,76 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       'speed': _player.playbackSpeed,
       'pipLite': _pipLite,
     });
+  }
+
+  /// 对齐 B站：临时打开 enableBackgroundPlay，并用现有的
+  /// `onVideoDetailChange` 写入 mediaItem（内部 `_item` 非空后，
+  /// `onUpdateState` 才会驱动音频会话）。退出页面时恢复原值。
+  void _applyBackgroundKeepAlive() {
+    final handler = videoPlayerServiceHandler;
+    if (handler == null) return;
+    if (!_bgKeepAliveApplied) {
+      _savedEnableBackgroundPlay = handler.enableBackgroundPlay;
+      handler.enableBackgroundPlay = true;
+      _bgKeepAliveApplied = true;
+    }
+    final entry = _current;
+    // 切条时先摘掉本页上一条，避免 _item 里越叠越多。
+    handler.onVideoDetailDispose(_bgTag);
+    handler.onVideoDetailChange(
+      Part(part: entry.title, duration: (entry.durationMs / 1000).round()),
+      0,
+      _bgTag,
+      artist: entry.author,
+      cover: entry.cover,
+    );
+    DiagProbe.event('bg-keepalive', <String, Object?>{
+      'enabled': handler.enableBackgroundPlay,
+      'hasMediaItem': handler.mediaItem.value != null,
+      'textureId': _player.videoController?.id.value,
+      'entryKey': entry.key,
+    });
+  }
+
+  void _releaseBackgroundKeepAlive() {
+    final handler = videoPlayerServiceHandler;
+    if (handler == null || !_bgKeepAliveApplied) return;
+    handler.onVideoDetailDispose(_bgTag);
+    // 本页 item 已摘除；顺手清掉它留下的 Now Playing / 播放状态，
+    // 避免退出播放页后媒体通知还显示抖音条目。
+    handler.clearIfNeeded();
+    final saved = _savedEnableBackgroundPlay;
+    if (saved != null) handler.enableBackgroundPlay = saved;
+    _bgKeepAliveApplied = false;
+    _savedEnableBackgroundPlay = null;
+  }
+
+  /// 进/回后台各记一条，直接观察 textureId 是否变化；copyPixelBuffer
+  /// 返回 nil 或内容重复由原生 pip_trace 的 frame/stale-source 记录。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final textureId = _player.videoController?.id.value;
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _bgTextureId = textureId;
+      DiagProbe.event('bg-enter', <String, Object?>{
+        'textureId': textureId,
+        'positionMs': _player.positionInMilliseconds,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'pipActive': IOSPipHelper.isActive,
+        'keepAlive': _bgKeepAliveApplied,
+      });
+    } else if (state == AppLifecycleState.resumed) {
+      DiagProbe.event('bg-return', <String, Object?>{
+        'textureId': textureId,
+        'previousTextureId': _bgTextureId,
+        'textureChanged': textureId != _bgTextureId,
+        'positionMs': _player.positionInMilliseconds,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'pipActive': IOSPipHelper.isActive,
+      });
+      _bgTextureId = null;
+    }
   }
 
   void _toggleShuffle() {

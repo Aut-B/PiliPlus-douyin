@@ -233,6 +233,18 @@ private final class PipSession: NSObject {
   /// Size of the PiP window in pixels, zero until known.
   private var renderSize = CGSize.zero
 
+  // 像素指纹诊断。PiP 卡在同一帧时，position/声音照常前进，只有 texture
+  // 内容不变；这里直接对每帧 source/output 取样校验和，用 identicalRun
+  // 证明「到底是不是同一张画面」。以下字段只在 `frameQueue` 上读写。
+  private var lastSourceHash: UInt32 = 0
+  private var hasSourceHash = false
+  private var identicalRun = 0
+  private var totalFingerprintFrames = 0
+  private var identicalRunsSum = 0
+  private var lastOutputHash: UInt32 = 0
+  private var hasOutputHash = false
+  private var verdictWritten = false
+
   init(textureId: Int64, sendEvent: @escaping (String, Any?) -> Void) {
     let sourceView = SampleBufferView()
     let displayLayer = sourceView.layer as! AVSampleBufferDisplayLayer
@@ -436,6 +448,9 @@ private final class PipSession: NSObject {
         + "frameInFlightDrops=\(frameInFlightDropCount) "
         + "throttleDrops=\(throttleDropCount) enqueued=\(enqueuedFrameCount)"
     )
+    // 同步在 frameQueue 上取快照：tearDown() 随后会把 session 置空，
+    // 异步闭包可能已经拿不到统计值。
+    frameQueue.sync { writeVerdictIfNeeded() }
   }
 
   // MARK: Frames
@@ -505,6 +520,8 @@ private final class PipSession: NSObject {
     }
     // The source buffer is reused by mpv a few frames later, so it is copied
     // (and downscaled if needed) instead of being handed to the layer as is.
+    // isActive 只在主线程读写，先在这里快照，别在 frameQueue 上裸读。
+    let active = isActive
     frameQueue.async { [weak self] in
       guard let self else { return }
       var stage = "copy"
@@ -512,6 +529,7 @@ private final class PipSession: NSObject {
       if let copy = self.copy(
         source,
         fallbackRenderSize: fallbackRenderSize,
+        active: active,
         stage: &stage
       ),
         let sampleBuffer = self.makeSampleBuffer(copy, stage: &stage)
@@ -543,6 +561,7 @@ private final class PipSession: NSObject {
   private func copy(
     _ source: CVPixelBuffer,
     fallbackRenderSize: CGSize,
+    active: Bool,
     stage: inout String
   ) -> CVPixelBuffer? {
     let started = CFAbsoluteTimeGetCurrent()
@@ -581,6 +600,7 @@ private final class PipSession: NSObject {
       )
       return nil
     }
+    recordSourceFingerprint(source, active: active)
     // 轻量模式优先用 PiP 窗口尺寸；didTransition 一直给 0 时退化为
     // sourceView 的视频区域尺寸（点），让每帧最多只渲染窗口像素。
     var target = CGSize.zero
@@ -661,8 +681,107 @@ private final class PipSession: NSObject {
     }
     ciContext.render(image, to: output)
     renderMs = (CFAbsoluteTimeGetCurrent() - renderStarted) * 1000
+    recordOutputFingerprint(output)
     stage = "done"
     return output
+  }
+
+  /// 32 位 FNV-1a。固定步长取样，最多 512 个点；大缓冲时按总字节数
+  /// 放大步长，保证覆盖整帧，而不是只读开头那一段。
+  private func pixelFingerprint(_ buffer: CVPixelBuffer) -> UInt32? {
+    let lockStatus = CVPixelBufferLockBaseAddress(buffer, .readOnly)
+    guard lockStatus == kCVReturnSuccess else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+    // 源帧通常是 NV12 平面格式；只在 plane 0（亮度）里取样，避免跨平面
+    // 读到不连续的内存。BGRA 输出则是单块数据，按 dataSize 取样。
+    let base: UnsafeMutableRawPointer?
+    let limit: Int
+    if CVPixelBufferIsPlanar(buffer) {
+      base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)
+      limit = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        * CVPixelBufferGetHeightOfPlane(buffer, 0)
+    } else {
+      base = CVPixelBufferGetBaseAddress(buffer)
+      limit = CVPixelBufferGetDataSize(buffer)
+    }
+    guard let base, limit > 0 else { return nil }
+    let stride = max(4096, limit / 512)
+    let bytes = base.assumingMemoryBound(to: UInt8.self)
+    var hash: UInt32 = 2166136261
+    var offset = 0
+    var samples = 0
+    while offset < limit && samples < 512 {
+      hash = (hash ^ UInt32(bytes[offset])) &* 16777619
+      samples += 1
+      offset += stride
+    }
+    return hash
+  }
+
+  /// 对源 texture 的帧算指纹，统计连续相同帧长度。达到 5/20/60 时各写
+  /// 一条 stale-source；达到 5 且 PiP 活跃时先 flush 一次显示层，用来
+  /// 区分「显示层缓存」与「源 texture 冻结」。
+  private func recordSourceFingerprint(_ source: CVPixelBuffer, active: Bool) {
+    guard let hash = pixelFingerprint(source) else {
+      PipTrace.log("fingerprint: source lock failed")
+      return
+    }
+    totalFingerprintFrames += 1
+    let same = hasSourceHash && hash == lastSourceHash
+    if same {
+      identicalRun += 1
+    } else {
+      identicalRunsSum += identicalRun
+      identicalRun = 0
+      hasSourceHash = true
+      lastSourceHash = hash
+    }
+    guard same else { return }
+    if identicalRun == 5 || identicalRun == 20 || identicalRun == 60 {
+      PipTrace.log(
+        "stale-source: run=\(identicalRun) "
+          + "hash=\(String(format: "%08X", hash)) active=\(active ? "YES" : "NO")"
+      )
+      if active {
+        flushForStale(run: identicalRun)
+      }
+    }
+  }
+
+  /// 对 render 后的 output 算指纹。每帧都写一次，true/false 直接对应
+  /// 「这一帧和上一帧的渲染结果是否不同」。
+  private func recordOutputFingerprint(_ output: CVPixelBuffer) {
+    guard let hash = pixelFingerprint(output) else {
+      PipTrace.log("out-hash-changed: false (lock failed)")
+      return
+    }
+    let changed = !hasOutputHash || hash != lastOutputHash
+    hasOutputHash = true
+    lastOutputHash = hash
+    PipTrace.log("out-hash-changed: \(changed)")
+  }
+
+  private func flushForStale(run: Int) {
+    if #available(iOS 17.0, *) {
+      displayLayer.sampleBufferRenderer.flush()
+    } else {
+      displayLayer.flush()
+    }
+    PipTrace.log("flush-on-stale: run=\(run)")
+  }
+
+  /// 会话结束时汇总：total 是参与比对的帧数，identicalRunsSum 是所有
+  /// 「与上一帧相同」的帧数，distinctApprox 是不同画面的近似数量。
+  private func writeVerdictIfNeeded() {
+    guard !verdictWritten else { return }
+    verdictWritten = true
+    let total = totalFingerprintFrames
+    let runsSum = identicalRunsSum + identicalRun
+    let distinct = max(0, total - runsSum)
+    PipTrace.log(
+      "verdict-frames: total=\(total) identicalRunsSum=\(runsSum) "
+        + "distinctApprox=\(distinct)"
+    )
   }
 
   private func makeSampleBuffer(
