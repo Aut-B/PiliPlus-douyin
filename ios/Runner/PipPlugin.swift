@@ -209,6 +209,14 @@ private final class PipSession: NSObject {
   private var frameInFlightDropCount = 0
   private var throttleDropCount = 0
   private var enqueuedFrameCount = 0
+  private var lastTextureCallbackTime: CFTimeInterval = 0
+  private var callbackWindowStart: CFTimeInterval = 0
+  private var callbackWindowCount = 0
+  /// 诊断：PiP 轻量模式。开启时按 PiP 窗口尺寸渲染，而不是源分辨率。
+  /// `pipLiteModeRequested` 只在主线程读写，`pipLiteMode` 只在 `frameQueue`
+  /// 上读写，避免 copy() 与 update() 竞争。
+  private var pipLiteModeRequested = true
+  private var pipLiteMode = true
   /// Whether a frame has been enqueued, PiP shows a black window otherwise.
   private var hasFrame = false
 
@@ -329,6 +337,20 @@ private final class PipSession: NSObject {
   }
 
   func update(_ args: [String: Any]) {
+    if let lite = args["pipLite"] as? Bool, lite != pipLiteModeRequested {
+      pipLiteModeRequested = lite
+      frameQueue.async { [weak self] in
+        guard let self else { return }
+        self.pipLiteMode = lite
+        // 尺寸路径变了：丢掉旧 pool，并等 didTransition 重新给出窗口尺寸；
+        // 在它回来之前轻量模式用 sourceView.bounds 兜底。
+        self.pool = nil
+        self.poolSize = .zero
+        self.renderSize = .zero
+        PipTrace.log("lite-mode: enabled=\(lite)")
+        DispatchQueue.main.async { self.frameAvailable(force: true) }
+      }
+    }
     let position = (args["position"] as? NSNumber)?.int64Value
     let isBuffering = args["isBuffering"] as? Bool ?? false
     let durationMs = (args["duration"] as? NSNumber)?.int64Value
@@ -420,7 +442,31 @@ private final class PipSession: NSObject {
 
   /// Must be called on the main thread.
   func frameAvailable(force: Bool = false) {
+    let callbackTime = CACurrentMediaTime()
     textureCallbackCount += 1
+    if lastTextureCallbackTime > 0 {
+      let gapMs = Int((callbackTime - lastTextureCallbackTime) * 1000)
+      if gapMs > 200 {
+        PipTrace.log(
+          "callback-gap: gapMs=\(gapMs) callbacks=\(textureCallbackCount)"
+        )
+      }
+    }
+    lastTextureCallbackTime = callbackTime
+    if callbackWindowStart == 0 {
+      callbackWindowStart = callbackTime
+    }
+    callbackWindowCount += 1
+    let windowMs = (callbackTime - callbackWindowStart) * 1000
+    if windowMs >= 1000 {
+      let fps = Double(callbackWindowCount) * 1000 / windowMs
+      PipTrace.log(
+        "stat-fps: callbacks=\(callbackWindowCount) windowMs=\(Int(windowMs)) "
+          + "fps=\(String(format: "%.1f", fps))"
+      )
+      callbackWindowStart = callbackTime
+      callbackWindowCount = 0
+    }
     guard !frameInFlight else {
       frameInFlightDropCount += 1
       return
@@ -444,6 +490,9 @@ private final class PipSession: NSObject {
     frameInFlightSince = CACurrentMediaTime()
     frameGeneration &+= 1
     let generation = frameGeneration
+    // didTransitionToRenderSize 在部分机型上一直给 0；轻量模式退化为
+    // 按 sourceView 的视频区域尺寸渲染，避免每帧按源分辨率做 NV12→BGRA。
+    let fallbackRenderSize = sourceView.bounds.size
     // A blocked copy/render/enqueue would otherwise leave the flag set and
     // silently drop every later frame without a trace.
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -460,7 +509,11 @@ private final class PipSession: NSObject {
       guard let self else { return }
       var stage = "copy"
       var enqueued = false
-      if let copy = self.copy(source, stage: &stage),
+      if let copy = self.copy(
+        source,
+        fallbackRenderSize: fallbackRenderSize,
+        stage: &stage
+      ),
         let sampleBuffer = self.makeSampleBuffer(copy, stage: &stage)
       {
         enqueued = self.enqueue(sampleBuffer, stage: &stage)
@@ -487,10 +540,40 @@ private final class PipSession: NSObject {
     }
   }
 
-  private func copy(_ source: CVPixelBuffer, stage: inout String) -> CVPixelBuffer? {
-    stage = "size"
+  private func copy(
+    _ source: CVPixelBuffer,
+    fallbackRenderSize: CGSize,
+    stage: inout String
+  ) -> CVPixelBuffer? {
+    let started = CFAbsoluteTimeGetCurrent()
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
     let sourceHeight = Double(CVPixelBufferGetHeight(source))
+    var sizeMs = 0.0
+    var poolMs = 0.0
+    var pixelBufferMs = 0.0
+    var renderMs = 0.0
+    var outputWidth = 0
+    var outputHeight = 0
+    defer {
+      let totalMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+      let details =
+        "totalMs=\(totalMs) sizeMs=\(Int(sizeMs)) poolMs=\(Int(poolMs)) "
+        + "pixelBufferMs=\(Int(pixelBufferMs)) renderMs=\(Int(renderMs)) "
+        + "src=\(Int(sourceWidth))x\(Int(sourceHeight)) "
+        + "out=\(outputWidth)x\(outputHeight) lite=\(pipLiteMode ? 1 : 0)"
+      PipTrace.log("copy-timing: \(details)")
+      let stages: [(String, Double)] = [
+        ("size", sizeMs),
+        ("pool", poolMs),
+        ("pixelBuffer", pixelBufferMs),
+        ("render", renderMs),
+      ]
+      for (name, ms) in stages where ms > 30 {
+        PipTrace.log("copy-slow: stage=\(name) ms=\(Int(ms)) \(details)")
+      }
+    }
+
+    stage = "size"
     guard sourceWidth > 0, sourceHeight > 0 else {
       PipTrace.log(
         "copy: zero source size \(CVPixelBufferGetWidth(source))x"
@@ -498,19 +581,32 @@ private final class PipSession: NSObject {
       )
       return nil
     }
+    // 轻量模式优先用 PiP 窗口尺寸；didTransition 一直给 0 时退化为
+    // sourceView 的视频区域尺寸（点），让每帧最多只渲染窗口像素。
+    var target = CGSize.zero
+    if pipLiteMode {
+      target =
+        renderSize.width > 0 && renderSize.height > 0
+        ? renderSize : fallbackRenderSize
+    } else if renderSize.width > 0 && renderSize.height > 0 {
+      target = renderSize
+    }
     var scale = min(1, Self.maxDimension / max(sourceWidth, sourceHeight))
-    if renderSize.width > 0 && renderSize.height > 0 {
-      // No need for more pixels than the PiP window has.
+    if target.width > 0 && target.height > 0 {
       scale = min(
         scale,
-        max(renderSize.width / sourceWidth, renderSize.height / sourceHeight)
+        max(target.width / sourceWidth, target.height / sourceHeight)
       )
     }
     let size = CGSize(
       width: (sourceWidth * scale).rounded(),
       height: (sourceHeight * scale).rounded()
     )
+    outputWidth = Int(size.width)
+    outputHeight = Int(size.height)
+    sizeMs = (CFAbsoluteTimeGetCurrent() - started) * 1000
 
+    let poolStarted = CFAbsoluteTimeGetCurrent()
     if pool == nil || poolSize != size {
       pool = nil
       poolSize = size
@@ -536,9 +632,11 @@ private final class PipSession: NSObject {
         return nil
       }
     }
+    poolMs = (CFAbsoluteTimeGetCurrent() - poolStarted) * 1000
     guard let pool else { return nil }
 
     stage = "pixelBuffer"
+    let pixelBufferStarted = CFAbsoluteTimeGetCurrent()
     var output: CVPixelBuffer?
     let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
     guard let output else {
@@ -548,8 +646,10 @@ private final class PipSession: NSObject {
       )
       return nil
     }
+    pixelBufferMs = (CFAbsoluteTimeGetCurrent() - pixelBufferStarted) * 1000
 
     stage = "render"
+    let renderStarted = CFAbsoluteTimeGetCurrent()
     var image = CIImage(cvPixelBuffer: source)
     if scale < 1 {
       image = image.transformed(
@@ -560,6 +660,7 @@ private final class PipSession: NSObject {
       )
     }
     ciContext.render(image, to: output)
+    renderMs = (CFAbsoluteTimeGetCurrent() - renderStarted) * 1000
     stage = "done"
     return output
   }
@@ -815,8 +916,21 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
       height: Double(newRenderSize.height) * scale
     )
     frameQueue.async { [weak self] in
-      self?.renderSize = size
-      DispatchQueue.main.async { self?.frameAvailable(force: true) }
+      guard let self else { return }
+      // 轻量模式直接用窗口点数作为渲染像素，强制做一次真正的缩小；
+      // 关闭时保持原来的「点数 × displayScale」行为，便于 A/B。
+      self.renderSize = self.pipLiteMode
+        ? CGSize(
+          width: Double(newRenderSize.width),
+          height: Double(newRenderSize.height)
+        )
+        : size
+      PipTrace.log(
+        "render-size: reported=\(newRenderSize.width)x\(newRenderSize.height) "
+          + "used=\(Int(self.renderSize.width))x\(Int(self.renderSize.height)) "
+          + "lite=\(self.pipLiteMode ? 1 : 0)"
+      )
+      DispatchQueue.main.async { self.frameAvailable(force: true) }
     }
   }
 

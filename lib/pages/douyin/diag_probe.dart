@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:PiliPlus/pages/douyin/rootscan.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
+import 'package:PiliPlus/utils/storage.dart';
 import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -35,6 +36,10 @@ const List<String> kMpvDiagKeys = <String>[
 
 const String kDiagPlaybackFile = 'diag_playback.log';
 
+/// PiP 轻量模式的持久化 key。放在 diag_probe 里是因为它属于诊断 A/B 开关，
+/// 不额外扩展全局设置键表。
+const String _kPipLiteModeKey = 'douyinPipLiteMode';
+
 /// 起播 3 秒后仍 position>0，才开始判断是否黑屏嫌疑。
 const int _blackScreenCheckMs = 3000;
 
@@ -61,6 +66,21 @@ abstract final class DiagProbe {
 
   static Future<Directory> _docDir() =>
       _documentsDir ??= getApplicationDocumentsDirectory();
+
+  /// 诊断：PiP 轻量模式。默认开启；关闭后回到源分辨率渲染路径，便于 A/B。
+  static bool get pipLiteMode {
+    try {
+      return GStorage.setting.get(_kPipLiteModeKey, defaultValue: true);
+    } catch (_) {
+      return true;
+    }
+  }
+
+  static Future<void> setPipLiteMode(bool value) async {
+    try {
+      await GStorage.setting.put(_kPipLiteModeKey, value);
+    } catch (_) {}
+  }
 
   /// 一次读取当前播放器的 mpv 指标、position 与 textureId。
   ///
@@ -138,6 +158,12 @@ abstract final class DiagProbe {
     if (!kDiagEnabled) return;
     _sampleTimer?.cancel();
     _sampleTimer = null;
+  }
+
+  /// 写一条 `diag_event`，用于记录 Dart 主 isolate 的卡顿等一次性事件。
+  static void event(String event, [Map<String, Object?> fields = const {}]) {
+    if (!kDiagEnabled) return;
+    _append('diag_event', <String, Object?>{'event': event, ...fields});
   }
 
   /// 记录一次 [_open] 的起点。旧 textureId 由调用方在 setDataSource 前读取。

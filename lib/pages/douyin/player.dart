@@ -154,6 +154,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// timebase 停在 0，老机型会把后续帧当成重复帧，画中画卡在第一帧。
   Timer? _pipTicker;
 
+  /// 上一次 ticker 触发的墙钟时间，用来量化 Dart 主 isolate 的卡顿。
+  int _lastPipTickMs = 0;
+
+  /// PiP 轻量模式的本地镜像。持久化是异步的，开关回调若再从 DiagProbe
+  /// 读值会和落盘抢时序；这里以本地值为准，再异步写回。
+  late bool _pipLite = DiagProbe.pipLiteMode;
+
+  /// 直接推 PiP 轻量模式，不改 `IOSPipHelper` 的公共签名。
+  static const MethodChannel _pipChannel = MethodChannel(
+    'com.example.piliplus/pip',
+  );
+
   QueueEntry get _current => _queue[_index];
 
   @override
@@ -582,7 +594,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     // 手动按钮立即启动画中画并退后台，和 B 站播放页一致；autoEnter 只 arm
     // 不 start，用户点了按钮却留在前台会看起来什么都没发生。
     _player.enterPip(autoEnter: false);
+    // 必须先 enter 再 update：PipSession 还不存在时 update 会被原生直接丢掉。
+    unawaited(_pushPipLiteMode());
     _publishPipState();
+  }
+
+  Future<void> _pushPipLiteMode([bool? value]) async {
+    try {
+      await _pipChannel.invokeMethod<void>('update', <String, Object>{
+        'pipLite': value ?? _pipLite,
+      });
+    } catch (_) {}
   }
 
   /// 诊断包专用：把 Documents 里的 trace / 采样打成 zip 并弹系统分享面板。
@@ -598,6 +620,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   /// 才会前进；只在进入画中画时推一次的话，老机型依旧会卡帧。
   void _startPipTicker() {
     _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      if (_lastPipTickMs != 0) {
+        final gapMs = nowMs - _lastPipTickMs;
+        if (gapMs > 300) {
+          DiagProbe.event('ticker-gap', <String, Object?>{
+            'gapMs': gapMs,
+            'intervalMs': 500,
+          });
+        }
+      }
+      _lastPipTickMs = nowMs;
       _publishPipState();
     });
   }
@@ -605,6 +638,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
   void _stopPipTicker() {
     _pipTicker?.cancel();
     _pipTicker = null;
+    _lastPipTickMs = 0;
   }
 
   /// 字段形状与 pl_player 的 `_iosPipState()` 对齐；position/duration 用毫秒。
@@ -617,6 +651,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
       'position': positionMs ?? _player.positionInMilliseconds,
       'duration': _player.durationInMilliseconds,
       'speed': _player.playbackSpeed,
+      'pipLite': _pipLite,
     });
   }
 
@@ -980,6 +1015,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     if (controller == null) {
       return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
+    final video = RepaintBoundary(
+      child: FittedBox(
+        fit: BoxFit.contain,
+        alignment: Alignment.center,
+        child: SimpleVideo(
+          controller: controller,
+          fill: Colors.black,
+          aspectRatio: null,
+        ),
+      ),
+    );
     return GestureDetector(
       // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
       //
@@ -1018,20 +1064,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
           // videoFit 在竖屏下的 BoxFit.contain 一致；aspectRatio 传 null
           // 表示按 texture 实际像素比（上游是 videoFit.aspectRatio，抖音这
           // 条没有外部画质偏好，用真实比例最稳，避免拉伸）。
-          child: RotatedBox(
-            quarterTurns: _quarterTurns,
-            child: RepaintBoundary(
-              child: FittedBox(
-                fit: BoxFit.contain,
-                alignment: Alignment.center,
-                child: SimpleVideo(
-                  controller: controller,
-                  fill: Colors.black,
-                  aspectRatio: null,
-                ),
-              ),
-            ),
-          ),
+          //
+          // 没旋转时不要再套 RotatedBox：它会给子树多一层 render object，
+          // 每帧都要参与变换。轻量模式下这层完全省掉，需要旋转时才加回来。
+          child: _pipLite && _quarterTurns == 0
+              ? video
+              : RotatedBox(quarterTurns: _quarterTurns, child: video),
         ),
       ),
     );
@@ -1665,6 +1703,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
                     _toggleShuffle();
                     setSheetState(() {});
                   },
+                  onPipLite: (value) {
+                    setState(() => _pipLite = value);
+                    unawaited(DiagProbe.setPipLiteMode(value));
+                    unawaited(_pushPipLiteMode(value));
+                    setSheetState(() {});
+                  },
                 );
             }
             return SafeArea(top: false, child: body);
@@ -1679,6 +1723,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
     required VoidCallback onVolume,
     required VoidCallback onRotate,
     required VoidCallback onShuffle,
+    required ValueChanged<bool> onPipLite,
   }) {
     return SingleChildScrollView(
       child: Column(
@@ -1725,6 +1770,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage> {
               Navigator.of(context).pop();
               unawaited(_enterPip());
             },
+          ),
+          SwitchListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            secondary: const Icon(
+              Icons.picture_in_picture_alt_outlined,
+              size: 20,
+              color: Colors.white70,
+            ),
+            title: const Text(
+              '诊断：PiP 轻量模式',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            subtitle: const Text(
+              '按窗口分辨率渲染并跳过 RotatedBox',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+            value: _pipLite,
+            activeThumbColor: Colors.lightBlueAccent,
+            onChanged: onPipLite,
           ),
           if (kDiagEnabled)
             _sheetTile(
