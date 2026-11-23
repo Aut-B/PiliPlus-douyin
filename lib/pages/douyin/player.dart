@@ -163,6 +163,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
   Timer? _chromeTimer;
 
+  /// 播放页内嵌面板。评论 / 画质 / 更多都走这一层，不再开 Navigator 路由：
+  /// 这条页面是 `Get.to` 推进来的，`showModalBottomSheet` / `PopupMenuButton`
+  /// 生成的 overlay 在 iOS 真机上点开看不到（表现为「按钮按不动」）。
+  _PlayerPanel? _panel;
+
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
       ValueNotifier<_GestureHint?>(null);
@@ -1530,8 +1535,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     return PopScope(
       // 系统返回手势 / 安卓返回键也要走收尾。注意这里是同步触发，
       // 不阻塞 pop，避免手势退出时同样被原生回调拖住。
+      // 面板打开时先关面板，不直接退页。
+      canPop: _panel == null,
       onPopInvokedWithResult: (didPop, _) {
-        if (didPop) unawaited(_shutdown());
+        if (didPop) {
+          unawaited(_shutdown());
+        } else {
+          _closePanel();
+        }
       },
       child: Scaffold(
         backgroundColor: Colors.black,
@@ -1627,6 +1638,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                   ),
                 ),
               ),
+            if (_panel != null) _panelOverlay(),
           ],
         ),
       ),
@@ -2097,7 +2109,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                   Icons.more_vert_outlined,
                   color: Colors.white,
                 ),
-                onTap: () => unawaited(_showMoreSheet()),
+                onTap: () => _openPanel(_PlayerPanel.more),
                 tooltip: '更多设置',
               ),
             ],
@@ -2191,7 +2203,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 ),
               ),
               const SizedBox(width: 4),
-              // 右侧六个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              // 右侧四个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
               Expanded(
                 child: Align(
                   alignment: Alignment.centerRight,
@@ -2200,7 +2212,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        _speedButton(),
                         _qualityButton(),
                         ComBtn(
                           icon: const Icon(
@@ -2208,29 +2219,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                             color: Colors.white,
                             size: 20,
                           ),
-                          onTap: () => unawaited(_showCommentsSheet()),
+                          onTap: () => _openPanel(_PlayerPanel.comments),
                           tooltip: '评论',
                           width: 30,
                           height: 30,
                         ),
-                        Obx(() {
-                          final volume = _player.volume.value;
-                          return ComBtn(
-                            icon: Icon(
-                              volume <= 0
-                                  ? Icons.volume_off
-                                  : volume < 0.5
-                                  ? Icons.volume_down
-                                  : Icons.volume_up,
-                              color: Colors.white,
-                              size: 20,
-                            ),
-                            onTap: _showVolumeSheet,
-                            tooltip: '音量',
-                            width: 30,
-                            height: 30,
-                          );
-                        }),
                         ComBtn(
                           icon: const Icon(
                             Icons.screen_rotation_alt,
@@ -2248,7 +2241,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                             color: Colors.white,
                             size: 20,
                           ),
-                          onTap: () => unawaited(_showMoreSheet()),
+                          onTap: () => _openPanel(_PlayerPanel.more),
                           tooltip: '更多设置',
                           width: 30,
                           height: 30,
@@ -2265,70 +2258,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  Widget _speedButton() {
-    return Obx(
-      () => PopupMenuButton<double>(
-        tooltip: '倍速',
-        requestFocus: false,
-        padding: EdgeInsets.zero,
-        initialValue: _player.playbackSpeed,
-        color: Colors.black.withValues(alpha: 0.8),
-        onSelected: (speed) => unawaited(_player.setPlaybackSpeed(speed)),
-        itemBuilder: (context) => _player.speedList
-            .map(
-              (speed) => PopupMenuItem<double>(
-                height: 35,
-                padding: const EdgeInsets.only(left: 30),
-                value: speed,
-                child: Text(
-                  '${speed}X',
-                  style: const TextStyle(color: Colors.white, fontSize: 13),
-                ),
-              ),
-            )
-            .toList(),
-        child: SizedBox(
-          width: 34,
-          height: 30,
-          child: Center(
-            child: Text(
-              '${_player.playbackSpeed}X',
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   /// 抖音/TikTok 的播放地址没有清晰度字段，这里不伪造档位：显示当前值
-  /// 「默认」并置灰，点开只说明原因。
+  /// 「默认」，点开用页内面板说明原因。之前用 PopupMenuButton，菜单路由
+  /// 在这条页面里弹不出来，用户看到的就是「按不动」。
   Widget _qualityButton() {
-    return PopupMenuButton<int>(
-      tooltip: '画质',
-      requestFocus: false,
-      padding: EdgeInsets.zero,
-      color: Colors.black.withValues(alpha: 0.8),
-      itemBuilder: (context) => const [
-        PopupMenuItem<int>(
-          enabled: false,
-          height: 35,
-          child: Text(
-            '接口未提供分辨率',
-            style: TextStyle(color: Colors.white54, fontSize: 12),
-          ),
-        ),
-      ],
-      child: const SizedBox(
-        width: 34,
-        height: 30,
-        child: Center(
-          child: Text(
-            '默认',
-            style: TextStyle(color: Colors.white54, fontSize: 12),
-          ),
+    return ComBtn(
+      icon: const Center(
+        child: Text(
+          '默认',
+          style: TextStyle(color: Colors.white70, fontSize: 12),
         ),
       ),
+      onTap: () => _openPanel(_PlayerPanel.quality),
+      tooltip: '画质',
+      width: 40,
+      height: 30,
     );
   }
 
@@ -2355,25 +2299,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     });
   }
 
-  Widget _sheetHeader(String title, {VoidCallback? onBack}) {
+  Widget _sheetHeader(String title) {
     return SizedBox(
       height: 44,
       child: Row(
         children: [
-          if (onBack != null)
-            IconButton(
-              onPressed: onBack,
-              icon: const Icon(
-                Icons.arrow_back_ios_new,
-                size: 16,
-                color: Colors.white70,
-              ),
-            )
-          else
-            const SizedBox(width: 16),
+          const SizedBox(width: 16),
           Text(
             title,
             style: const TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          const Spacer(),
+          IconButton(
+            onPressed: _closePanel,
+            icon: const Icon(Icons.close, size: 18, color: Colors.white54),
+            tooltip: '关闭',
           ),
         ],
       ),
@@ -2384,24 +2324,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     required IconData icon,
     required String title,
     String? subtitle,
-    bool enabled = true,
     VoidCallback? onTap,
   }) {
     return ListTile(
       dense: true,
-      enabled: enabled,
       onTap: onTap,
-      leading: Icon(
-        icon,
-        size: 20,
-        color: enabled ? Colors.white70 : Colors.white24,
-      ),
+      leading: Icon(icon, size: 20, color: Colors.white70),
       title: Text(
         title,
-        style: TextStyle(
-          color: enabled ? Colors.white : Colors.white38,
-          fontSize: 14,
-        ),
+        style: const TextStyle(color: Colors.white, fontSize: 14),
       ),
       subtitle: subtitle == null
           ? null
@@ -2419,231 +2350,174 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 评论入口。
+  /// 打开页内面板。评论 / 画质 / 更多共用这一层。
+  void _openPanel(_PlayerPanel panel) {
+    _chromeTimer?.cancel();
+    setState(() => _panel = panel);
+  }
+
+  void _closePanel() {
+    if (_panel == null) return;
+    setState(() => _panel = null);
+    _scheduleChromeHide();
+  }
+
+  /// 页内面板：半透明遮罩 + 底部卡片。
   ///
-  /// 抖音 / TikTok 的收藏抓取接口只返回视频元数据，没有评论列表；B 站播放页
-  /// 那个「发弹幕」的位置在这里换成评论，但没有数据时只显示「暂无评论」，
-  /// 不编造、也不额外请求接口。
-  Future<void> _showCommentsSheet() {
-    final entry = _current;
-    final platform =
-        ShortVideoPlatform.fromId(entry.short?.platform) ??
-        ShortVideoPlatform.douyin;
-    return showModalBottomSheet<void>(
-      context: context,
-      useRootNavigator: true,
-      backgroundColor: const Color(0xFF1A1A1A),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
-      ),
-      builder: (_) => SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _sheetHeader('评论'),
-              const SizedBox(height: 6),
-              Text(
-                entry.title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-              const SizedBox(height: 20),
-              const Icon(
-                Icons.chat_bubble_outline,
-                size: 32,
-                color: Colors.white24,
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                '暂无评论',
-                style: TextStyle(color: Colors.white70, fontSize: 14),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '${platform.album}的收藏接口不返回评论数据，'
-                '这里只显示本地能拿到的内容。',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white38, fontSize: 11),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _showVolumeSheet() {
-    showModalBottomSheet<void>(
-      context: context,
-      useRootNavigator: true,
-      backgroundColor: const Color(0xFF1A1A1A),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
-      ),
-      builder: (_) => StatefulBuilder(
-        builder: (context, setSheetState) => SafeArea(
-          top: false,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _sheetHeader('音量'),
-              _volumeBody(setSheetState: setSheetState),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _volumeBody({required StateSetter setSheetState}) {
-    final max = _player.maxVolume;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+  /// 不用 `showModalBottomSheet`：这条页面是 `Get.to` 推进来的，弹层路由
+  /// 在 iOS 真机上不可见，评论/画质/更多三个入口全部表现为「按不动」。
+  /// 放进同一个 Stack 后，面板和控件同一条合成链，点击必定有反馈。
+  Widget _panelOverlay() {
+    final panel = _panel;
+    if (panel == null) return const SizedBox.shrink();
+    final Widget body = switch (panel) {
+      _PlayerPanel.comments => _commentsPanelBody(),
+      _PlayerPanel.more => _morePanelBody(),
+      _PlayerPanel.quality => _qualityPanelBody(),
+    };
+    return Positioned.fill(
+      child: Stack(
         children: [
-          Row(
-            children: [
-              const Text(
-                '媒体音量',
-                style: TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-              const Spacer(),
-              Text(
-                '${(_volume * 100).round()}%',
-                style: const TextStyle(color: Colors.white, fontSize: 13),
-              ),
-            ],
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _closePanel,
+              child: const ColoredBox(color: Color(0x99000000)),
+            ),
           ),
-          Slider(
-            value: _volume.clamp(0.0, max).toDouble(),
-            max: max,
-            activeColor: Colors.white,
-            inactiveColor: Colors.white24,
-            onChanged: (value) {
-              _volume = value;
-              unawaited(_player.setVolume(value, showIndicator: false));
-              setSheetState(() {});
-            },
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+              ),
+              child: Material(
+                color: const Color(0xFF1A1A1A),
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(14),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: SafeArea(top: false, child: body),
+              ),
+            ),
           ),
         ],
       ),
     );
   }
 
-  Future<void> _showMoreSheet() {
-    return showModalBottomSheet<void>(
-      context: context,
-      useRootNavigator: true,
-      backgroundColor: const Color(0xFF1A1A1A),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(14)),
+  /// 评论入口。
+  ///
+  /// 抖音 / TikTok 的收藏抓取接口只返回视频元数据，没有评论列表；B 站播放页
+  /// 那个「发弹幕」的位置在这里换成评论，但没有数据时只显示「暂无评论」，
+  /// 不编造、也不额外请求接口。
+  Widget _commentsPanelBody() {
+    final entry = _current;
+    final platform =
+        ShortVideoPlatform.fromId(entry.short?.platform) ??
+        ShortVideoPlatform.douyin;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('评论'),
+          const SizedBox(height: 6),
+          Text(
+            entry.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 20),
+          const Icon(
+            Icons.chat_bubble_outline,
+            size: 32,
+            color: Colors.white24,
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '暂无评论',
+            style: TextStyle(color: Colors.white70, fontSize: 14),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '${platform.album}的收藏接口不返回评论数据，'
+            '这里只显示本地能拿到的内容。',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+        ],
       ),
-      builder: (_) {
-        // 0 = 更多设置，1 = 倍速，2 = 音量。子页留在同一个 sheet 里，
-        // 避免「关一个再开一个」时和路由动画打架。
-        var page = 0;
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            final Widget body;
-            switch (page) {
-              case 1:
-                body = _speedListBody(
-                  onBack: () => setSheetState(() => page = 0),
-                );
-              case 2:
-                body = Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _sheetHeader(
-                      '音量',
-                      onBack: () => setSheetState(() => page = 0),
-                    ),
-                    _volumeBody(setSheetState: setSheetState),
-                  ],
-                );
-              default:
-                body = _moreListBody(
-                  onSpeed: () => setSheetState(() => page = 1),
-                  onVolume: () => setSheetState(() => page = 2),
-                  onRotate: () {
-                    _rotateVideo();
-                    setSheetState(() {});
-                  },
-                  onShuffle: () {
-                    _toggleShuffle();
-                    setSheetState(() {});
-                  },
-                  onPipLite: (value) {
-                    setState(() => _pipLite = value);
-                    unawaited(DiagProbe.setPipLiteMode(value));
-                    unawaited(_pushPipLiteMode(value));
-                    setSheetState(() {});
-                  },
-                );
-            }
-            return SafeArea(top: false, child: body);
-          },
-        );
-      },
     );
   }
 
-  Widget _moreListBody({
-    required VoidCallback onSpeed,
-    required VoidCallback onVolume,
-    required VoidCallback onRotate,
-    required VoidCallback onShuffle,
-    required ValueChanged<bool> onPipLite,
-  }) {
+  /// 画质：接口没有档位，只显示当前实际使用的「默认」，点开说明原因。
+  Widget _qualityPanelBody() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('画质'),
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(
+              Icons.check,
+              size: 20,
+              color: Colors.lightBlueAccent,
+            ),
+            title: const Text(
+              '默认',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            subtitle: const Text(
+              '收藏接口只返回播放地址，不提供分辨率档位，'
+              '当前按源地址的默认清晰度播放。',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+          ),
+          const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
+
+  /// 更多设置面板。
+  ///
+  /// 倍速和音量入口已按用户要求移除：音量用视频区上下滑动调节，
+  /// 倍速不再在播放页暴露。画质项改为可点，打开同一套页内画质说明。
+  Widget _morePanelBody() {
     return SingleChildScrollView(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           _sheetHeader('更多设置'),
           _sheetTile(
-            icon: Icons.speed,
-            title: '倍速',
-            subtitle: '${_player.playbackSpeed}X',
-            onTap: onSpeed,
-          ),
-          _sheetTile(
             icon: Icons.high_quality_outlined,
             title: '画质',
             subtitle: '默认 · 接口未提供分辨率',
-            enabled: false,
-          ),
-          _sheetTile(
-            icon: Icons.volume_up_outlined,
-            title: '音量',
-            subtitle: '${(_volume * 100).round()}%',
-            onTap: onVolume,
+            onTap: () => _openPanel(_PlayerPanel.quality),
           ),
           _sheetTile(
             icon: Icons.screen_rotation_alt,
             title: '画面旋转',
             subtitle: '${_quarterTurns * 90}°',
-            onTap: onRotate,
+            onTap: _rotateVideo,
           ),
           _sheetTile(
             icon: _shuffle ? Icons.shuffle : Icons.swap_vert,
             title: '播放模式',
             subtitle: _shuffle ? '随机播放' : '顺序播放',
-            onTap: onShuffle,
+            onTap: _toggleShuffle,
           ),
           _sheetTile(
             icon: Icons.picture_in_picture_alt_outlined,
             title: '画中画',
             onTap: () {
-              // 关掉的是这一层的 sheet，不能靠 Get.back 猜栈顶：
-              // bottom sheet 现在挂在 root navigator 上，Get.back 在有别的
-              // 路由叠着时可能关错页面。
-              Navigator.of(context).pop();
+              _closePanel();
               unawaited(_enterPip());
             },
           ),
@@ -2665,7 +2539,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             ),
             value: _pipLite,
             activeThumbColor: Colors.lightBlueAccent,
-            onChanged: onPipLite,
+            onChanged: (value) {
+              setState(() => _pipLite = value);
+              unawaited(DiagProbe.setPipLiteMode(value));
+              unawaited(_pushPipLiteMode(value));
+            },
           ),
           if (kDiagEnabled)
             _sheetTile(
@@ -2673,7 +2551,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               title: '导出诊断',
               subtitle: 'pip_trace / 播放采样 / rootscan',
               onTap: () {
-                Navigator.of(context).pop();
+                _closePanel();
                 unawaited(_exportDiagnostics());
               },
             ),
@@ -2682,53 +2560,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       ),
     );
   }
-
-  Widget _speedListBody({required VoidCallback onBack}) {
-    return SizedBox(
-      height: 300,
-      child: Column(
-        children: [
-          _sheetHeader('倍速', onBack: onBack),
-          Expanded(
-            child: Obx(
-              () => ListView.builder(
-                itemCount: _player.speedList.length,
-                itemBuilder: (context, index) {
-                  final speed = _player.speedList[index];
-                  final selected = _player.playbackSpeed == speed;
-                  return ListTile(
-                    dense: true,
-                    onTap: () {
-                      unawaited(_player.setPlaybackSpeed(speed));
-                      // 同上：只关这一层 sheet，不用 Get.back 猜栈顶。
-                      Navigator.of(context).pop();
-                    },
-                    title: Text(
-                      '${speed}X',
-                      style: TextStyle(
-                        color: selected ? Colors.lightBlueAccent : Colors.white,
-                        fontSize: 14,
-                      ),
-                    ),
-                    trailing: selected
-                        ? const Icon(
-                            Icons.check,
-                            size: 18,
-                            color: Colors.lightBlueAccent,
-                          )
-                        : null,
-                  );
-                },
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 enum _SwipeTarget { brightness, volume }
+
+/// 播放页内嵌面板的类型。
+enum _PlayerPanel { comments, more, quality }
 
 /// 进度条与时间文本的局部状态。单位是秒，和 `PlPlayerController` 的
 /// `position/duration/buffered` 保持一致。
