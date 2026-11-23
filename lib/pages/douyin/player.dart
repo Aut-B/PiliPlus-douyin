@@ -212,6 +212,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   bool _recovering = false;
   int _autoRecoverCount = 0;
   int _recoverStreak = 0;
+  /// 自动连播（复用同一 texture）累计条数；每 [_autoRebuildInterval] 条
+  /// 主动整实例重建一次，避免 texture/解码器长期复用累积劣化。
+  int _autoPlaysSinceRebuild = 0;
 
   /// 当前这次 [_open] 的起点，用来识别卡住的 opening 标志。
   int _openStartedAtMs = 0;
@@ -231,6 +234,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 继续挂定时器只会无限自旋。此时停表并留日志，等下一次用户切条按
   /// [_staleOpenMs] 复位。
   static const int _maxWatchdogOpenBusyRetries = 8;
+
+  /// 首帧看门狗首次检查的时点。常规首帧 ~2s 出，给一点余量在 ~2.8s
+  /// 判定；彻底不来时尽早重建恢复画面，不再让用户盯 8 秒黑屏。
+  static const int _firstFrameWatchdogMs = 2800;
+
+  /// 自动连播每 N 条主动重建一次 player/texture。手动选播 = 完整重建
+  /// 能恢复，说明重建有效；这里提前做，防止累积到黑屏才被动救。
+  static const int _autoRebuildInterval = 20;
 
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
@@ -663,6 +674,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       DiagProbe.playItem(key: entry.key);
       _isPlaying.value = _player.playerStatus.isPlaying;
       _notePlayed(entry.key);
+      // 只统计自动连播（复用同一 texture）的条数；手动切播/自愈重建不计数。
+      if (source == 'auto') _autoPlaysSinceRebuild++;
       _prefetchNext();
       // videoController 是本次 setDataSource 才建出来的，必须重建一次把
       // 加载圈换成画面。这是一次切换一次，不是按帧刷新。
@@ -869,7 +882,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _watchdogStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     _watchdogOpenBusyRetries = 0;
     _firstFrameWatchdog = Timer(
-      const Duration(milliseconds: 2500),
+      const Duration(milliseconds: _firstFrameWatchdogMs),
       () => _onFirstFrameWatchdog(session),
     );
   }
@@ -937,8 +950,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       });
       return;
     }
-    if (_appPaused || IOSPipHelper.isActive) {
-      // 回前台后再补一次判定；后台不重建播放器，交给 C23 的原生 PiP。
+    // 只在真正后台（appPaused=true 且非 PiP 活跃）才跳过重建。前台即便
+    // 正在 PiP（pipActive=true）也要完整重建——build58 诊断显示此前
+    // pipActive=true 且 appPaused=false 时也被这里跳过，导致黑屏只有声音
+    // 不自愈。真正后台的 PiP 保活由 C23 原生侧处理，这里不碰；回前台补
+    // 判定由 didChangeAppLifecycleState 的 resumed 分支负责。
+    if (_appPaused && !IOSPipHelper.isActive) {
       DiagProbe.event('auto-recover-skipped', <String, Object?>{
         'index': _watchdogIndex,
         'source': _watchdogSource,
@@ -985,6 +1002,64 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
+  /// 整实例重建：dispose 当前 player/texture，重新 getInstance 并挂监听，
+  /// 再以 [openSource] 重开 [index]。返回 true 表示重建（含重开）已执行。
+  ///
+  /// 调用方负责：置 [_recovering] / 取消看门狗 / 写 'auto-recover' 起点日志；
+  /// 这里只做"拆 + 重建 + 重开"的机械动作，供首帧自愈和定期主动重建共用。
+  Future<bool> _rebuildPlayerInstance({
+    required int index,
+    required String reason,
+    required String openSource,
+    required int retry,
+  }) async {
+    final sw = Stopwatch()..start();
+    var disposeCalls = 0;
+    try {
+      _detachPlayerListeners();
+      _lastPositionTickMs = 0;
+      try {
+        // 单例按引用计数管理：若别的页面还持有旧实例，第一次 dispose 只会
+        // 减计数、不拆 texture，自愈就退化成「同一个实例再 open 一次」，
+        // 黑屏救不回来。这里补调用到引用计数归零（_instance 置空为标志），
+        // 最多 8 次，避免异常状态下无限拆。
+        while (disposeCalls < 8 && PlPlayerController.instance != null) {
+          _player.dispose();
+          disposeCalls++;
+        }
+      } catch (_) {}
+      if (!mounted || _disposed || _leaving) return false;
+      final instanceCleared = PlPlayerController.instance == null;
+      _player = PlPlayerController.getInstance();
+      _attachPlayerListeners();
+      _progress.value = const _PlaybackProgress();
+      sw.stop();
+      DiagProbe.event('auto-recover-rebuilt', <String, Object?>{
+        'index': index,
+        'reason': reason,
+        'disposeMs': sw.elapsedMilliseconds,
+        'disposeCalls': disposeCalls,
+        'instanceCleared': instanceCleared,
+        'textureId': _player.videoController?.id.value,
+        'retry': retry,
+      });
+      // 任何一次整实例重建都把连播计数归零，下一轮从 1 开始计。
+      _autoPlaysSinceRebuild = 0;
+      await _open(index, source: openSource, force: true);
+      return true;
+    } catch (error) {
+      DiagProbe.event('auto-recover-failed', <String, Object?>{
+        'index': index,
+        'reason': reason,
+        'error': '$error',
+      });
+      return false;
+    } finally {
+      _recovering = false;
+      _consumePendingOpen();
+    }
+  }
+
   /// 首帧超时的自愈：整实例重建，等价于用户去播放列表里手动选这一条。
   ///
   /// 连播约 30 条后旧 player/texture 会进入「有声音没画面」的状态，单靠
@@ -996,7 +1071,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }) async {
     if (_recovering) return;
     if (_disposed || _leaving || _opening) return;
-    if (_appPaused || IOSPipHelper.isActive) {
+    // 同看门狗守卫：只在真正后台（非 PiP 活跃）才跳过；前台 PiP 也要重建。
+    if (_appPaused && !IOSPipHelper.isActive) {
       DiagProbe.event('auto-recover-skipped', <String, Object?>{
         'index': _index,
         'reason': 'app-paused-or-pip',
@@ -1029,44 +1105,41 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'textureId': _player.videoController?.id.value,
       'retry': attempt,
     });
-    final sw = Stopwatch()..start();
-    var disposeCalls = 0;
-    try {
-      _detachPlayerListeners();
-      _lastPositionTickMs = 0;
-      try {
-        // 单例按引用计数管理：若别的页面还持有旧实例，第一次 dispose 只会
-        // 减计数、不拆 texture，自愈就退化成「同一个实例再 open 一次」，
-        // 黑屏救不回来。这里补调用到引用计数归零（_instance 置空为标志），
-        // 最多 8 次，避免异常状态下无限拆。
-        while (disposeCalls < 8 && PlPlayerController.instance != null) {
-          _player.dispose();
-          disposeCalls++;
-        }
-      } catch (_) {}
-      if (!mounted || _disposed || _leaving) return;
-      final instanceCleared = PlPlayerController.instance == null;
-      _player = PlPlayerController.getInstance();
-      _attachPlayerListeners();
-      _progress.value = const _PlaybackProgress();
-      sw.stop();
-      DiagProbe.event('auto-recover-rebuilt', <String, Object?>{
-        'index': index,
-        'disposeMs': sw.elapsedMilliseconds,
-        'disposeCalls': disposeCalls,
-        'instanceCleared': instanceCleared,
-        'textureId': _player.videoController?.id.value,
-      });
-      await _open(index, source: 'auto-recover', force: true);
-    } catch (error) {
-      DiagProbe.event('auto-recover-failed', <String, Object?>{
-        'index': index,
-        'error': '$error',
-      });
-    } finally {
-      _recovering = false;
-      _consumePendingOpen();
-    }
+    await _rebuildPlayerInstance(
+      index: index,
+      reason: 'no-first-frame',
+      openSource: 'auto-recover',
+      retry: attempt,
+    );
+  }
+
+  /// 自动连播复用同一 texture，每 [_autoRebuildInterval] 条主动整实例重建一次，
+  /// 避免 texture/解码器长期复用累积劣化（手动选播 = 完整重建能恢复，说明重建有效）。
+  /// 在 [_next] 准备自动下一条前调用；返回 true 表示已重建并重开，调用方不要再 open。
+  Future<bool> _maybeAutoRebuildBeforeNext(int nextIndex) async {
+    if (_autoPlaysSinceRebuild < _autoRebuildInterval) return false;
+    if (_recovering || _disposed || _leaving || _opening) return false;
+    // 真正后台（非 PiP 活跃）不主动拆播放器，交给 C23 原生 PiP 保活。
+    if (_appPaused && !IOSPipHelper.isActive) return false;
+    _recovering = true;
+    _completionArmed = false;
+    _cancelFirstFrameWatchdog();
+    final attempt = ++_autoRecoverCount;
+    DiagProbe.event('auto-recover', <String, Object?>{
+      'index': nextIndex,
+      'reason': 'proactive-rebuild',
+      'source': 'auto',
+      'sinceRebuild': _autoPlaysSinceRebuild,
+      'textureId': _player.videoController?.id.value,
+      'retry': attempt,
+    });
+    await _rebuildPlayerInstance(
+      index: nextIndex,
+      reason: 'proactive-rebuild',
+      openSource: 'auto',
+      retry: attempt,
+    );
+    return true;
   }
 
   void _notePlayed(String key) {
@@ -1183,6 +1256,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (!_shuffle) {
       final next = (_index + 1) % _queue.length;
       _diagSwitchRequest(source, next);
+      if (source == 'auto' && await _maybeAutoRebuildBeforeNext(next)) return;
       await _open(next, source: source);
       return;
     }
@@ -1193,11 +1267,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       final index = _queue.indexWhere((e) => e.key == key);
       if (index < 0) continue;
       _diagSwitchRequest(source, index);
+      if (source == 'auto' && await _maybeAutoRebuildBeforeNext(index)) return;
       await _open(index, source: source);
       return;
     }
     final fallback = (_index + 1) % _queue.length;
     _diagSwitchRequest(source, fallback);
+    if (source == 'auto' && await _maybeAutoRebuildBeforeNext(fallback)) return;
     await _open(fallback, source: source);
   }
 
