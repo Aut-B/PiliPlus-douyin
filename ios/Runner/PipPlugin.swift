@@ -244,6 +244,8 @@ private final class PipSession: NSObject {
   private var lastOutputHash: UInt32 = 0
   private var hasOutputHash = false
   private var verdictWritten = false
+  /// 只在兜底渲染尺寸变化时写一次，避免每帧刷屏。
+  private var lastFallbackLogSignature = ""
 
   init(textureId: Int64, sendEvent: @escaping (String, Any?) -> Void) {
     let sourceView = SampleBufferView()
@@ -507,7 +509,8 @@ private final class PipSession: NSObject {
     let generation = frameGeneration
     // didTransitionToRenderSize 在部分机型上一直给 0；轻量模式退化为
     // 按 sourceView 的视频区域尺寸渲染，避免每帧按源分辨率做 NV12→BGRA。
-    let fallbackRenderSize = sourceView.bounds.size
+    // bounds 为 0 时依次退到父视图 / 宿主窗口，全部取不到才放弃缩放。
+    let fallbackRenderSize = Self.fallbackRenderSize(for: sourceView)
     // A blocked copy/render/enqueue would otherwise leave the flag set and
     // silently drop every later frame without a trace.
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -604,18 +607,24 @@ private final class PipSession: NSObject {
     // 轻量模式优先用 PiP 窗口尺寸；didTransition 一直给 0 时退化为
     // sourceView 的视频区域尺寸（点），让每帧最多只渲染窗口像素。
     var target = CGSize.zero
+    var usedFallback = false
     if pipLiteMode {
-      target =
-        renderSize.width > 0 && renderSize.height > 0
-        ? renderSize : fallbackRenderSize
+      if renderSize.width > 0 && renderSize.height > 0 {
+        target = renderSize
+      } else {
+        target = fallbackRenderSize
+        usedFallback = true
+      }
     } else if renderSize.width > 0 && renderSize.height > 0 {
       target = renderSize
     }
     var scale = min(1, Self.maxDimension / max(sourceWidth, sourceHeight))
     if target.width > 0 && target.height > 0 {
+      // 等比缩放到窗口内（contain）：取两个方向的较小比例，避免为了
+      // 铺满一边把另一边也放大，输出像素反而超过窗口尺寸。
       scale = min(
         scale,
-        max(target.width / sourceWidth, target.height / sourceHeight)
+        min(target.width / sourceWidth, target.height / sourceHeight)
       )
     }
     let size = CGSize(
@@ -624,6 +633,19 @@ private final class PipSession: NSObject {
     )
     outputWidth = Int(size.width)
     outputHeight = Int(size.height)
+    if usedFallback && target.width > 0 && target.height > 0 {
+      let signature =
+        "\(Int(target.width))x\(Int(target.height))->"
+        + "\(outputWidth)x\(outputHeight)"
+      if signature != lastFallbackLogSignature {
+        lastFallbackLogSignature = signature
+        PipTrace.log(
+          "fallback-render: target=\(Int(target.width))x\(Int(target.height)) "
+            + "src=\(Int(sourceWidth))x\(Int(sourceHeight)) "
+            + "out=\(outputWidth)x\(outputHeight) lite=\(pipLiteMode ? 1 : 0)"
+        )
+      }
+    }
     sizeMs = (CFAbsoluteTimeGetCurrent() - started) * 1000
 
     let poolStarted = CFAbsoluteTimeGetCurrent()
@@ -923,6 +945,20 @@ private final class PipSession: NSObject {
       .flatMap(\.windows)
     return windows.first { $0.rootViewController is FlutterViewController }
       ?? windows.first { $0.isKeyWindow }
+  }
+
+  /// 兜底渲染尺寸：sourceView 自己的 bounds 优先，依次退到父视图和宿主
+  /// 窗口。must be called on the main thread。
+  private static func fallbackRenderSize(for view: UIView) -> CGSize {
+    let candidates: [CGSize?] = [
+      view.bounds.size,
+      view.superview?.bounds.size,
+      hostWindow()?.bounds.size,
+    ]
+    for case let size? in candidates where size.width > 0 && size.height > 0 {
+      return size
+    }
+    return .zero
   }
 
   /// 宿主窗口总数。configure 后如果 sourceView 没进树，这里通常是 0 或

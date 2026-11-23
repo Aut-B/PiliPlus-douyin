@@ -126,6 +126,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   _SwipeTarget? _swipeTarget;
   double _swipeStartY = 0;
   double _swipeStartValue = 0;
+
   /// 拖动时每像素对应多少比例；开始拖的时候算一次，避免每帧查 MediaQuery。
   double _swipeRange = 1;
 
@@ -140,6 +141,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 横向拖动的起点/预览目标，单位毫秒。
   int _seekStartMs = 0;
   int _seekTargetMs = 0;
+
   /// 开始横拖时缓存的屏宽，避免拖动途中每帧查 MediaQuery。
   double _seekWidth = 0;
   bool _seekDragging = false;
@@ -159,6 +161,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   final ValueNotifier<_GestureHint?> _gestureHint =
       ValueNotifier<_GestureHint?>(null);
   Timer? _gestureHintTimer;
+
+  /// 播放状态单独驱动暂停/播放图标。
+  ///
+  /// playerStatus 是控制器上的普通字段，不是 Rx；以前每次播放/暂停都靠
+  /// `setState(() {})` 刷整页，切条和高频状态回调叠加时会放大主 isolate
+  /// 的重建量。这里只重建图标这一小块。
+  final ValueNotifier<bool> _isPlaying = ValueNotifier<bool>(false);
+
+  /// 下一条地址的预热：key + 进行中的解析任务。
+  ///
+  /// 自动连播的黑屏只有声音，主要是「上一条播完才开始解析下一条」。在本条
+  /// 起播成功后提前解析下一条，`_open` 命中时直接拿结果。
+  String? _prefetchKey;
+  Future<QueueMedia?>? _prefetchFuture;
+
+  /// 上一次 position 回调的墙钟时间，用来量化主 isolate 冻结。
+  int _lastPositionTickMs = 0;
+
+  /// `ui-block` 事件按 stage/step 限流，避免持续卡顿把日志刷爆。
+  final Map<String, int> _uiBlockLoggedAt = <String, int>{};
 
   /// 画中画状态推送的节拍器。
   ///
@@ -187,6 +209,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     WidgetsBinding.instance.addObserver(this);
     _player.addStatusLister(_onPlayerStatus);
     _statusListening = true;
+    _player.addPositionListener(_onPositionTick);
+    _isPlaying.value = _player.playerStatus.isPlaying;
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
     // 普通包头一行就会 return，不产生文件。
     DiagProbe.startSampling();
@@ -231,6 +255,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _gestureHintTimer?.cancel();
     _gestureHint.dispose();
+    _isPlaying.dispose();
     super.dispose();
   }
 
@@ -253,10 +278,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _disposed = true;
     DiagProbe.stop();
     _stopPipTicker();
+    _prefetchKey = null;
+    _prefetchFuture = null;
     if (_statusListening) {
       _statusListening = false;
       _player.removeStatusLister(_onPlayerStatus);
     }
+    try {
+      _player.removePositionListener(_onPositionTick);
+    } catch (_) {}
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
         IOSPipHelper.dispose();
@@ -330,10 +360,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       final entry = _queue[target];
       // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
       // 是新纹理，无法判断「换了纹理但没画面」。
+      final oldTextureId = _player.videoController?.id.value;
       DiagProbe.beginOpen(
         index: target,
         key: entry.key,
-        oldTextureId: _player.videoController?.id.value,
+        oldTextureId: oldTextureId,
       );
       setState(() {
         _index = target;
@@ -349,20 +380,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 之前无论本地有没有缓存，都先 await 一次 cookie（原生通道，网页没开过
       // 时是慢路径）再查缓存，串行下来就是「右下角都显示缓存 281MB 了，还要
       // 等很久」。现在先试离线，命中就直接开播，cookie 完全不碰。
-      final video = entry.short;
-      final media =
-          await fastOfflineMedia(entry) ??
-          await () async {
-            final cookie = video == null
-                ? ''
-                : await ShortVideoWeb.cookieHeader(
-                    (ShortVideoPlatform.fromId(video.platform) ??
-                            ShortVideoPlatform.douyin)
-                        .cookieDomainNeedle,
-                  );
-            if (!mounted) return null;
-            return resolveQueueEntry(entry, cookie: cookie);
-          }();
+      final resolveSw = Stopwatch()..start();
+      final media = await _resolveMedia(entry);
+      resolveSw.stop();
+      _diagUiBlock(
+        'open',
+        'resolve',
+        resolveSw,
+        extra: <String, Object?>{'index': target},
+      );
       if (!mounted) return;
       if (media == null || media.url.isEmpty) {
         openError = 'no-media';
@@ -383,6 +409,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       } else {
         _player.overrideMediaHeader();
       }
+      final sourceSw = Stopwatch()..start();
       await _player.setDataSource(
         // 缓存好的那条是磁盘上的 mp4，必须按本地文件打开，不能当网络源。
         //
@@ -405,19 +432,46 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             ? Duration(milliseconds: entry.durationMs)
             : null,
       );
+      sourceSw.stop();
+      _diagUiBlock(
+        'open',
+        'setDataSource',
+        sourceSw,
+        extra: <String, Object?>{'index': target, 'local': media.isLocal},
+      );
+      // 切条复用同一个 FlutterTexture 时 same=YES；这条用来证明没有因为
+      // 换源把整页 texture 重建掉。
+      final newTextureId = _player.videoController?.id.value;
+      DiagProbe.event('texture-reuse', <String, Object?>{
+        'same': newTextureId != null && newTextureId == oldTextureId,
+        'oldTextureId': oldTextureId,
+        'newTextureId': newTextureId,
+      });
       if (!mounted || session != _openSession) return;
       // `setDataSource(autoplay: true)` 内部的自动播放走的是静态
       // `playIfExists()`，只有 B 站视频页 / 直播页注册了那个回调。
       // 抖音页没有注册，只加载不会真正播放，这里在确认数据源就绪后
       // 显式起播；首条和自动切出的下一条都会经过这里。
       if (_player.dataStatus.value != DataStatus.loaded) return;
+      final playSw = Stopwatch()..start();
       await _player.play();
+      playSw.stop();
+      _diagUiBlock(
+        'open',
+        'play',
+        playSw,
+        extra: <String, Object?>{'index': target},
+      );
       if (!mounted || session != _openSession) return;
       _publishPipState();
       _completionArmed = true;
       _armedSession = session;
-      setState(() {});
+      _isPlaying.value = _player.playerStatus.isPlaying;
       _notePlayed(entry.key);
+      _prefetchNext();
+      // videoController 是本次 setDataSource 才建出来的，必须重建一次把
+      // 加载圈换成画面。这是一次切换一次，不是按帧刷新。
+      if (mounted) setState(() {});
     } catch (error) {
       openError = '$error';
       if (mounted) setState(() => _error = '播放失败：$error');
@@ -434,6 +488,75 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
+  /// 主 isolate 计时探针：一次同步工作超过 50ms 就写一条 `ui-block`，
+  /// 让下一份诊断包直接指出是 open / position / gesture 哪一段堵住。
+  ///
+  /// [throttleMs] 用于 position/gesture 这种每秒会回调多次的阶段，
+  /// 避免持续卡顿时同一条事件把日志刷爆；open 各阶段每次只发生一次，
+  /// 默认不限流。
+  void _diagUiBlock(
+    String stage,
+    String step,
+    Stopwatch sw, {
+    Map<String, Object?> extra = const {},
+    int throttleMs = 0,
+  }) {
+    final ms = sw.elapsedMilliseconds;
+    if (ms < 50) return;
+    if (throttleMs > 0) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final key = '$stage:$step';
+      final last = _uiBlockLoggedAt[key] ?? 0;
+      if (now - last < throttleMs) return;
+      _uiBlockLoggedAt[key] = now;
+    }
+    DiagProbe.event('ui-block', <String, Object?>{
+      'stage': stage,
+      'step': step,
+      'ms': ms,
+      ...extra,
+    });
+  }
+
+  /// position 流每来一次就同步刷新播放状态，并量化两次回调之间的空洞。
+  ///
+  /// 主 isolate 被整块堵住时，正常 100~500ms 一次的 position 回调会出现
+  /// 秒级间隔；这里把 gap 直接写进 `ui-block`，不依赖 ticker 的 500ms 节拍。
+  void _onPositionTick(Duration position) {
+    if (_disposed) return;
+    final sw = Stopwatch()..start();
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final gapMs = _lastPositionTickMs == 0 ? 0 : nowMs - _lastPositionTickMs;
+    _lastPositionTickMs = nowMs;
+    final isPlaying = _player.playerStatus.isPlaying;
+    if (_isPlaying.value != isPlaying) {
+      _isPlaying.value = isPlaying;
+    }
+    sw.stop();
+    _diagUiBlock(
+      'position',
+      'tick',
+      sw,
+      extra: <String, Object?>{'positionMs': position.inMilliseconds},
+      throttleMs: 1000,
+    );
+    // 回调本身很快，但两次回调间隔很大，说明主 isolate 在此之前被整块
+    // 占住了。这条不能按 50ms 的同步耗时判断，单独记 gap。
+    if (gapMs > 1000) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final last = _uiBlockLoggedAt['position:gap'] ?? 0;
+      if (now - last >= 1000) {
+        _uiBlockLoggedAt['position:gap'] = now;
+        DiagProbe.event('ui-block', <String, Object?>{
+          'stage': 'position',
+          'step': 'gap',
+          'ms': gapMs,
+          'positionMs': position.inMilliseconds,
+        });
+      }
+    }
+  }
+
   void _notePlayed(String key) {
     _played.add(key);
     if (_deckSignature.isNotEmpty) {
@@ -446,6 +569,67 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
+  /// 解析某一条的播放地址。命中预热结果时直接复用，自动连播不再从零开始
+  /// 取 cookie + 解析。
+  Future<QueueMedia?> _resolveMedia(QueueEntry entry) async {
+    if (_prefetchKey == entry.key) {
+      final future = _prefetchFuture;
+      _prefetchKey = null;
+      _prefetchFuture = null;
+      if (future != null) {
+        try {
+          final media = await future;
+          if (media != null && media.url.isNotEmpty) {
+            DiagProbe.event('prefetch-hit', <String, Object?>{
+              'key': entry.key,
+            });
+            return media;
+          }
+        } catch (_) {}
+      }
+    }
+    return _resolveMediaUncached(entry);
+  }
+
+  /// 真正走磁盘缓存 / cookie / 网络解析的路径。
+  Future<QueueMedia?> _resolveMediaUncached(QueueEntry entry) async {
+    final direct = await fastOfflineMedia(entry);
+    if (direct != null) return direct;
+    final video = entry.short;
+    final cookie = video == null
+        ? ''
+        : await ShortVideoWeb.cookieHeader(
+            (ShortVideoPlatform.fromId(video.platform) ??
+                    ShortVideoPlatform.douyin)
+                .cookieDomainNeedle,
+          );
+    if (!mounted) return null;
+    return resolveQueueEntry(entry, cookie: cookie);
+  }
+
+  /// 算下一条要预热谁的 key。顺序模式取队列下一条，随机模式取牌堆首项。
+  String _prefetchTargetKey() {
+    if (_queue.length <= 1) return '';
+    final key = _shuffle && _deck.isNotEmpty
+        ? _deck.first
+        : _queue[(_index + 1) % _queue.length].key;
+    return key == _current.key ? '' : key;
+  }
+
+  /// 本条已经起播后，提前解析下一条的地址。切条时 [_resolveMedia] 命中，
+  /// 首帧不再等一次完整的 cookie + 解析往返。
+  void _prefetchNext() {
+    if (_disposed || _leaving) return;
+    final key = _prefetchTargetKey();
+    if (key.isEmpty || key == _prefetchKey) return;
+    final index = _queue.indexWhere((e) => e.key == key);
+    if (index < 0) return;
+    final entry = _queue[index];
+    _prefetchKey = key;
+    _prefetchFuture = _resolveMediaUncached(entry).catchError((_) => null);
+    DiagProbe.event('prefetch-start', <String, Object?>{'key': key});
+  }
+
   /// 复用 B 站播放页的完成监听：controller 把 mpv 的 completed 流转成
   /// [PlayerStatus.completed] 后回调到这里。
   ///
@@ -453,6 +637,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 退出页面都不算完成。上膛只发生在当前会话成功加载并起播之后，
   /// 迟到的 `playing` 不会再打开标记。
   void _onPlayerStatus(PlayerStatus status) {
+    final isPlaying = _player.playerStatus.isPlaying;
+    if (_isPlaying.value != isPlaying) {
+      _isPlaying.value = isPlaying;
+    }
     _publishPipState();
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
@@ -542,6 +730,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 所以只重排在两边的条目，其余条目留在原位，不改变队列长度。
   void _applyPlaylistOrder(List<PlaylistItem> items) {
     if (items.isEmpty || _queue.isEmpty) return;
+    _prefetchKey = null;
+    _prefetchFuture = null;
     final incoming = <String, QueueEntry>{
       for (final entry in _queue) entry.key: entry,
     };
@@ -576,6 +766,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 播放列表里点了一条：整份列表成为新的播放队列，并从这条开始播。
   void _playFromPlaylist(List<QueueEntry> entries, int index) {
     if (entries.isEmpty) return;
+    _prefetchKey = null;
+    _prefetchFuture = null;
     final target = index.clamp(0, entries.length - 1);
     final key = entries[target].key;
     final wasCurrentKey = _current.key;
@@ -602,8 +794,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     } else {
       await _player.play();
     }
+    // 只重建暂停/播放图标那一小块，不再 setState 整页。
+    _isPlaying.value = _player.playerStatus.isPlaying;
     _publishPipState();
-    if (mounted) setState(() {});
   }
 
   Future<void> _enterPip() async {
@@ -747,6 +940,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   void _toggleShuffle() {
+    _prefetchKey = null;
+    _prefetchFuture = null;
     setState(() {
       _shuffle = !_shuffle;
       if (_shuffle) {
@@ -754,6 +949,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         _refillDeck();
       }
     });
+    _prefetchNext();
   }
 
   @override
@@ -947,6 +1143,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   void _onVerticalDragStart(DragStartDetails details) {
+    final sw = Stopwatch()..start();
     final size = MediaQuery.sizeOf(context);
     final isLeft = details.localPosition.dx < size.width / 2;
     _swipeTarget = isLeft ? _SwipeTarget.brightness : _SwipeTarget.volume;
@@ -955,9 +1152,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 在开始拖时算一次，拖动过程中不要再查 MediaQuery。
     _swipeRange = size.height * (isLeft ? 0.6 : 0.5);
     _publishSwipeHint(_swipeStartValue);
+    sw.stop();
+    _diagUiBlock('gesture', 'vertical-start', sw, throttleMs: 1000);
   }
 
   void _onVerticalDragUpdate(DragUpdateDetails details) {
+    final sw = Stopwatch()..start();
     final target = _swipeTarget;
     if (target == null) return;
     final isBrightness = target == _SwipeTarget.brightness;
@@ -979,14 +1179,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       unawaited(_player.setVolume(value, showIndicator: false));
     }
     _publishSwipeHint(value);
+    sw.stop();
+    _diagUiBlock('gesture', 'vertical', sw, throttleMs: 1000);
   }
 
   void _onVerticalDragEnd(DragEndDetails details) {
+    final sw = Stopwatch()..start();
     if (_swipeTarget == _SwipeTarget.brightness) {
       unawaited(_applyBrightness(_brightness));
     }
     _swipeTarget = null;
     _hideHintSoon();
+    sw.stop();
+    _diagUiBlock('gesture', 'vertical-end', sw, throttleMs: 1000);
   }
 
   void _onVerticalDragCancel() {
@@ -996,6 +1201,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 横向拖动只更新预览，松手才真正 seek，避免拖动途中反复冲缓冲。
   void _onHorizontalDragStart(DragStartDetails details) {
+    final sw = Stopwatch()..start();
     final durationMs = _player.durationInMilliseconds;
     _seekDragging = durationMs > 0;
     if (!_seekDragging) return;
@@ -1006,9 +1212,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 同样在开始拖时缓存，拖动途中不查 MediaQuery。
     _seekWidth = MediaQuery.sizeOf(context).width;
     _showSeekHint();
+    sw.stop();
+    _diagUiBlock('gesture', 'horizontal-start', sw, throttleMs: 1000);
   }
 
   void _onHorizontalDragUpdate(DragUpdateDetails details) {
+    final sw = Stopwatch()..start();
     if (!_seekDragging) return;
     final durationMs = _player.durationInMilliseconds;
     final width = _seekWidth;
@@ -1016,15 +1225,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final deltaMs = (details.delta.dx / width * durationMs).round();
     _seekTargetMs = (_seekTargetMs + deltaMs).clamp(0, durationMs).toInt();
     _showSeekHint();
+    sw.stop();
+    _diagUiBlock('gesture', 'horizontal', sw, throttleMs: 1000);
   }
 
   void _onHorizontalDragEnd(DragEndDetails details) {
+    final sw = Stopwatch()..start();
     if (!_seekDragging) return;
     _seekDragging = false;
     _player.position.value = _seekTargetMs ~/ 1000;
     unawaited(_player.seekTo(Duration(milliseconds: _seekTargetMs)));
     _publishPipState(_seekTargetMs);
     _hideHintSoon();
+    sw.stop();
+    _diagUiBlock('gesture', 'horizontal-end', sw, throttleMs: 1000);
   }
 
   void _onHorizontalDragCancel() {
@@ -1323,8 +1537,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   Widget _bottomBar() {
-    // playerStatus 是普通字段，不是 Rx；播放状态变化时由 _togglePlay 自己 setState。
-    // 进度、缓冲、时长是 Rx，放进 Obx 里按秒刷新。
+    // playerStatus 是普通字段，不是 Rx；暂停/播放图标由 `_isPlaying` 单独
+    // 驱动，只重建这一个按钮。进度、缓冲、时长是 Rx，放进 Obx 里按秒刷新。
     return _controls(
       Column(
         mainAxisAlignment: MainAxisAlignment.end,
@@ -1372,17 +1586,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 width: 30,
                 height: 30,
               ),
-              ComBtn(
-                icon: Icon(
-                  _player.playerStatus.isPlaying
-                      ? Icons.pause
-                      : Icons.play_arrow,
-                  color: Colors.white,
+              ValueListenableBuilder<bool>(
+                valueListenable: _isPlaying,
+                builder: (context, playing, child) => ComBtn(
+                  icon: Icon(
+                    playing ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white,
+                  ),
+                  onTap: () => unawaited(_togglePlay()),
+                  tooltip: '暂停/继续',
+                  width: 30,
+                  height: 30,
                 ),
-                onTap: () => unawaited(_togglePlay()),
-                tooltip: '暂停/继续',
-                width: 30,
-                height: 30,
               ),
               ComBtn(
                 icon: const Icon(Icons.skip_next, color: Colors.white),

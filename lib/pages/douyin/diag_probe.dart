@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:PiliPlus/pages/douyin/rootscan.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
@@ -46,6 +47,24 @@ const int _blackScreenCheckMs = 3000;
 /// 一次切条最多观察 8 秒，避免探针永远挂着。
 const int _openProbeTimeoutMs = 8000;
 
+/// 切条探针前 3 秒用 100ms 轮询抓首帧，之后降到 500ms。
+///
+/// 整段 8 秒都按 100ms 轮询时，探针本身每秒要读几十次播放器状态；一旦
+/// mpv 核心在打开/seek 期间占着锁，这些同步读取就会把主 isolate 一起拖住。
+const int _openFastWindowMs = 3000;
+const int _openFastPollMs = 100;
+const int _openSlowPollMs = 500;
+
+/// 单段同步工作超过这个值就写一条 `ui-block`，供下一份诊断包定位。
+const int _uiBlockMs = 50;
+
+/// mpv 属性每 3 秒完整刷新一次，其余采样复用缓存。
+const int _mpvSnapshotIntervalMs = 3000;
+
+/// 诊断日志批量落盘：攒够行数或等 500ms 再写，不再每行 flush。
+const int _writeBatchLines = 32;
+const int _writeFlushDelayMs = 500;
+
 /// 3 秒内丢帧增量达到这个值，视为「暴涨」。
 const int _dropFrameJumpThreshold = 30;
 
@@ -60,9 +79,17 @@ abstract final class DiagProbe {
 
   static Timer? _sampleTimer;
   static Timer? _openTimer;
+  static Timer? _writeFlushTimer;
+  static bool _openSlowPoll = false;
   static _OpenTracker? _tracker;
   static Future<void> _writeChain = Future<void>.value();
   static Future<Directory>? _documentsDir;
+  static final List<String> _writeBuffer = <String>[];
+  static int _writeBatchCount = 0;
+
+  /// 上一次完整读取 mpv 属性的时间与结果。
+  static int _mpvCacheAt = 0;
+  static final Map<String, Object?> _mpvCache = <String, Object?>{};
 
   static Future<Directory> _docDir() =>
       _documentsDir ??= getApplicationDocumentsDirectory();
@@ -85,7 +112,7 @@ abstract final class DiagProbe {
   /// 一次读取当前播放器的 mpv 指标、position 与 textureId。
   ///
   /// rootscan 也直接复用这个快照，保证两处字段完全一致。
-  static Map<String, Object?> snapshot() {
+  static Map<String, Object?> snapshot({bool full = false}) {
     final out = <String, Object?>{
       'positionMs': null,
       'textureId': null,
@@ -106,16 +133,38 @@ abstract final class DiagProbe {
       out['textureId'] = player.videoController?.id.value;
       out['dataStatus'] = player.dataStatus.value.name;
     } catch (_) {}
-    final native = player.videoPlayerController;
+
+    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。每秒
+    // 读 11 项看起来不多，但叠上切条/seek 时的锁竞争就足以把主 isolate
+    // 卡成秒级。这里只降频，不删指标：完整快照最多 3 秒一次。
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final refresh =
+        full ||
+        _mpvCache.isEmpty ||
+        now - _mpvCacheAt >= _mpvSnapshotIntervalMs;
+    if (refresh) {
+      final native = player.videoPlayerController;
+      for (final key in kMpvDiagKeys) {
+        String? value;
+        try {
+          final raw = native?.getProperty(key);
+          if (raw != null && raw.isNotEmpty) value = raw;
+        } catch (_) {}
+        _mpvCache[key] = value;
+      }
+      _mpvCacheAt = now;
+    }
     for (final key in kMpvDiagKeys) {
-      String? value;
-      try {
-        final raw = native?.getProperty(key);
-        if (raw != null && raw.isNotEmpty) value = raw;
-      } catch (_) {}
-      out[key] = value;
+      out[key] = _mpvCache[key];
     }
     return out;
+  }
+
+  /// 切条前后 mpv 状态会整体换掉，缓存必须作废，否则新视频的宽高/解码
+  /// 指标要等到下一次完整刷新才更新。
+  static void invalidateSnapshotCache() {
+    _mpvCache.clear();
+    _mpvCacheAt = 0;
   }
 
   /// App 版本 / 构建号 / 系统 / 机型。
@@ -150,7 +199,9 @@ abstract final class DiagProbe {
     if (!kDiagEnabled) return;
     _sampleTimer?.cancel();
     _sampleTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final sw = Stopwatch()..start();
       _append('playback', snapshot());
+      _eventIfSlow('snapshot', sw);
     });
   }
 
@@ -173,9 +224,11 @@ abstract final class DiagProbe {
     int? oldTextureId,
   }) {
     if (!kDiagEnabled) return;
+    final sw = Stopwatch()..start();
     _stopOpenProbe();
+    invalidateSnapshotCache();
     final startedAt = DateTime.now().millisecondsSinceEpoch;
-    final snap = snapshot();
+    final snap = snapshot(full: true);
     final tracker = _OpenTracker(
       index: index,
       key: key,
@@ -192,10 +245,8 @@ abstract final class DiagProbe {
       'positionMs': snap['positionMs'],
       'dataStatus': snap['dataStatus'],
     });
-    _openTimer = Timer.periodic(
-      const Duration(milliseconds: 100),
-      (_) => _pollOpen(),
-    );
+    _passiveUiBlock('beginOpen', sw);
+    _rearmOpenTimer(_openFastPollMs);
   }
 
   /// [_open] 收尾时写一行汇总。出错时同时停掉探针，避免误记到下一条。
@@ -203,7 +254,10 @@ abstract final class DiagProbe {
     if (!kDiagEnabled) return;
     final tracker = _tracker;
     if (tracker == null || tracker.ended) return;
+    final sw = Stopwatch()..start();
     tracker.ended = true;
+    invalidateSnapshotCache();
+    // 缓存刚被作废，默认快照会自己刷新一次；不再强制 full，避免多读一轮。
     final snap = snapshot();
     final now = DateTime.now().millisecondsSinceEpoch;
     _append('open-end', <String, Object?>{
@@ -230,6 +284,7 @@ abstract final class DiagProbe {
       });
       _stopOpenProbe();
     }
+    _passiveUiBlock('endOpen', sw);
   }
 
   /// 页面退出时统一收尾。
@@ -237,6 +292,7 @@ abstract final class DiagProbe {
     if (!kDiagEnabled) return;
     stopSampling();
     _stopOpenProbe();
+    unawaited(flush());
   }
 
   /// 把 Documents 下的诊断文件打成一个 zip，并交给系统分享面板。
@@ -244,10 +300,12 @@ abstract final class DiagProbe {
   /// 缺失的文件直接跳过；没有任何文件或打包失败返回 null，不弹异常。
   static Future<String?> exportAndShare() async {
     if (!kDiagEnabled) return null;
+    // 先把缓冲里的最后几行落盘，否则刚写的事件会漏出诊断包。
+    await flush();
     File? zipFile;
     try {
       final dir = await _docDir();
-      final files = <File>[];
+      final entries = <Map<String, String>>[];
       for (final name in <String>[
         'pip_trace.log',
         kDiagPlaybackFile,
@@ -256,26 +314,15 @@ abstract final class DiagProbe {
       ]) {
         final file = File('${dir.path}/$name');
         if (!file.existsSync() || file.lengthSync() == 0) continue;
-        files.add(file);
+        entries.add(<String, String>{'name': name, 'path': file.path});
       }
-      if (files.isEmpty) return null;
+      if (entries.isEmpty) return null;
       zipFile = File('${dir.path}/diag_${_timestamp()}.zip');
-      final out = OutputFileStream(zipFile.path);
-      final encoder = ZipEncoder();
-      try {
-        encoder.startEncode(out);
-        for (final file in files) {
-          encoder.add(
-            ArchiveFile.stream(
-              file.uri.pathSegments.last,
-              InputFileStream(file.path),
-            ),
-          );
-        }
-        encoder.endEncode();
-      } finally {
-        out.close();
-      }
+      final zipPath = zipFile.path;
+      final zipEntries = entries;
+      // pip_trace 是逐帧日志，大包能到几十 MB；压缩放在单独 isolate，
+      // 避免导出按钮点下去主 isolate 整块卡住。
+      await Isolate.run(() => _encodeZip(zipEntries, zipPath));
       try {
         await _channel.invokeMethod<bool>('shareFile', <String, Object?>{
           'path': zipFile.path,
@@ -294,6 +341,15 @@ abstract final class DiagProbe {
 
   static void _pollOpen() {
     if (!kDiagEnabled) return;
+    final sw = Stopwatch()..start();
+    try {
+      _pollOpenOnce();
+    } finally {
+      _passiveUiBlock('open-poll', sw);
+    }
+  }
+
+  static void _pollOpenOnce() {
     final tracker = _tracker;
     if (tracker == null) {
       _stopOpenProbe();
@@ -314,8 +370,7 @@ abstract final class DiagProbe {
           textureId != null &&
           tracker.oldTextureId != null &&
           textureId != tracker.oldTextureId;
-      final positionReset =
-          tracker.startPositionMs != null
+      final positionReset = tracker.startPositionMs != null
           ? position < tracker.startPositionMs! || position <= 1200
           : position <= 1200;
       final loadedWindow =
@@ -350,6 +405,10 @@ abstract final class DiagProbe {
         });
       }
       final elapsed = now - tracker.startedAt;
+      if (!_openSlowPoll && elapsed >= _openFastWindowMs) {
+        _openSlowPoll = true;
+        _rearmOpenTimer(_openSlowPollMs);
+      }
       final checkFrom = tracker.firstFrameAt ?? tracker.startedAt;
       if (!tracker.blackChecked &&
           now - checkFrom >= _blackScreenCheckMs &&
@@ -375,6 +434,7 @@ abstract final class DiagProbe {
     int position,
     int elapsed,
   ) {
+    // 黑屏判定复用最近一次采样缓存即可，避免同步 FFI 再读 11 项。
     final snap = snapshot();
     final width = _asNum(snap['video-params/w']);
     final drop = _asNum(snap['drop-frame-count']);
@@ -410,7 +470,41 @@ abstract final class DiagProbe {
   static void _stopOpenProbe() {
     _openTimer?.cancel();
     _openTimer = null;
+    _openSlowPoll = false;
     _tracker = null;
+  }
+
+  static void _rearmOpenTimer(int ms) {
+    _openTimer?.cancel();
+    _openTimer = Timer.periodic(
+      Duration(milliseconds: ms),
+      (_) => _pollOpen(),
+    );
+  }
+
+  static void _eventIfSlow(
+    String step,
+    Stopwatch sw, [
+    Map<String, Object?> extra = const {},
+  ]) {
+    final ms = sw.elapsedMilliseconds;
+    if (ms < _uiBlockMs) return;
+    event('ui-block', <String, Object?>{
+      'stage': 'diag',
+      'step': step,
+      'ms': ms,
+      ...extra,
+    });
+  }
+
+  static void _passiveUiBlock(String step, Stopwatch sw) {
+    final ms = sw.elapsedMilliseconds;
+    if (ms < _uiBlockMs) return;
+    event('ui-block', <String, Object?>{
+      'stage': 'diag',
+      'step': step,
+      'ms': ms,
+    });
   }
 
   static void _append(String tag, Map<String, Object?> fields) {
@@ -420,18 +514,66 @@ abstract final class DiagProbe {
       'tag': tag,
       ...fields,
     });
-    _writeChain = _writeChain.then((_) => _writeLine(line));
+    _writeBuffer.add(line);
+    if (_writeBuffer.length >= _writeBatchLines) {
+      _flushBuffer();
+    } else {
+      _writeFlushTimer ??= Timer(
+        const Duration(milliseconds: _writeFlushDelayMs),
+        _flushBuffer,
+      );
+    }
   }
 
-  static Future<void> _writeLine(String line) async {
+  /// 把当前缓冲整批交给写链。每 8 批做一次 fsync，既保留掉电前大部分
+  /// 日志，又不再让每一行都等磁盘 flush。
+  static void _flushBuffer() {
+    _writeFlushTimer?.cancel();
+    _writeFlushTimer = null;
+    if (_writeBuffer.isEmpty) return;
+    final chunk = '${_writeBuffer.join('\n')}\n';
+    _writeBuffer.clear();
+    _writeBatchCount += 1;
+    final sync = _writeBatchCount % 8 == 0;
+    _writeChain = _writeChain.then((_) => _writeChunk(chunk, sync: sync));
+  }
+
+  static Future<void> _writeChunk(String chunk, {required bool sync}) async {
     try {
       final dir = await _docDir();
       await File('${dir.path}/$kDiagPlaybackFile').writeAsString(
-        '$line\n',
+        chunk,
         mode: FileMode.append,
-        flush: true,
+        flush: sync,
       );
     } catch (_) {}
+  }
+
+  /// 导出前/退出时把缓冲刷干净。
+  static Future<void> flush() async {
+    _flushBuffer();
+    try {
+      await _writeChain;
+    } catch (_) {}
+  }
+
+  static void _encodeZip(List<Map<String, String>> entries, String zipPath) {
+    final out = OutputFileStream(zipPath);
+    final encoder = ZipEncoder();
+    try {
+      encoder.startEncode(out);
+      for (final entry in entries) {
+        encoder.add(
+          ArchiveFile.stream(
+            entry['name']!,
+            InputFileStream(entry['path']!),
+          ),
+        );
+      }
+      encoder.endEncode();
+    } finally {
+      out.close();
+    }
   }
 
   static num? _asNum(Object? value) {
