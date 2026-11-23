@@ -171,6 +171,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 原生一共回传了多少段响应（不等于视频条数）。
   int _rawCount = 0;
 
+  /// 本次抓取会话的已知 id 集合：已同步 + 当前列表 + 墓碑。
+  /// 每段响应只做字符串判重，不再反复解码本地缓存。
+  Set<String> _knownKeys = <String>{};
+
   /// 正在把选中的条目下到本地。
   bool _caching = false;
 
@@ -230,7 +234,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       if (!mounted) return;
       _reload();
       ShortVideoAutoCache.schedule();
-      var text = '已同步：${result.summary}';
+      var text = '已同步：${result.summary}（${result.counts}）';
       if (_videos.isEmpty && result.total > 0) {
         // 总数不为 0、本页却是空的：说明那些条目不属于当前平台，
         // 或者落库失败。两种都在 summary 里写清楚了，别再说「同步成功」。
@@ -249,8 +253,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     }
   }
 
-  Future<void> _openWeb() async {
+  /// 网页弹层是否正在打开，避免连点叠两个。
+  bool _openingWeb = false;
+
+  void _installWebHandlers() {
     _rawCount = 0;
+    _knownKeys = <String>{
+      ...ShortVideoRepo.loadSynced(platform),
+      ..._videos.map((e) => e.key),
+      ...ShortVideoRepo.loadDeleted(platform),
+    };
     ShortVideoWeb.onPayload = _ingest;
     ShortVideoWeb.onStatus = (text) {
       if (mounted) setState(() => _status = text);
@@ -262,52 +274,83 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       ShortVideoAutoCache.schedule();
       _sync(silent: true);
     };
+  }
+
+  Future<void> _openWeb() async {
+    if (_openingWeb) return;
+    _openingWeb = true;
+    _installWebHandlers();
     try {
       // 把本地已有条数带下去：抓够这么多就不再无限滚动翻旧数据。
       await ShortVideoWeb.open(platform, knownCount: _videos.length);
     } catch (e) {
       if (mounted) setState(() => _status = '打开网页失败：$e');
       SmartDialog.showToast('打开网页失败: $e');
+    } finally {
+      _openingWeb = false;
+    }
+  }
+
+  /// 直接同步：打开收藏页后立刻开始抓取，只把新增 id 解析入库。
+  ///
+  /// 平台接口要签名，Dart 侧不能直接请求；这里复用原生 WKWebView，并在
+  /// `open` 之后马上调 `start`，由原生自己切到收藏页、按本地条数尽早停止
+  /// 翻旧页。增量语义由 `_ingest` 保证：滚多少页都只解析新增。
+  Future<void> _directSync() async {
+    if (_openingWeb) return;
+    _openingWeb = true;
+    _installWebHandlers();
+    try {
+      await ShortVideoWeb.open(
+        platform,
+        knownCount: _videos.length,
+        autoStart: true,
+      );
+      if (mounted) {
+        setState(() => _status = '直连同步：只拉取新增收藏…');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = '直连同步失败：$e');
+      SmartDialog.showToast('直连同步失败: $e');
+    } finally {
+      _openingWeb = false;
     }
   }
 
   void _ingest(String body) {
     _rawCount++;
-    final parsed = ShortVideoParser.fromResponseBody(body, platform);
-    if (parsed.isEmpty) {
-      if (mounted) {
+    // 命中的条目连字段都不解析；墓碑里的 key 也跳过，遵守「本地为准」，
+    // 不会被平台重新抓回来。
+    final result = ShortVideoParser.parseIncremental(
+      body,
+      platform,
+      knownKeys: _knownKeys,
+    );
+    final added = <ShortVideo>[
+      for (final video in result.videos)
+        if (_knownKeys.add(video.key)) video,
+    ];
+    debugPrint(
+      '[fav-sync] capture#$_rawCount new=${added.length} '
+      'skipped=${result.skipped} deleted=0 parsed=${result.parsed}',
+    );
+    if (added.isEmpty) {
+      if (mounted && result.parsed == 0) {
         setState(
-          () => _status = '收到 $_rawCount 段数据，解析出 0 条（字段可能变了）',
+          () => _status = '收到 $_rawCount 段数据，无新增'
+              '（跳过 ${result.skipped} 条）',
         );
       }
       return;
     }
-
-    final indexById = <String, int>{
-      for (var i = 0; i < _videos.length; i++) _videos[i].id: i,
-    };
-    var changed = 0;
-    for (final video in parsed) {
-      final index = indexById[video.id];
-      if (index != null) {
-        // 直链是签名过的，会过期；重抓时用新的覆盖旧的。
-        if (_videos[index].playUrl != video.playUrl) {
-          _videos[index] = video;
-          changed++;
-        }
-      } else {
-        _videos.add(video);
-        indexById[video.id] = _videos.length - 1;
-        changed++;
-      }
-    }
-    if (changed == 0) return;
-    // 重新抓到了就撤掉删除墓碑，让它重新回到列表。
-    ShortVideoRepo.unmarkDeleted(platform, parsed.map((e) => e.key));
+    _videos.addAll(added);
     ShortVideoRepo.save(platform, _videos);
     ShortVideoAutoCache.schedule();
     if (mounted) {
-      setState(() => _status = '已抓取 ${_videos.length} 条');
+      setState(
+        () => _status = '新增 ${added.length} 条，跳过 ${result.skipped} 条，'
+            '本地 ${_videos.length} 条',
+      );
     }
   }
 
@@ -470,9 +513,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     List<int> positions,
   ) async {
     ShortVideoRepo.unmarkDeleted(platform, removed.map((e) => e.key));
+    // 撤销要算一次「本地更新」：远端增量里可能还留着这条的删除记录，
+    // updatedAt 更晚才会被当成新增推回去，而不是又被远端删除带走。
+    final now = DateTime.now().millisecondsSinceEpoch.toDouble();
     setState(() {
       for (var i = 0; i < removed.length; i++) {
-        final video = removed[i];
+        final video = removed[i].copyWith(updatedAt: now);
         if (_videos.any((e) => e.key == video.key)) continue;
         final at = (i < positions.length ? positions[i] : _videos.length)
             .clamp(0, _videos.length);
@@ -803,6 +849,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            const SizedBox(height: 6),
+            Text(
+              '已经登录过就直接点「直接同步（只拉新增）」，'
+              '只解析新收藏，旧条目不再重复处理。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
             const SizedBox(height: 10),
             Text(
               '网页打不开也不要紧：在 Kumone 里抓同一份收藏，'
@@ -1001,7 +1056,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   ),
                 ],
               )
-            else
+            else ...[
               Row(
                 children: [
                   Expanded(
@@ -1018,6 +1073,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   ),
                 ],
               ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _openingWeb ? null : _directSync,
+                  icon: const Icon(Icons.sync_alt),
+                  label: const Text('直接同步（只拉新增）'),
+                ),
+              ),
+            ],
           ],
         ),
     );

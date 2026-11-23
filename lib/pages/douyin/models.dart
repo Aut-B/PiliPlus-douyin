@@ -202,8 +202,25 @@ class ShortVideo {
   }
 }
 
-abstract final class ShortVideoParser {
+/// 一次增量解析的结果。
+///
+/// `skipped` 是只看了 id 就跳过的条数，`parsed` 是真正进入逐条字段解析的条数；
+/// 两者相加等于响应里可识别的条目总数（不含解析失败的条目）。
+class ShortVideoParseResult {
+  const ShortVideoParseResult({
+    this.videos = const [],
+    this.skipped = 0,
+    this.parsed = 0,
+  });
 
+  final List<ShortVideo> videos;
+  final int skipped;
+  final int parsed;
+
+  int get count => videos.length;
+}
+
+abstract final class ShortVideoParser {
   /// 解析网页里截获的一段 JSON。
   ///
   /// 抖音是 `aweme_list` / `aweme_detail`，TikTok 是 `itemList` / `itemStruct`；
@@ -228,6 +245,62 @@ abstract final class ShortVideoParser {
     Map<String, dynamic> root,
     ShortVideoPlatform platform,
   ) {
+    return _itemMaps(root)
+        .map((e) => _fromItem(e, platform))
+        .whereType<ShortVideo>()
+        .toList();
+  }
+
+  /// 只解析还没见过的条目。
+  ///
+  /// 旧流程每条响应都整段解析，一个收藏夹几百条时，加一个好视频也要把所有旧
+  /// 条目重新走一遍字段提取。这里先只取 id 与 [knownKeys] 比对，命中就跳过，
+  /// 不再构造 `ShortVideo`——平台列表必须重拉时，旧条目的成本只剩一次
+  /// 字符串比较。
+  static ShortVideoParseResult parseIncremental(
+    String body,
+    ShortVideoPlatform platform, {
+    required Set<String> knownKeys,
+  }) {
+    if (body.length < 40) return const ShortVideoParseResult();
+    if (!platform.markers.any(body.contains)) {
+      return const ShortVideoParseResult();
+    }
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is! Map) return const ShortVideoParseResult();
+      final items = _itemMaps(decoded.cast<String, dynamic>());
+      final videos = <ShortVideo>[];
+      final seen = <String>{};
+      var skipped = 0;
+      var parsed = 0;
+      for (final item in items) {
+        final id = _itemId(item);
+        if (id.isEmpty) {
+          skipped++;
+          continue;
+        }
+        final key = '${platform.id}:$id';
+        if (knownKeys.contains(key) || !seen.add(key)) {
+          skipped++;
+          continue;
+        }
+        parsed++;
+        final video = _fromItem(item, platform);
+        if (video != null) videos.add(video);
+      }
+      return ShortVideoParseResult(
+        videos: videos,
+        skipped: skipped,
+        parsed: parsed,
+      );
+    } catch (_) {
+      return const ShortVideoParseResult();
+    }
+  }
+
+  /// 从响应对象里取出所有候选条目（不解析字段）。
+  static List<Map<String, dynamic>> _itemMaps(Map<String, dynamic> root) {
     for (final key in const [
       'aweme_list',
       'itemList',
@@ -238,19 +311,22 @@ abstract final class ShortVideoParser {
       if (list is List) {
         return list
             .whereType<Map>()
-            .map((e) => _fromItem(e.cast<String, dynamic>(), platform))
-            .whereType<ShortVideo>()
+            .map((e) => e.cast<String, dynamic>())
             .toList();
       }
     }
     for (final key in const ['aweme_detail', 'itemStruct', 'itemInfo']) {
       final detail = root[key];
-      if (detail is Map) {
-        final video = _fromItem(detail.cast<String, dynamic>(), platform);
-        if (video != null) return [video];
-      }
+      if (detail is Map) return [detail.cast<String, dynamic>()];
     }
     return const [];
+  }
+
+  /// 与 `_fromItem` 完全一致的 id 取法，避免判重和解析认的不是同一条。
+  static String _itemId(Map<String, dynamic> item) {
+    final nested = item['itemStruct'];
+    final source = nested is Map ? nested.cast<String, dynamic>() : item;
+    return '${source['aweme_id'] ?? source['id'] ?? item['aweme_id'] ?? item['id'] ?? ''}';
   }
 
   static ShortVideo? _fromItem(
@@ -261,8 +337,7 @@ abstract final class ShortVideoParser {
     final nested = item['itemStruct'];
     final source = nested is Map ? nested.cast<String, dynamic>() : item;
 
-    final id =
-        '${source['aweme_id'] ?? source['id'] ?? item['aweme_id'] ?? item['id'] ?? ''}';
+    final id = _itemId(item);
     if (id.isEmpty) return null;
     final video = source['video'] ?? item['video'];
     if (video is! Map) return null;

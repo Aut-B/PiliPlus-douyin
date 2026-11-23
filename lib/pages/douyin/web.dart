@@ -55,6 +55,7 @@ abstract final class ShortVideoWeb {
   static Future<void> open(
     ShortVideoPlatform platform, {
     int knownCount = 0,
+    bool autoStart = false,
   }) async {
     _ensureHandler();
     await _channel.invokeMethod('open', {
@@ -66,6 +67,8 @@ abstract final class ShortVideoWeb {
       'hookScript': hookJs(platform),
       'driverScript': driverJs(platform, knownCount: knownCount),
     });
+    // 直接同步入口：打开后立刻让原生切到收藏页并开始抓取。
+    if (autoStart) await _channel.invokeMethod('start');
   }
 
   /// 设备物理内存（字节）。取不到返回 0。
