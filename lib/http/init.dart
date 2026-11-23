@@ -21,11 +21,15 @@ import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:dio_http2_adapter/dio_http2_adapter.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, listEquals;
+import 'package:flutter/widgets.dart'
+    show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 
 const String _kDiagStartMs = '_diag_start_ms';
 const String _kDiagSinceResume = '_diag_since_resume';
 const String _kDiagFirstAfterResume = '_diag_first_after_resume';
 const String _kDiagFirstAfterLongIdle = '_diag_first_after_long_idle';
+const String _kNetRetryTag = 'net-retry';
+const String _kNetRecoveredTag = 'net-recovered';
 
 /// 只读诊断拦截器：请求失败时写一条 `net-fail`，绝不改变重试/超时/鉴权行为。
 ///
@@ -319,20 +323,35 @@ class Request {
   @pragma('vm:notify-debugger-on-exception')
   static void _resetAdaptersForNetworkChange() {
     try {
-      final (h11, connectionManager) = _createPool();
-      if (connectionManager != null) {
-        (dio.httpClientAdapter as Http2Adapter)
-          ..connectionManager.close(force: true)
-          ..connectionManager = connectionManager
-          ..fallbackAdapter.close(force: true)
-          ..fallbackAdapter = h11;
-        _http11Dio?.httpClientAdapter = h11;
-      } else {
-        dio
-          ..httpClientAdapter.close(force: true)
-          ..httpClientAdapter = h11;
-      }
+      _applyPool(_createPool());
     } catch (_) {}
+  }
+
+  /// Force-close the current connection pool / http client and swap in a
+  /// freshly built one. This drops any stale dns cache or half-dead socket
+  /// pool left behind after a long background idle, and is called both on
+  /// connectivity changes and on a dns-class retry.
+  @pragma('vm:notify-debugger-on-exception')
+  static void rebuildConnectionPool() {
+    try {
+      _applyPool(_createPool());
+    } catch (_) {}
+  }
+
+  static void _applyPool((IOHttpClientAdapter, ConnectionManager?) pool) {
+    final (h11, connectionManager) = pool;
+    if (connectionManager != null) {
+      (dio.httpClientAdapter as Http2Adapter)
+        ..connectionManager.close(force: true)
+        ..connectionManager = connectionManager
+        ..fallbackAdapter.close(force: true)
+        ..fallbackAdapter = h11;
+      _http11Dio?.httpClientAdapter = h11;
+    } else {
+      dio
+        ..httpClientAdapter.close(force: true)
+        ..httpClientAdapter = h11;
+    }
   }
 
   /*
@@ -370,7 +389,15 @@ class Request {
     // 先于其他Interceptor
     if (Pref.retryCount != 0) {
       dio.interceptors.add(
-        RetryInterceptor(dio, Pref.retryCount, Pref.retryDelay),
+        RetryInterceptor(
+          dio,
+          Pref.retryCount,
+          Pref.retryDelay,
+          onDnsReset: (_) => rebuildConnectionPool(),
+          log: (tag, fields) => DiagProbe.log(tag, fields),
+          retryTag: _kNetRetryTag,
+          recoveredTag: _kNetRecoveredTag,
+        ),
       );
     }
 
@@ -392,6 +419,7 @@ class Request {
       };
 
     if (Platform.isIOS) _watchConnectivity();
+    _watchLifecycle();
   }
 
   /*
@@ -526,4 +554,72 @@ class Request {
     responseBytesDecoder(responseBytes, responseBody.headers),
     allowMalformed: true,
   );
+
+  /// Background longer than this counts as a "long idle" whose resume may
+  /// leave the dns / connection stack stale. Kept in sync with
+  /// `mobile_observer.dart` so the diag signal and the warmup agree.
+  static const int _kLongBackgroundMs = 5 * 60 * 1000;
+
+  static bool _lifecycleObserved = false;
+
+  static void _watchLifecycle() {
+    if (_lifecycleObserved) return;
+    _lifecycleObserved = true;
+    WidgetsBinding.instance.addObserver(_LifecycleObserver());
+  }
+
+  /// Lightweight probe fired once after the app returns from a long
+  /// background idle, before the first real request. It warms up the
+  /// connection stack and, if the probe still fails with a connection/dns
+  /// error, rebuilds the pool once so the subsequent real requests do not
+  /// all start with dns failures. Fire-and-forget; never blocks callers.
+  static Future<void> warmUpAfterResume(int idleMs) async {
+    final url = '${HttpString.apiBaseUrl}/x/web-interface/nav';
+    // Throwaway Dio with NO interceptors so the probe:
+    //   - does not consume the first-after-resume flag of takeRequestTiming()
+    //   - does not get logged as net-fail noise by _NetFailDiagInterceptor
+    //   - does not trigger RetryInterceptor (the probe IS the recovery)
+    // Share the current adapter of dio so it probes the real pool state; do NOT
+    // close() the probe, that would close the shared adapter and kill the pool of dio.
+    final probe = Dio(
+      BaseOptions(
+        connectTimeout: const Duration(seconds: 4),
+        sendTimeout: const Duration(seconds: 4),
+        receiveTimeout: const Duration(seconds: 4),
+      ),
+    )..httpClientAdapter = dio.httpClientAdapter;
+    try {
+      await probe.get<void>(url).timeout(const Duration(seconds: 5));
+      DiagProbe.log('net-warmup', <String, Object?>{'idleMs': idleMs, 'ok': true});
+    } on DioException catch (e) {
+      if (isRetryableNetError(e)) {
+        DiagProbe.log('net-warmup-rebuild', <String, Object?>{
+          'idleMs': idleMs,
+          'dns': isDnsError(e),
+          'dioType': e.type.name,
+        });
+        rebuildConnectionPool();
+      }
+    } catch (_) {
+      // timeout / cancel / anything non-retryable: ignore, let real requests retry.
+    }
+  }
+}
+
+class _LifecycleObserver with WidgetsBindingObserver {
+  int? _backgroundAtMs;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (state == AppLifecycleState.resumed) {
+      final idleMs = _backgroundAtMs == null ? null : nowMs - _backgroundAtMs!;
+      _backgroundAtMs = null;
+      if (idleMs != null && idleMs >= Request._kLongBackgroundMs) {
+        unawaited(Request.warmUpAfterResume(idleMs));
+      }
+    } else {
+      _backgroundAtMs ??= nowMs;
+    }
+  }
 }
