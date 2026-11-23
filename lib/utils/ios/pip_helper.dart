@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 import 'package:flutter/services.dart';
@@ -45,21 +47,62 @@ abstract final class IOSPipHelper {
           }
         }
       case 'setPlaying':
-        if (call.arguments as bool) {
-          PlPlayerController.playIfExists();
-        } else {
-          PlPlayerController.pauseIfExists();
-        }
+        unawaited(_setPlaying(call.arguments as bool));
       case 'skip':
-        if (PlPlayerController.instance case final ctr?) {
-          ctr.seekTo(
-            Duration(
-              milliseconds:
-                  ctr.positionInMilliseconds + (call.arguments as int),
-            ),
-          );
+        final args = call.arguments;
+        int deltaMs = 0;
+        int? targetMs;
+        if (args is Map) {
+          deltaMs = (args['delta'] as num?)?.toInt() ?? 0;
+          targetMs = (args['target'] as num?)?.toInt();
+        } else if (args is num) {
+          deltaMs = args.toInt();
         }
+        unawaited(_seek(deltaMs, targetMs));
     }
+  }
+
+  /// PiP 的暂停/恢复必须落到当前播放器实例上。抖音播放页没有注册
+  /// `PlPlayerController.playIfExists()` 使用的播放回调，只走回调会导致
+  /// 暂停后无法恢复；回调为空或指向已重建的旧实例时退到实例 play/pause。
+  static Future<void> _setPlaying(bool playing) async {
+    final ctr = PlPlayerController.instance;
+    if (playing) {
+      // B 站视频页/直播页注册的回调优先，保留原有副作用。
+      try {
+        await (PlPlayerController.playIfExists() ?? Future<void>.value());
+      } catch (e) {
+        if (kDebugMode) debugPrint('PiP play callback failed: $e');
+      }
+      // 抖音页没有注册回调，或回调指向已重建的旧实例；以当前实例是否
+      // 真的在播为准兜底，否则暂停后点开始会一直停在暂停。
+      if (ctr != null && !ctr.playerStatus.isPlaying) {
+        try {
+          await ctr.play(hideControls: false);
+        } catch (e) {
+          if (kDebugMode) debugPrint('PiP resume failed: $e');
+        }
+      }
+    } else {
+      try {
+        final pause = ctr != null
+            ? ctr.pause()
+            : PlPlayerController.pauseIfExists();
+        await (pause ?? Future<void>.value());
+      } catch (e) {
+        if (kDebugMode) debugPrint('PiP pause failed: $e');
+      }
+    }
+  }
+
+  /// 原生已经算好目标位置；旧版本事件只带 delta，继续兼容。
+  static Future<void> _seek(int deltaMs, int? targetMs) async {
+    final ctr = PlPlayerController.instance;
+    if (ctr == null) return;
+    final target = targetMs != null
+        ? Duration(milliseconds: targetMs)
+        : Duration(milliseconds: ctr.positionInMilliseconds + deltaMs);
+    await ctr.seekTo(target);
   }
 
   /// Enters PiP, or arms entering it automatically when the app goes to

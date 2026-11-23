@@ -191,6 +191,7 @@ private final class PipSession: NSObject {
   private var enteredBackground = false
 
   private var isPlaying = false
+  private var isBuffering = false
   private var isLive = false
   private var speed = 1.0
   /// Latest playback position pushed by Dart, in milliseconds.
@@ -220,6 +221,9 @@ private final class PipSession: NSObject {
   private var lastTextureCallbackTime: CFTimeInterval = 0
   private var callbackWindowStart: CFTimeInterval = 0
   private var callbackWindowCount = 0
+  /// 画中画 seek 的代数。异步补帧任务只认最新一次 seek，避免连续点
+  /// 快进/快退时旧任务在新位置之后又把旧帧拉回来。
+  private var seekGeneration = 0
   /// 诊断：PiP 轻量模式。开启时按 PiP 窗口尺寸渲染，而不是源分辨率。
   /// `pipLiteModeRequested` 只在主线程读写，`pipLiteMode` 只在 `frameQueue`
   /// 上读写，避免 copy() 与 update() 竞争。
@@ -378,9 +382,10 @@ private final class PipSession: NSObject {
       }
     }
     let position = (args["position"] as? NSNumber)?.int64Value
-    let isBuffering = args["isBuffering"] as? Bool ?? false
+    let buffering = args["isBuffering"] as? Bool ?? isBuffering
     let durationMs = (args["duration"] as? NSNumber)?.int64Value
     if let value = args["isPlaying"] as? Bool { isPlaying = value }
+    if let value = args["isBuffering"] as? Bool { isBuffering = value }
     if let value = args["isLive"] as? Bool { isLive = value }
     if let value = durationMs {
       duration = CMTime(value: value, timescale: 1000)
@@ -388,12 +393,12 @@ private final class PipSession: NSObject {
     if let value = (args["speed"] as? NSNumber)?.doubleValue { speed = value }
     PipTrace.log(
       "update: position=\(position.map { String($0) } ?? "nil")ms isPlaying=\(isPlaying) "
-        + "isBuffering=\(isBuffering) speed=\(speed) "
+        + "isBuffering=\(buffering) speed=\(speed) "
         + "duration=\(durationMs.map { String($0) } ?? "nil")ms"
     )
     if let position {
       positionMs = position
-      let rate = isPlaying && !isBuffering ? speed : 0
+      let rate = isPlaying && !buffering ? speed : 0
       let status = CMTimebaseSetRateAndAnchorTime(
         timebase,
         rate: rate,
@@ -1024,6 +1029,50 @@ private final class PipSession: NSObject {
     PipTrace.log("flush-on-stale: run=\(run)")
   }
 
+  /// seek 后显示层里还排着旧 PTS 的样本；不 flush 的话新帧会排在旧
+  /// 时间线上，表现为一直停在 seek 前那一帧。
+  private func flushForSeek() {
+    if #available(iOS 17.0, *) {
+      displayLayer.sampleBufferRenderer.flush()
+    } else {
+      displayLayer.flush()
+    }
+    PipTrace.log("pip-seek-flush: asked")
+  }
+
+  /// 重置 PiP 用的时基并重新锚定。layer 本身不接 controlTimebase，
+  /// 这里只保证 delegate 报告的 position/rate 与真实播放位置一致。
+  @discardableResult
+  private func resetTimebase(targetMs: Int64, reason: String) -> OSStatus {
+    let target = CMTime(value: targetMs, timescale: 1000)
+    CMTimebaseSetTime(timebase, time: target)
+    let rate = isPlaying && !isBuffering ? speed : 0
+    let status = CMTimebaseSetRateAndAnchorTime(
+      timebase,
+      rate: rate,
+      anchorTime: target,
+      immediateSourceTime: CMClockGetTime(CMClockGetHostTimeClock())
+    )
+    let current = CMTimebaseGetTime(timebase)
+    PipTrace.log(
+      "timebase-reset: reason=\(reason) rate=\(rate) target=\(targetMs)ms "
+        + "time=\(current.seconds) status=\(status)"
+    )
+    return status
+  }
+
+  /// seek / 恢复播放后主动拉几次最新 texture。不能只等下一次回调：
+  /// mpv 已经暂停出帧时，显示层不会自己醒来。
+  private func requestFramesAfterReset(generation: Int) {
+    let delays: [Double] = [0, 0.05, 0.15, 0.35, 0.7]
+    for delay in delays {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        guard let self, self.seekGeneration == generation else { return }
+        self.frameAvailable(force: true)
+      }
+    }
+  }
+
   /// 会话结束时汇总：total 是参与比对的帧数，identicalRunsSum 是所有
   /// 「与上一帧相同」的帧数，distinctApprox 是不同画面的近似数量。
   private func writeVerdictIfNeeded() {
@@ -1272,9 +1321,31 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     setPlaying playing: Bool
   ) {
     isPlaying = playing
-    CMTimebaseSetRate(timebase, rate: playing ? speed : 0)
+    let rate = playing && !isBuffering ? speed : 0
+    if playing {
+      // 从暂停恢复时把时基重新锚到当前播放位置，不能只 SetRate：
+      // 暂停期间 Dart 推来的 position 可能已经落后，直接恢复会跳。
+      resetTimebase(targetMs: max(0, positionMs), reason: "setplaying")
+    } else {
+      let status = CMTimebaseSetRate(timebase, rate: 0)
+      let current = CMTimebaseGetTime(timebase)
+      PipTrace.log(
+        "timebase-reset: reason=setplaying-pause rate=0 "
+          + "time=\(current.seconds) status=\(status)"
+      )
+    }
+    PipTrace.log(
+      "pip-setplaying: playing=\(playing) rate=\(rate) pos=\(positionMs)ms "
+        + "buffering=\(isBuffering) speed=\(speed)"
+    )
     pictureInPictureController.invalidatePlaybackState()
     sendEvent("setPlaying", playing)
+    if playing {
+      // Dart 侧恢复 media_kit 后不一定马上有 texture 回调；和 seek 一样
+      // 主动拉几次帧，确保 PiP 不停在暂停画面。
+      seekGeneration &+= 1
+      requestFramesAfterReset(generation: seekGeneration)
+    }
   }
 
   func pictureInPictureControllerTimeRangeForPlayback(
@@ -1326,14 +1397,34 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     skipByInterval skipInterval: CMTime,
     completion completionHandler: @escaping () -> Void
   ) {
-    let current = CMTime(value: positionMs, timescale: 1000)
-    let target = CMTimeClampToRange(
-      CMTimeAdd(current, skipInterval),
-      range: CMTimeRange(start: .zero, duration: duration)
+    let deltaSeconds = skipInterval.seconds
+    let deltaMs =
+      deltaSeconds.isFinite ? Int64((deltaSeconds * 1000).rounded()) : 0
+    let currentMs = max(0, positionMs)
+    var targetMs = currentMs + deltaMs
+    let durationSeconds = duration.seconds
+    let durationMs =
+      durationSeconds > 0 && durationSeconds.isFinite
+      ? Int64((durationSeconds * 1000).rounded()) : 0
+    if !isLive && durationMs > 0 {
+      targetMs = min(max(0, targetMs), durationMs)
+    } else {
+      targetMs = max(0, targetMs)
+    }
+    positionMs = targetMs
+    let status = resetTimebase(targetMs: targetMs, reason: "skip")
+    flushForSeek()
+    seekGeneration &+= 1
+    let generation = seekGeneration
+    let rate = isPlaying && !isBuffering ? speed : 0
+    PipTrace.log(
+      "pip-seek: delta=\(deltaMs) target=\(targetMs) current=\(currentMs) "
+        + "duration=\(durationMs) rate=\(rate) status=\(status)"
     )
-    positionMs = Int64((target.seconds * 1000).rounded())
-    CMTimebaseSetTime(timebase, time: target)
-    sendEvent("skip", Int((skipInterval.seconds * 1000).rounded()))
+    // 原生不能直接 seek mpv：把目标位置交给 Dart，由 media_kit 真正执行。
+    // Dart 侧 seek 完成后会回传 position，帧回调继续供 PiP。
+    sendEvent("skip", ["delta": Int(deltaMs), "target": Int(targetMs)])
+    requestFramesAfterReset(generation: generation)
     completionHandler()
   }
 
