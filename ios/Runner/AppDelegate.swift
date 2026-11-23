@@ -61,13 +61,6 @@ import UIKit
     NSLog("[Diag] memory-warning count=\(memoryWarningCount)")
   }
 
-  private func didReceiveMemoryWarning() {
-    AppDelegate.recordMemoryWarning()
-  }
-
-  @objc func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
-    didReceiveMemoryWarning()
-  }
 }
 
 /// 诊断导出通道（`piliplus/diag_export`）。
