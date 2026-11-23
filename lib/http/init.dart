@@ -7,6 +7,7 @@ import 'package:PiliPlus/http/constants.dart';
 import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/http/retry_interceptor.dart';
 import 'package:PiliPlus/http/user.dart';
+import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/accounts/account.dart';
 import 'package:PiliPlus/utils/accounts/account_manager/account_mgr.dart';
@@ -20,6 +21,146 @@ import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:dio_http2_adapter/dio_http2_adapter.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, listEquals;
+
+const String _kDiagStartMs = '_diag_start_ms';
+const String _kDiagSinceResume = '_diag_since_resume';
+const String _kDiagFirstAfterResume = '_diag_first_after_resume';
+const String _kDiagFirstAfterLongIdle = '_diag_first_after_long_idle';
+
+/// 只读诊断拦截器：请求失败时写一条 `net-fail`，绝不改变重试/超时/鉴权行为。
+///
+/// 位置必须排在 `RetryInterceptor` 之前：Dio 的 onError 是逆序执行，
+/// 这样只有重试彻底放弃后的最终失败才会被记录，重试成功不产生噪音。
+class _NetFailDiagInterceptor extends Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    try {
+      if (kDiagEnabled) {
+        final (msSinceResume, firstAfterResume, firstAfterLongIdle) =
+            DiagProbe.takeRequestTiming();
+        options.extra
+          ..[_kDiagStartMs] = DateTime.now().millisecondsSinceEpoch
+          ..[_kDiagSinceResume] = msSinceResume
+          ..[_kDiagFirstAfterResume] = firstAfterResume
+          ..[_kDiagFirstAfterLongIdle] = firstAfterLongIdle;
+      }
+    } catch (_) {
+      // 诊断永远不能反过来影响请求本身。
+    }
+    handler.next(options);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    try {
+      _record(err);
+    } catch (_) {
+      // 诊断永远不能反过来影响请求失败的处理。
+    }
+    handler.next(err);
+  }
+
+  void _record(DioException err) {
+    final options = err.requestOptions;
+    final startMs = options.extra[_kDiagStartMs];
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final uri = options.uri;
+    DiagProbe.log('net-fail', <String, Object?>{
+      'host': uri.host,
+      // 只记 path，不记任何 query/value，避免 access_key、SESSDATA 等落盘。
+      'path': uri.path.isEmpty ? options.path.split('?').first : uri.path,
+      'method': options.method,
+      'statusCode': err.response?.statusCode,
+      'errorType': _errorType(err),
+      'dioType': err.type.name,
+      'errorMsg': _safeErrorMsg(err),
+      'elapsedMs': startMs is int ? nowMs - startMs : null,
+      'msSinceResume': options.extra[_kDiagSinceResume],
+      'firstAfterResume': options.extra[_kDiagFirstAfterResume] == true,
+      'firstAfterLongIdle': options.extra[_kDiagFirstAfterLongIdle] == true,
+      'hasToken': _hasToken(options),
+      'hasCookie': _hasHeader(options.headers, 'cookie'),
+    });
+  }
+
+  static String _errorType(DioException err) {
+    if (err.response != null) return 'http';
+    return switch (err.type) {
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout ||
+      DioExceptionType.transformTimeout => 'timeout',
+      DioExceptionType.badCertificate => 'tls',
+      DioExceptionType.badResponse => 'http',
+      DioExceptionType.connectionError ||
+      DioExceptionType.unknown => _classifyIoError(err.error) ?? 'connection',
+      DioExceptionType.cancel => 'connection',
+    };
+  }
+
+  static String? _classifyIoError(Object? error) {
+    if (error is HandshakeException || error is TlsException) return 'tls';
+    if (error is SocketException) {
+      final msg = error.message.toLowerCase();
+      if (msg.contains('failed host lookup') ||
+          msg.contains('nodename nor servname') ||
+          msg.contains('no address associated with hostname') ||
+          msg.contains('name or service not known') ||
+          msg.contains('temporary failure in name resolution')) {
+        return 'dns';
+      }
+      if (msg.contains('timed out') || msg.contains('timeout')) {
+        return 'timeout';
+      }
+      if (msg.contains('connection closed') ||
+          msg.contains('connection reset') ||
+          msg.contains('broken pipe') ||
+          msg.contains('socket has been closed') ||
+          msg.contains('connection abort')) {
+        return 'socket';
+      }
+      return 'connection';
+    }
+    return null;
+  }
+
+  static String _safeErrorMsg(DioException err) {
+    final raw = (err.error?.toString() ?? err.message ?? '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .replaceAllMapped(
+          RegExp(
+            r'(access_key|sessdata|bili_jct|buvid3|buvid4|token|cookie|authorization)\s*[=:]\s*[^&\s;]+',
+            caseSensitive: false,
+          ),
+          (match) => '${match[1]}=***',
+        );
+    return raw.length <= 300 ? raw : raw.substring(0, 300);
+  }
+
+  static bool _hasToken(RequestOptions options) {
+    if (_hasHeader(options.headers, 'authorization')) return true;
+    final cookie = _headerValue(options.headers, 'cookie');
+    if (cookie != null && cookie.contains('SESSDATA=')) return true;
+    if (options.queryParameters['access_key'] != null) return true;
+    final data = options.data;
+    return data is Map && data['access_key'] != null;
+  }
+
+  static String? _headerValue(Map<String, dynamic> headers, String name) {
+    for (final entry in headers.entries) {
+      if (entry.key.toLowerCase() == name) {
+        final value = entry.value;
+        return value?.toString();
+      }
+    }
+    return null;
+  }
+
+  static bool _hasHeader(Map<String, dynamic> headers, String name) {
+    final value = _headerValue(headers, name);
+    return value != null && value.isNotEmpty;
+  }
+}
 
 class Request {
   static final gzip = ZLibDecoder(gzip: true);
@@ -222,6 +363,9 @@ class Request {
       ..httpClientAdapter = _enableHttp2
           ? Http2Adapter(connectionManager, fallbackAdapter: h11)
           : h11;
+
+    // 只读诊断，先于重试拦截器入链：onError 逆序，最终失败才会被记录。
+    dio.interceptors.add(_NetFailDiagInterceptor());
 
     // 先于其他Interceptor
     if (Pref.retryCount != 0) {

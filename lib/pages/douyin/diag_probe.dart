@@ -99,6 +99,14 @@ abstract final class DiagProbe {
   static final Map<String, int> _sessionOpenBySource = <String, int>{};
   static final Map<String, int> _sessionBlackBySource = <String, int>{};
 
+  /// 最近一次 App 回到前台的时间，以及「回前台后首个请求」的待消费标记。
+  ///
+  /// 网络失败取证需要知道失败请求离最近一次 resume 有多久、是不是 resume
+  /// 后的第一个请求；状态只在这里保存，http/mobile_observer 只读调用。
+  static int _lastResumeAtMs = 0;
+  static bool _awaitFirstRequestAfterResume = false;
+  static bool _lastResumeWasLongIdle = false;
+
   /// 上一次完整读取 mpv 属性的时间与结果。
   static int _mpvCacheAt = 0;
   static final Map<String, Object?> _mpvCache = <String, Object?>{};
@@ -243,6 +251,38 @@ abstract final class DiagProbe {
   static void event(String event, [Map<String, Object?> fields = const {}]) {
     if (!kDiagEnabled) return;
     _append('diag_event', <String, Object?>{'event': event, ...fields});
+  }
+
+  /// 通用只读诊断入口，与播放诊断共用同一份 diag_playback.log。
+  ///
+  /// 生命周期与网络失败取证都走这里，避免再开一条写入链路导致行交错。
+  static void log(String tag, Map<String, Object?> fields) {
+    if (!kDiagEnabled) return;
+    _append(tag, fields);
+  }
+
+  /// App 回到前台时登记一次 resume，供网络失败取证计算 msSinceResume /
+  /// firstAfterResume；不参与任何网络决策。
+  static void noteResume(int atMs, {required bool longIdle}) {
+    if (!kDiagEnabled) return;
+    _lastResumeAtMs = atMs;
+    _awaitFirstRequestAfterResume = true;
+    _lastResumeWasLongIdle = longIdle;
+  }
+
+  /// 每个请求开始时调用一次，返回
+  /// (msSinceResume, firstAfterResume, firstAfterLongIdle)。
+  /// 首个请求会消费掉「回前台」标记，后面的请求只保留时间差。
+  static (int?, bool, bool) takeRequestTiming() {
+    if (!kDiagEnabled) {
+      return (null, false, false);
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final msSinceResume = _lastResumeAtMs == 0 ? null : now - _lastResumeAtMs;
+    final first = _awaitFirstRequestAfterResume;
+    final firstAfterLongIdle = first && _lastResumeWasLongIdle;
+    _awaitFirstRequestAfterResume = false;
+    return (msSinceResume, first, firstAfterLongIdle);
   }
 
   /// 记录一次 [_open] 的起点。旧 textureId 由调用方在 setDataSource 前读取。
