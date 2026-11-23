@@ -8,6 +8,15 @@ import UIKit
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     application.applicationSupportsShakeToEdit = false // Disable shake to undo
+    // 诊断：Scene 生命周期下 AppDelegate 的内存警告回调可能不来，补一条
+    // 系统通知监听；只计数打日志，不干预任何缓存/播放行为。
+    NotificationCenter.default.addObserver(
+      forName: UIApplication.didReceiveMemoryWarningNotification,
+      object: nil,
+      queue: .main
+    ) { _ in
+      AppDelegate.recordMemoryWarning()
+    }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
@@ -37,6 +46,27 @@ import UIKit
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "DiagExportPlugin") {
       DiagExportPlugin.register(with: registrar)
     }
+  }
+
+  /// 诊断：系统内存压力只计数并打日志，不做任何回收动作，避免影响播放。
+  /// delegate 回调与系统通知可能同时到达，200ms 内只记一次。
+  private static var memoryWarningCount = 0
+  private static var lastMemoryWarningAt: TimeInterval = 0
+
+  static func recordMemoryWarning() {
+    let now = ProcessInfo.processInfo.systemUptime
+    if now - lastMemoryWarningAt < 0.2 { return }
+    lastMemoryWarningAt = now
+    memoryWarningCount += 1
+    NSLog("[Diag] memory-warning count=\(memoryWarningCount)")
+  }
+
+  private func didReceiveMemoryWarning() {
+    AppDelegate.recordMemoryWarning()
+  }
+
+  @objc func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
+    didReceiveMemoryWarning()
   }
 }
 

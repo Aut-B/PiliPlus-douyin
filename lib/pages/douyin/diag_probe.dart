@@ -47,6 +47,9 @@ const int _blackScreenCheckMs = 3000;
 /// 一次切条最多观察 8 秒，避免探针永远挂着。
 const int _openProbeTimeoutMs = 8000;
 
+/// 一次 open 超过 5 秒还没收尾，写一条 `open-stuck` 留证。
+const int _openStuckMs = 5000;
+
 /// 切条探针前 3 秒用 100ms 轮询抓首帧，之后降到 500ms。
 ///
 /// 整段 8 秒都按 100ms 轮询时，探针本身每秒要读几十次播放器状态；一旦
@@ -87,6 +90,15 @@ abstract final class DiagProbe {
   static final List<String> _writeBuffer = <String>[];
   static int _writeBatchCount = 0;
 
+  /// 本页会话内的 open 序号与按来源统计。`stop()` 时汇总成
+  /// `session-summary`，用来直接对比自动连播与手动选播。
+  static int _openSeq = 0;
+  static int _sessionStartedAt = 0;
+  static int _sessionBlackCount = 0;
+  static final Set<int> _sessionTextureIds = <int>{};
+  static final Map<String, int> _sessionOpenBySource = <String, int>{};
+  static final Map<String, int> _sessionBlackBySource = <String, int>{};
+
   /// 上一次完整读取 mpv 属性的时间与结果。
   static int _mpvCacheAt = 0;
   static final Map<String, Object?> _mpvCache = <String, Object?>{};
@@ -108,6 +120,22 @@ abstract final class DiagProbe {
       await GStorage.setting.put(_kPipLiteModeKey, value);
     } catch (_) {}
   }
+
+  /// 页面会话起点。进入播放页时调用一次；[stop] 时写 `session-summary`。
+  static void startSession() {
+    if (!kDiagEnabled) return;
+    _sessionStartedAt = DateTime.now().millisecondsSinceEpoch;
+    _openSeq = 0;
+    _sessionBlackCount = 0;
+    _sessionTextureIds.clear();
+    _sessionOpenBySource.clear();
+    _sessionBlackBySource.clear();
+  }
+
+  /// 本页从进入到现在经过的毫秒数；未开会话时返回 0。
+  static int get sessionElapsedMs => _sessionStartedAt == 0
+      ? 0
+      : DateTime.now().millisecondsSinceEpoch - _sessionStartedAt;
 
   /// 一次读取当前播放器的 mpv 指标、position 与 textureId。
   ///
@@ -222,6 +250,7 @@ abstract final class DiagProbe {
     required int index,
     required String key,
     int? oldTextureId,
+    String source = 'auto',
   }) {
     if (!kDiagEnabled) return;
     final sw = Stopwatch()..start();
@@ -229,7 +258,12 @@ abstract final class DiagProbe {
     invalidateSnapshotCache();
     final startedAt = DateTime.now().millisecondsSinceEpoch;
     final snap = snapshot(full: true);
+    final seq = ++_openSeq;
+    if (oldTextureId != null) _sessionTextureIds.add(oldTextureId);
+    _sessionOpenBySource[source] = (_sessionOpenBySource[source] ?? 0) + 1;
     final tracker = _OpenTracker(
+      seq: seq,
+      source: source,
       index: index,
       key: key,
       startedAt: startedAt,
@@ -239,6 +273,8 @@ abstract final class DiagProbe {
     );
     _tracker = tracker;
     _append('open-start', <String, Object?>{
+      'seq': seq,
+      'source': source,
       'index': index,
       'key': key,
       'oldTextureId': oldTextureId,
@@ -247,6 +283,12 @@ abstract final class DiagProbe {
     });
     _passiveUiBlock('beginOpen', sw);
     _rearmOpenTimer(_openFastPollMs);
+  }
+
+  /// 记录当前 open 进行到哪一段，供 `open-stuck` 判断卡在哪一步。
+  static void openPhase(String phase) {
+    if (!kDiagEnabled) return;
+    _tracker?.phase = phase;
   }
 
   /// [_open] 收尾时写一行汇总。出错时同时停掉探针，避免误记到下一条。
@@ -260,13 +302,32 @@ abstract final class DiagProbe {
     // 缓存刚被作废，默认快照会自己刷新一次；不再强制 full，避免多读一轮。
     final snap = snapshot();
     final now = DateTime.now().millisecondsSinceEpoch;
+    final newTextureId = _asInt(tracker.newTextureId ?? snap['textureId']);
+    if (newTextureId != null) _sessionTextureIds.add(newTextureId);
+    final elapsedMs = now - tracker.startedAt;
+    _append('open-seq', <String, Object?>{
+      'seq': tracker.seq,
+      'source': tracker.source,
+      'index': tracker.index,
+      'key': tracker.key,
+      'oldTextureId': tracker.oldTextureId,
+      'newTextureId': newTextureId,
+      'textureChanged': tracker.oldTextureId == null || newTextureId == null
+          ? null
+          : tracker.oldTextureId != newTextureId,
+      'distinctTextureCount': _sessionTextureIds.length,
+      'elapsedMs': elapsedMs,
+      'error': error,
+    });
     _append('open-end', <String, Object?>{
+      'seq': tracker.seq,
+      'source': tracker.source,
       'index': tracker.index,
       'key': tracker.key,
       'error': error,
-      'elapsedMs': now - tracker.startedAt,
+      'elapsedMs': elapsedMs,
       'oldTextureId': tracker.oldTextureId,
-      'newTextureId': tracker.newTextureId ?? snap['textureId'],
+      'newTextureId': newTextureId,
       'loadedAfterMs': tracker.loadedAt == null
           ? null
           : tracker.loadedAt! - tracker.startedAt,
@@ -287,12 +348,68 @@ abstract final class DiagProbe {
     _passiveUiBlock('endOpen', sw);
   }
 
+  /// 一条视频真正起播时写一行，标出它是否已经出现过首帧缺失。
+  static void playItem({required String key, String? source}) {
+    if (!kDiagEnabled) return;
+    final tracker = _tracker;
+    _append('play-item', <String, Object?>{
+      'seq': tracker?.seq ?? _openSeq,
+      'source': source ?? tracker?.source ?? 'auto',
+      'key': key,
+      'blackSuspect': tracker?.firstFrameMissLogged ?? false,
+    });
+  }
+
+  /// 切换/退出时旧 player 与 texture 的 dispose 结果。
+  static void disposeResult({
+    required bool ok,
+    String? error,
+    required int elapsedMs,
+    String scope = 'page-shutdown',
+  }) {
+    if (!kDiagEnabled) return;
+    _append('dispose-result', <String, Object?>{
+      'seq': _openSeq,
+      'scope': scope,
+      'ok': ok,
+      'error': error,
+      'elapsedMs': elapsedMs,
+    });
+    // 页面已经退出，延迟批量写可能等不到下一次定时器，这里立即落盘。
+    unawaited(flush());
+  }
+
   /// 页面退出时统一收尾。
   static void stop() {
     if (!kDiagEnabled) return;
     stopSampling();
     _stopOpenProbe();
+    _appendSessionSummary();
     unawaited(flush());
+  }
+
+  static void _appendSessionSummary() {
+    if (_sessionStartedAt == 0) return;
+    Map<String, Object?> bySource(String key) => <String, Object?>{
+      'open': _sessionOpenBySource[key] ?? 0,
+      'black': _sessionBlackBySource[key] ?? 0,
+    };
+    _append('session-summary', <String, Object?>{
+      'openedCount': _sessionOpenBySource.values.fold<int>(
+        0,
+        (sum, value) => sum + value,
+      ),
+      'blackCount': _sessionBlackCount,
+      'distinctTextureCount': _sessionTextureIds.length,
+      'pageAliveMs': sessionElapsedMs,
+      'bySource': <String, Object?>{
+        'auto': bySource('auto'),
+        'next': bySource('next'),
+        'playlistSelect': bySource('playlist-select'),
+        'initial': bySource('initial'),
+      },
+    });
+    _sessionStartedAt = 0;
   }
 
   /// 把 Documents 下的诊断文件打成一个 zip，并交给系统分享面板。
@@ -361,7 +478,10 @@ abstract final class DiagProbe {
       final now = DateTime.now().millisecondsSinceEpoch;
       final position = player.positionInMilliseconds;
       final textureId = player.videoController?.id.value;
-      if (textureId != null) tracker.newTextureId = textureId;
+      if (textureId != null) {
+        tracker.newTextureId = textureId;
+        _sessionTextureIds.add(textureId);
+      }
       final status = player.dataStatus.value;
       if (status == DataStatus.loading) tracker.sawLoading = true;
       // 切条刚开始时 position 还是上一条的，不能直接当新视频首帧。
@@ -405,6 +525,40 @@ abstract final class DiagProbe {
         });
       }
       final elapsed = now - tracker.startedAt;
+      // 3 秒仍没有起播位置、或者 mpv 还没给出视频宽高：记首帧缺失。
+      // 强制实时判断有没有声音，区分「黑屏但有声」。
+      if (!tracker.firstFrameMissLogged && elapsed >= _blackScreenCheckMs) {
+        final snap = snapshot();
+        final videoParamsW = _asNum(snap['video-params/w']);
+        if (position == 0 || videoParamsW == null) {
+          tracker.firstFrameMissLogged = true;
+          _markBlack(tracker);
+          _append('first-frame-miss', <String, Object?>{
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+            'key': tracker.key,
+            'afterOpenMs': elapsed,
+            'positionMs': position,
+            'videoParamsW': videoParamsW,
+            'dataStatus': status.name,
+            'textureId': textureId,
+            'audioReady': _audioReady(player),
+          });
+        }
+      }
+      // open 已收尾后计时器还要留到 3 秒黑屏判定，不能把正常完成的一批
+      // 误记成「5 秒没结束」。
+      if (!tracker.ended && !tracker.stuckLogged && elapsed >= _openStuckMs) {
+        tracker.stuckLogged = true;
+        _append('open-stuck', <String, Object?>{
+          'seq': tracker.seq,
+          'source': tracker.source,
+          'index': tracker.index,
+          'elapsedMs': elapsed,
+          'phase': tracker.phase,
+        });
+      }
       if (!_openSlowPoll && elapsed >= _openFastWindowMs) {
         _openSlowPoll = true;
         _rearmOpenTimer(_openSlowPollMs);
@@ -420,11 +574,17 @@ abstract final class DiagProbe {
         if (tracker.firstFrameAt == null) {
           _append('diag_event', <String, Object?>{
             'event': 'open-no-first-frame',
+            'seq': tracker.seq,
+            'source': tracker.source,
             'index': tracker.index,
             'elapsedMs': elapsed,
           });
         }
-        _stopOpenProbe();
+        // 只停轮询，保留 tracker：真正卡住的 _open 收尾时还要写
+        // open-end / open-seq，否则这条 open 的出口证据会丢。
+        _openTimer?.cancel();
+        _openTimer = null;
+        _openSlowPoll = false;
       }
     } catch (_) {}
   }
@@ -448,6 +608,7 @@ abstract final class DiagProbe {
       reason = 'drop-frame-count-jump';
     }
     if (reason == null) return;
+    _markBlack(tracker);
     _append('diag_event', <String, Object?>{
       'event': 'blackscreen-suspect',
       'reason': reason,
@@ -465,6 +626,28 @@ abstract final class DiagProbe {
       'dropFrameDelta': delta,
       'textureId': tracker.newTextureId ?? snap['textureId'],
     });
+  }
+
+  static void _markBlack(_OpenTracker tracker) {
+    if (tracker.blackCounted) return;
+    tracker.blackCounted = true;
+    _sessionBlackCount += 1;
+    _sessionBlackBySource[tracker.source] =
+        (_sessionBlackBySource[tracker.source] ?? 0) + 1;
+  }
+
+  /// 有声音没画面：优先看 mpv 是否已经识别出音频轨；读不到时退回
+  /// 「正在播且不在缓冲」这个保守判断。
+  static bool? _audioReady(PlPlayerController player) {
+    try {
+      final codec = player.videoPlayerController?.getProperty('audio-codec');
+      if (codec != null && codec.isNotEmpty) return true;
+    } catch (_) {}
+    try {
+      return player.playerStatus.isPlaying && !player.isBuffering.value;
+    } catch (_) {
+      return null;
+    }
   }
 
   static void _stopOpenProbe() {
@@ -594,6 +777,8 @@ abstract final class DiagProbe {
 
 final class _OpenTracker {
   _OpenTracker({
+    required this.seq,
+    required this.source,
     required this.index,
     required this.key,
     required this.startedAt,
@@ -602,6 +787,8 @@ final class _OpenTracker {
     required this.dropBaseline,
   });
 
+  final int seq;
+  final String source;
   final int index;
   final String key;
   final int startedAt;
@@ -614,5 +801,9 @@ final class _OpenTracker {
   int? firstFrameAt;
   bool sawLoading = false;
   bool blackChecked = false;
+  bool blackCounted = false;
+  bool firstFrameMissLogged = false;
+  bool stuckLogged = false;
   bool ended = false;
+  String phase = 'resolve';
 }

@@ -81,8 +81,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 不加这个字段的话，`_opening` 为真时那次点击会被直接丢掉：列表页
   /// 已经 pop 掉了，用户看到列表关闭、视频却没换。
   int? _pendingOpenIndex;
+  String? _pendingOpenSource;
   String? _error;
   bool _shuffle = false;
+
+  /// 只读诊断标志：只要有一次切条在途（open 中或列表点击已排队）就算真。
+  bool get _switching => _opening || _pendingOpenIndex != null;
 
   /// 当前这条是否已经成功加载并起播。
   ///
@@ -213,6 +217,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _isPlaying.value = _player.playerStatus.isPlaying;
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
     // 普通包头一行就会 return，不产生文件。
+    DiagProbe.startSession();
     DiagProbe.startSampling();
     _startPipTicker();
     _scheduleChromeHide();
@@ -221,7 +226,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_dumpViewHierarchy());
       unawaited(PiliRootScan.run());
-      unawaited(_open(_index));
+      unawaited(_open(_index, source: 'initial'));
       unawaited(_restoreShuffle());
     });
   }
@@ -293,11 +298,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         _pipEntered = false;
       }
     } catch (_) {}
+    final disposeSw = Stopwatch()..start();
+    var disposeOk = false;
+    String? disposeError;
     try {
       // 单例的 dispose 会把 _instance 置空，下次进播放页重新 getInstance 拿到
       // 干净实例。前提是本页只在 dispose() 时做，绝不在 build 期间调用。
       _player.dispose();
-    } catch (_) {}
+      disposeOk = true;
+    } catch (error) {
+      disposeError = '$error';
+    } finally {
+      disposeSw.stop();
+      DiagProbe.disposeResult(
+        ok: disposeOk,
+        error: disposeError,
+        elapsedMs: disposeSw.elapsedMilliseconds,
+      );
+    }
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
     _releaseBackgroundKeepAlive();
@@ -349,8 +367,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 把某一条解析成可以直接交给播放器的地址，然后开播。
-  Future<void> _open(int index) async {
-    if (_opening || _queue.isEmpty) return;
+  Future<void> _open(int index, {String source = 'auto'}) async {
+    if (_opening || _queue.isEmpty) {
+      _diagSwitchBlocked(
+        source,
+        _opening ? 'opening' : 'empty-queue',
+        targetIndex: index,
+      );
+      return;
+    }
     final target = index.clamp(0, _queue.length - 1);
     final session = ++_openSession;
     _opening = true;
@@ -365,7 +390,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         index: target,
         key: entry.key,
         oldTextureId: oldTextureId,
+        source: source,
       );
+      DiagProbe.openPhase('resolve');
       setState(() {
         _index = target;
         _error = null;
@@ -395,6 +422,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         setState(() => _error = '解析不出播放地址');
         return;
       }
+      // 自动连播会优先吃预取结果，手动选播通常重新解析；把来源与是否本地
+      // 缓存写进日志，才能对比两条 open 路径拿到的媒体是否不同。
+      DiagProbe.event('open-media', <String, Object?>{
+        'source': source,
+        'index': target,
+        'key': entry.key,
+        'local': media.isLocal,
+        'host': Uri.tryParse(media.url)?.host,
+      });
       // 抖音 / TikTok 的 CDN 认网页 UA 和 referer，上游 controller 里默认写死了
       // 桌面 UA + B 站 referer，直接用会 403 或者只给到一部分数据（表现为
       // 「有声音没画面」）。这里在开播前把 header 换成本条自己的来源。
@@ -409,6 +445,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       } else {
         _player.overrideMediaHeader();
       }
+      DiagProbe.openPhase('set-datasource');
       final sourceSw = Stopwatch()..start();
       await _player.setDataSource(
         // 缓存好的那条是磁盘上的 mp4，必须按本地文件打开，不能当网络源。
@@ -453,6 +490,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 抖音页没有注册，只加载不会真正播放，这里在确认数据源就绪后
       // 显式起播；首条和自动切出的下一条都会经过这里。
       if (_player.dataStatus.value != DataStatus.loaded) return;
+      DiagProbe.openPhase('play');
       final playSw = Stopwatch()..start();
       await _player.play();
       playSw.stop();
@@ -466,6 +504,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _publishPipState();
       _completionArmed = true;
       _armedSession = session;
+      DiagProbe.openPhase('played');
+      DiagProbe.playItem(key: entry.key);
       _isPlaying.value = _player.playerStatus.isPlaying;
       _notePlayed(entry.key);
       _prefetchNext();
@@ -481,11 +521,46 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 加载期间用户在播放列表里点过别的条目：现在补跳过去，否则那次
       // 点击会石沉大海（列表已经关了，屏幕上什么都没变）。
       final pending = _pendingOpenIndex;
+      final pendingSource = _pendingOpenSource ?? 'auto';
       _pendingOpenIndex = null;
+      _pendingOpenSource = null;
       if (pending != null && mounted && !_leaving && !_disposed) {
-        unawaited(_open(pending));
+        unawaited(_open(pending, source: pendingSource));
       }
     }
+  }
+
+  void _diagSwitchRequest(String source, int targetIndex) {
+    DiagProbe.event('switch-request', <String, Object?>{
+      'source': source,
+      'targetIndex': targetIndex,
+      'curIndex': _index,
+      'switchingFlag': _switching,
+      'openingFlag': _opening,
+      'isBuffering': _player.isBuffering.value,
+      'playing': _player.playerStatus.isPlaying,
+      'positionMs': _player.positionInMilliseconds,
+      'durationMs': _player.durationInMilliseconds,
+      'queueLen': _queue.length,
+      'textureId': _player.videoController?.id.value,
+      'msSincePageStart': DiagProbe.sessionElapsedMs,
+    });
+  }
+
+  void _diagSwitchBlocked(
+    String source,
+    String reason, {
+    int? targetIndex,
+  }) {
+    DiagProbe.event('switch-blocked', <String, Object?>{
+      'source': source,
+      'reason': reason,
+      'targetIndex': targetIndex,
+      'curIndex': _index,
+      'switchingFlag': _switching,
+      'openingFlag': _opening,
+      'isBuffering': _player.isBuffering.value,
+    });
   }
 
   /// 主 isolate 计时探针：一次同步工作超过 50ms 就写一条 `ui-block`，
@@ -661,11 +736,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 下一条。顺序模式就是下一条，随机模式从牌堆里取，保证一轮之内不重复。
-  Future<void> _next() async {
-    if (_queue.length <= 1) return;
+  Future<void> _next({String source = 'auto'}) async {
+    if (_queue.length <= 1) {
+      _diagSwitchRequest(source, _index);
+      _diagSwitchBlocked(source, 'single-item', targetIndex: _index);
+      return;
+    }
     if (!_shuffle) {
       final next = (_index + 1) % _queue.length;
-      await _open(next);
+      _diagSwitchRequest(source, next);
+      await _open(next, source: source);
       return;
     }
     if (_deck.isEmpty) _refillDeck();
@@ -674,10 +754,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (key == _current.key) continue;
       final index = _queue.indexWhere((e) => e.key == key);
       if (index < 0) continue;
-      await _open(index);
+      _diagSwitchRequest(source, index);
+      await _open(index, source: source);
       return;
     }
-    await _open((_index + 1) % _queue.length);
+    final fallback = (_index + 1) % _queue.length;
+    _diagSwitchRequest(source, fallback);
+    await _open(fallback, source: source);
   }
 
   /// 重新发牌：这一轮没播过的都进去，洗一遍。
@@ -701,8 +784,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   Future<void> _previous() async {
-    if (_queue.length <= 1) return;
-    await _open((_index - 1 + _queue.length) % _queue.length);
+    if (_queue.length <= 1) {
+      _diagSwitchRequest('next', _index);
+      _diagSwitchBlocked('next', 'single-item', targetIndex: _index);
+      return;
+    }
+    final target = (_index - 1 + _queue.length) % _queue.length;
+    _diagSwitchRequest('next', target);
+    await _open(target, source: 'next');
   }
 
   /// 打开播放列表。列表里调序会回调 [_applyPlaylistOrder]，
@@ -770,6 +859,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _prefetchFuture = null;
     final target = index.clamp(0, entries.length - 1);
     final key = entries[target].key;
+    _diagSwitchRequest('playlist-select', target);
     final wasCurrentKey = _current.key;
     setState(() {
       _queue
@@ -778,14 +868,27 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _index = target;
     });
     // 点的就是当前这条：只把队列换成列表顺序，不重新加载打断播放。
-    if (key == wasCurrentKey) return;
+    if (key == wasCurrentKey) {
+      _diagSwitchBlocked(
+        'playlist-select',
+        'duplicate-target',
+        targetIndex: target,
+      );
+      return;
+    }
     // 正在解析/加载上一条时不能直接丢弃这次点击：列表已经关了，用户点了却
     // 什么都没发生。记下来，等当前这次 _open 收尾时补跳。
     if (_opening) {
       _pendingOpenIndex = target;
+      _pendingOpenSource = 'playlist-select';
+      _diagSwitchBlocked(
+        'playlist-select',
+        'opening-deferred',
+        targetIndex: target,
+      );
       return;
     }
-    unawaited(_open(target));
+    unawaited(_open(target, source: 'playlist-select'));
   }
 
   Future<void> _togglePlay() async {
@@ -1307,10 +1410,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               ),
               const SizedBox(height: 12),
               TextButton(
-                onPressed: () => _open(_index),
+                onPressed: () => _open(_index, source: 'next'),
                 child: const Text('重试'),
               ),
-              TextButton(onPressed: _next, child: const Text('下一条')),
+              TextButton(
+                onPressed: () => unawaited(_next(source: 'next')),
+                child: const Text('下一条'),
+              ),
             ],
           ),
         ),
@@ -1601,7 +1707,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               ),
               ComBtn(
                 icon: const Icon(Icons.skip_next, color: Colors.white),
-                onTap: () => unawaited(_next()),
+                onTap: () => unawaited(_next(source: 'next')),
                 tooltip: '下一条',
                 width: 30,
                 height: 30,
