@@ -68,7 +68,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   late final List<QueueEntry> _queue = List<QueueEntry>.of(widget.queue);
   late int _index = widget.index.clamp(0, _queue.length - 1);
 
-  final PlPlayerController _player = PlPlayerController.getInstance();
+  /// 播放器单例。首帧看门狗自愈时会先 dispose 再重新 getInstance，
+  /// 因此不能是 final；否则自动连播复用同一 texture 永远救不回来。
+  PlPlayerController _player = PlPlayerController.getInstance();
 
   /// 随机播放的牌堆。空表示需要重新发牌。
   final List<String> _deck = <String>[];
@@ -183,6 +185,51 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 上一次 position 回调的墙钟时间，用来量化主 isolate 冻结。
   int _lastPositionTickMs = 0;
 
+  /// 进度条专用局部状态。
+  ///
+  /// position/ duration / buffered 原来分别挂在 Obx 上，每个 position 回调
+  /// 都会把控件树里的进度条和时间文本标脏。这里合并成一个 ValueNotifier，
+  /// 按 200ms 节流后只刷这两个小部件，position 回调本身不再触发整页重建。
+  final ValueNotifier<_PlaybackProgress> _progress =
+      ValueNotifier<_PlaybackProgress>(const _PlaybackProgress());
+  int _lastProgressPushMs = 0;
+
+  /// 首帧看门狗。每次 open 起播后挂一次，超时没有首帧就整实例重建。
+  Timer? _firstFrameWatchdog;
+  int _watchdogSession = -1;
+  int _watchdogIndex = -1;
+  String _watchdogSource = 'auto';
+  int _watchdogStartedAtMs = 0;
+  bool _watchdogGraceUsed = false;
+  int _watchdogOpenBusyRetries = 0;
+  int _openStartPositionMs = 0;
+  bool _firstFrameSeen = false;
+  bool _recovering = false;
+  int _autoRecoverCount = 0;
+  int _recoverStreak = 0;
+
+  /// 当前这次 [_open] 的起点，用来识别卡住的 opening 标志。
+  int _openStartedAtMs = 0;
+
+  /// 当前真正持有 `_opening` 的会话号。
+  ///
+  /// 被新请求作废的旧 open 仍可能在 await 里；它收尾时不能把新 open 的
+  /// `_opening` 清掉，也不能替新 open 消费 pending。
+  int _activeOpenSession = -1;
+
+  /// open 在途超过这个时长就视为卡死；下一次切条先复位标志再继续。
+  static const int _staleOpenMs = 12000;
+
+  /// 看门狗撞上「本次 open 还没返回」时最多让路几次。
+  ///
+  /// 每次让路 1 秒；超过这个次数说明 open 自己卡住了，再等也不会等到首帧，
+  /// 继续挂定时器只会无限自旋。此时停表并留日志，等下一次用户切条按
+  /// [_staleOpenMs] 复位。
+  static const int _maxWatchdogOpenBusyRetries = 8;
+
+  /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
+  bool _appPaused = false;
+
   /// `ui-block` 事件按 stage/step 限流，避免持续卡顿把日志刷爆。
   final Map<String, int> _uiBlockLoggedAt = <String, int>{};
 
@@ -211,10 +258,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _player.addStatusLister(_onPlayerStatus);
-    _statusListening = true;
-    _player.addPositionListener(_onPositionTick);
-    _isPlaying.value = _player.playerStatus.isPlaying;
+    _attachPlayerListeners();
+    _pushProgress(force: true);
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
     // 普通包头一行就会 return，不产生文件。
     DiagProbe.startSession();
@@ -244,11 +289,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     } catch (_) {}
   }
 
+  /// 监听只挂一次、只摘一次。首帧自愈会换掉 [_player]，必须用同一组
+  /// 方法重新挂载，否则新播放器没有 position/status 回调，看门狗也就失效。
+  void _attachPlayerListeners() {
+    _player.addStatusLister(_onPlayerStatus);
+    _statusListening = true;
+    _player.addPositionListener(_onPositionTick);
+    _isPlaying.value = _player.playerStatus.isPlaying;
+  }
+
+  void _detachPlayerListeners() {
+    if (_statusListening) {
+      _statusListening = false;
+      try {
+        _player.removeStatusLister(_onPlayerStatus);
+      } catch (_) {}
+    }
+    try {
+      _player.removePositionListener(_onPositionTick);
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _stopPipTicker();
     _chromeTimer?.cancel();
+    _firstFrameWatchdog?.cancel();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
     // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
@@ -261,6 +328,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _gestureHintTimer?.cancel();
     _gestureHint.dispose();
     _isPlaying.dispose();
+    _progress.dispose();
     super.dispose();
   }
 
@@ -285,13 +353,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _stopPipTicker();
     _prefetchKey = null;
     _prefetchFuture = null;
-    if (_statusListening) {
-      _statusListening = false;
-      _player.removeStatusLister(_onPlayerStatus);
-    }
-    try {
-      _player.removePositionListener(_onPositionTick);
-    } catch (_) {}
+    _detachPlayerListeners();
     try {
       if (_pipEntered && IOSPipHelper.isActive) {
         IOSPipHelper.dispose();
@@ -367,19 +429,95 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 把某一条解析成可以直接交给播放器的地址，然后开播。
-  Future<void> _open(int index, {String source = 'auto'}) async {
-    if (_opening || _queue.isEmpty) {
+  Future<void> _open(
+    int index, {
+    String source = 'auto',
+    bool force = false,
+  }) async {
+    if (_disposed || _leaving || _queue.isEmpty) {
       _diagSwitchBlocked(
         source,
-        _opening ? 'opening' : 'empty-queue',
+        _queue.isEmpty ? 'empty-queue' : 'page-gone',
         targetIndex: index,
       );
       return;
     }
     final target = index.clamp(0, _queue.length - 1);
+    // 切条请求不能因为上一次 open 还在途就被丢掉：用户点「下一条」或播放
+    // 列表条目时，列表页已经关了，丢掉就等于这一下彻底没反应。这里排队，
+    // 并把在途会话作废，让它跑到下一个检查点就退出，不再把用户不想要的那条
+    // 播出来；真正的补跳在 finally 里执行。
+    if (_recovering && !force) {
+      _pendingOpenIndex = target;
+      _pendingOpenSource = source;
+      DiagProbe.event('switch-pending', <String, Object?>{
+        'source': source,
+        'targetIndex': target,
+        'curIndex': _index,
+        'reason': 'recovering',
+        'isBuffering': _player.isBuffering.value,
+      });
+      return;
+    }
+    if (_opening) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final staleMs = _openStartedAtMs > 0 ? now - _openStartedAtMs : 0;
+      if (staleMs > _staleOpenMs) {
+        _opening = false;
+        _openStartedAtMs = 0;
+        DiagProbe.event('switch-blocked', <String, Object?>{
+          'source': source,
+          'reason': 'stale-opening-reset',
+          'staleMs': staleMs,
+          'targetIndex': target,
+          'curIndex': _index,
+          'switchingFlag': _switching,
+          'isBuffering': _player.isBuffering.value,
+        });
+      } else {
+        _pendingOpenIndex = target;
+        _pendingOpenSource = source;
+        _openSession++;
+        _diagSwitchBlocked(
+          source,
+          'opening-deferred',
+          targetIndex: target,
+        );
+        DiagProbe.event('switch-pending', <String, Object?>{
+          'source': source,
+          'targetIndex': target,
+          'curIndex': _index,
+          'msSinceOpen': _openStartedAtMs == 0 ? null : now - _openStartedAtMs,
+          'isBuffering': _player.isBuffering.value,
+        });
+        return;
+      }
+    }
     final session = ++_openSession;
+    _activeOpenSession = session;
+    final fromIndex = _index;
+    final switchingBefore = _switching;
+    _openStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _openStartPositionMs = _player.positionInMilliseconds;
+    if (source != 'auto-recover') _recoverStreak = 0;
+    _cancelFirstFrameWatchdog();
+    _firstFrameSeen = false;
     _opening = true;
     _completionArmed = false;
+    // 开关日志：记录点击/自动连播真正进入 open 的瞬间。isBuffering 不是
+    // 拦截条件，这里只把它作为证据写下来，方便对比「buffering 时点了也切」。
+    DiagProbe.event('switch-now', <String, Object?>{
+      'source': source,
+      'targetIndex': target,
+      'fromIndex': fromIndex,
+      'isBuffering': _player.isBuffering.value,
+      'playing': _player.playerStatus.isPlaying,
+      'switchingFlag': switchingBefore,
+      'pendingFlag': _pendingOpenIndex != null,
+      'recovering': _recovering,
+      'positionMs': _openStartPositionMs,
+      'textureId': _player.videoController?.id.value,
+    });
     String? openError;
     try {
       final entry = _queue[target];
@@ -416,7 +554,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         resolveSw,
         extra: <String, Object?>{'index': target},
       );
-      if (!mounted) return;
+      if (!mounted || _disposed || _leaving || session != _openSession) {
+        return;
+      }
       if (media == null || media.url.isEmpty) {
         openError = 'no-media';
         setState(() => _error = '解析不出播放地址');
@@ -484,7 +624,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'oldTextureId': oldTextureId,
         'newTextureId': newTextureId,
       });
-      if (!mounted || session != _openSession) return;
+      if (!mounted || _disposed || _leaving || session != _openSession) {
+        return;
+      }
       // `setDataSource(autoplay: true)` 内部的自动播放走的是静态
       // `playIfExists()`，只有 B 站视频页 / 直播页注册了那个回调。
       // 抖音页没有注册，只加载不会真正播放，这里在确认数据源就绪后
@@ -500,10 +642,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         playSw,
         extra: <String, Object?>{'index': target},
       );
-      if (!mounted || session != _openSession) return;
+      if (!mounted || _disposed || _leaving || session != _openSession) {
+        return;
+      }
       _publishPipState();
       _completionArmed = true;
       _armedSession = session;
+      _armFirstFrameWatchdog(
+        session: session,
+        index: target,
+        source: source,
+      );
+      _pushProgress(force: true);
       DiagProbe.openPhase('played');
       DiagProbe.playItem(key: entry.key);
       _isPlaying.value = _player.playerStatus.isPlaying;
@@ -517,17 +667,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
       DiagProbe.endOpen(error: openError);
-      _opening = false;
-      // 加载期间用户在播放列表里点过别的条目：现在补跳过去，否则那次
-      // 点击会石沉大海（列表已经关了，屏幕上什么都没变）。
-      final pending = _pendingOpenIndex;
-      final pendingSource = _pendingOpenSource ?? 'auto';
-      _pendingOpenIndex = null;
-      _pendingOpenSource = null;
-      if (pending != null && mounted && !_leaving && !_disposed) {
-        unawaited(_open(pending, source: pendingSource));
+      // 只有仍然持有 `_opening` 的会话才有资格收尾。被新请求作废的旧
+      // open 可能刚醒过来，不能把新 open 的标志清掉、也不能替它消费
+      // pending，否则新 open 会立刻被当成「已结束」而丢状态。
+      if (_activeOpenSession == session) {
+        _activeOpenSession = -1;
+        _opening = false;
+        _openStartedAtMs = 0;
+        // 自愈的 open 收尾时仍处于 recovery 中，交给 recovery 的 finally
+        // 消费 pending；否则这里同步再 open 会被 `_recovering` 二次排队。
+        if (!_recovering) _consumePendingOpen();
       }
     }
+  }
+
+  /// 补跳加载期间用户点下的目标。列表页此时已经关闭，丢一次就完全没反应。
+  void _consumePendingOpen() {
+    final pending = _pendingOpenIndex;
+    if (pending == null) return;
+    final pendingSource = _pendingOpenSource ?? 'auto';
+    _pendingOpenIndex = null;
+    _pendingOpenSource = null;
+    if (!mounted || _leaving || _disposed) return;
+    unawaited(_open(pending, source: pendingSource));
   }
 
   void _diagSwitchRequest(String source, int targetIndex) {
@@ -607,6 +769,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_isPlaying.value != isPlaying) {
       _isPlaying.value = isPlaying;
     }
+    // 进度只推给底部那一小块 ValueListenableBuilder，不再让整个页面或
+    // Obx 子树跟着 position 回调重建。
+    // 首帧判定放在看门狗里做：它要读一次 mpv 属性（同步 FFI），不能塞进
+    // 每秒多次的 position 回调，否则又会把主 isolate 堵住。
+    _pushProgress();
     sw.stop();
     _diagUiBlock(
       'position',
@@ -629,6 +796,271 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           'positionMs': position.inMilliseconds,
         });
       }
+    }
+  }
+
+  /// 把 position / duration / buffered 合并成一个低节拍的局部状态。
+  ///
+  /// position 回调一秒可能来好几次，直接逐次刷 widget 会把进度条和时间
+  /// 文本反复标脏；这里 200ms 节流，并且只在秒级数值变化时通知。
+  void _pushProgress({bool force = false}) {
+    if (_disposed || !mounted) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (!force && now - _lastProgressPushMs < 200) return;
+    _lastProgressPushMs = now;
+    final total = _player.duration.value;
+    final position = total <= 0
+        ? 0
+        : _player.position.value.clamp(0, total).toInt();
+    final buffered = total <= 0
+        ? 0
+        : _player.buffered.value.clamp(0, total).toInt();
+    final next = _PlaybackProgress(
+      position: position,
+      duration: total,
+      buffered: buffered,
+    );
+    if (next != _progress.value) {
+      _progress.value = next;
+    }
+  }
+
+  /// 直接读 mpv 的视频轨宽度。
+  ///
+  /// 不能用 `state.width`：连播复用同一个 texture 时，它可能还是上一条的
+  /// 宽高，会把「有声音没画面」误判成已经有首帧。mpv 的 `video-params/w`
+  /// 在新文件解出视频轨前为空，正好对应真机日志里的 no-first-frame。
+  int? _mpvVideoWidth() {
+    try {
+      final raw = _player.videoPlayerController?.getProperty('video-params/w');
+      if (raw == null || raw.isEmpty) return null;
+      final width = num.tryParse(raw);
+      if (width == null || width <= 0) return null;
+      return width.toInt();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 首帧判定：起播位置在走，且 mpv 已经识别出视频轨。
+  ///
+  /// 会做一次同步 FFI 读取，只允许在看门狗（低频）里调用，不能放进
+  /// 每秒多次的 position 回调。
+  bool _hasFirstFrameNow() {
+    if (_player.dataStatus.value != DataStatus.loaded) return false;
+    if (_player.positionInMilliseconds <= 0) return false;
+    return (_mpvVideoWidth() ?? 0) > 0;
+  }
+
+  void _armFirstFrameWatchdog({
+    required int session,
+    required int index,
+    required String source,
+  }) {
+    _cancelFirstFrameWatchdog();
+    _watchdogSession = session;
+    _watchdogIndex = index;
+    _watchdogSource = source;
+    _watchdogStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _watchdogOpenBusyRetries = 0;
+    _firstFrameWatchdog = Timer(
+      const Duration(milliseconds: 2500),
+      () => _onFirstFrameWatchdog(session),
+    );
+  }
+
+  void _cancelFirstFrameWatchdog() {
+    _firstFrameWatchdog?.cancel();
+    _firstFrameWatchdog = null;
+    _watchdogGraceUsed = false;
+    _watchdogOpenBusyRetries = 0;
+  }
+
+  void _onFirstFrameWatchdog(int session) {
+    _firstFrameWatchdog = null;
+    if (_disposed || _leaving || session != _openSession) return;
+    if (_firstFrameSeen) {
+      _recoverStreak = 0;
+      return;
+    }
+    if (_hasFirstFrameNow()) {
+      _firstFrameSeen = true;
+      _recoverStreak = 0;
+      DiagProbe.event('first-frame-seen', <String, Object?>{
+        'index': _watchdogIndex,
+        'source': _watchdogSource,
+        'via': 'watchdog',
+        'positionMs': _player.positionInMilliseconds,
+        'videoWidth': _mpvVideoWidth(),
+        'textureWidth': _player.videoPlayerController?.state.width,
+        'textureId': _player.videoController?.id.value,
+      });
+      return;
+    }
+    final sinceOpenMs =
+        DateTime.now().millisecondsSinceEpoch - _watchdogStartedAtMs;
+    // 这次 open 还卡在 resolve/setDataSource/play 里没回来：先别拆播放器，
+    // 一秒后再看。否则可能在别人 await 的中途把实例 dispose 掉；也不能在
+    // 这一步按「已暂停」放过——open 还没收尾时 playing 本来就可能为 false。
+    if (_opening) {
+      _watchdogOpenBusyRetries++;
+      if (_watchdogOpenBusyRetries > _maxWatchdogOpenBusyRetries) {
+        DiagProbe.event('first-frame-watchdog-open-stuck', <String, Object?>{
+          'index': _watchdogIndex,
+          'source': _watchdogSource,
+          'retries': _watchdogOpenBusyRetries,
+          'sinceOpenMs': sinceOpenMs,
+          'isBuffering': _player.isBuffering.value,
+          'positionMs': _player.positionInMilliseconds,
+        });
+        return;
+      }
+      _firstFrameWatchdog = Timer(
+        const Duration(seconds: 1),
+        () => _onFirstFrameWatchdog(session),
+      );
+      return;
+    }
+    // 用户主动暂停在首帧之前不是黑屏，不能把播放器拆掉重建；恢复播放时
+    // 由 _togglePlay 重新挂看门狗。
+    if (!_player.playerStatus.isPlaying && !_player.isBuffering.value) {
+      DiagProbe.event('first-frame-watchdog-paused', <String, Object?>{
+        'index': _watchdogIndex,
+        'source': _watchdogSource,
+        'positionMs': _player.positionInMilliseconds,
+        'videoWidth': _player.videoPlayerController?.state.width,
+      });
+      return;
+    }
+    if (_appPaused || IOSPipHelper.isActive) {
+      // 回前台后再补一次判定；后台不重建播放器，交给 C23 的原生 PiP。
+      DiagProbe.event('auto-recover-skipped', <String, Object?>{
+        'index': _watchdogIndex,
+        'source': _watchdogSource,
+        'reason': 'app-paused-or-pip',
+        'sinceOpenMs': sinceOpenMs,
+        'pipActive': IOSPipHelper.isActive,
+        'appPaused': _appPaused,
+      });
+      return;
+    }
+    // 网络慢导致的 buffering 不是黑屏；给一次 1.5 秒宽限，避免刚起播就
+    // 把正常加载中的播放器整实例拆掉。
+    if (_player.isBuffering.value && !_watchdogGraceUsed) {
+      _watchdogGraceUsed = true;
+      DiagProbe.event('first-frame-watchdog-grace', <String, Object?>{
+        'index': _watchdogIndex,
+        'source': _watchdogSource,
+        'sinceOpenMs': sinceOpenMs,
+      });
+      _firstFrameWatchdog = Timer(
+        const Duration(milliseconds: 1500),
+        () => _onFirstFrameWatchdog(session),
+      );
+      return;
+    }
+    final width = _player.videoPlayerController?.state.width ?? 0;
+    DiagProbe.event('first-frame-watchdog-timeout', <String, Object?>{
+      'index': _watchdogIndex,
+      'source': _watchdogSource,
+      'sinceOpenMs': sinceOpenMs,
+      'positionMs': _player.positionInMilliseconds,
+      'videoWidth': _mpvVideoWidth(),
+      'textureWidth': width,
+      'openBusyRetries': _watchdogOpenBusyRetries,
+      'isBuffering': _player.isBuffering.value,
+      'dataStatus': _player.dataStatus.value.name,
+      'textureId': _player.videoController?.id.value,
+    });
+    unawaited(
+      _recoverNoFirstFrame(
+        sinceOpenMs: sinceOpenMs,
+        source: _watchdogSource,
+      ),
+    );
+  }
+
+  /// 首帧超时的自愈：整实例重建，等价于用户去播放列表里手动选这一条。
+  ///
+  /// 连播约 30 条后旧 player/texture 会进入「有声音没画面」的状态，单靠
+  /// 再 open 一次救不回来；必须 dispose 当前单例（连同 FlutterTexture），
+  /// 重新 getInstance 并 setDataSource，才能新建解码器和纹理。
+  Future<void> _recoverNoFirstFrame({
+    required int sinceOpenMs,
+    required String source,
+  }) async {
+    if (_recovering) return;
+    if (_disposed || _leaving || _opening) return;
+    if (_appPaused || IOSPipHelper.isActive) {
+      DiagProbe.event('auto-recover-skipped', <String, Object?>{
+        'index': _index,
+        'reason': 'app-paused-or-pip',
+        'source': source,
+      });
+      return;
+    }
+    // 同一条连续重建仍拿不到首帧，说明不是 texture 卡死而是片源/解码器
+    // 本身有问题；再拆下去只会反复黑屏，放弃并留证据。
+    if (_recoverStreak >= 3) {
+      DiagProbe.event('auto-recover-gave-up', <String, Object?>{
+        'index': _index,
+        'source': source,
+        'streak': _recoverStreak,
+      });
+      return;
+    }
+    _recovering = true;
+    _recoverStreak++;
+    _completionArmed = false;
+    _cancelFirstFrameWatchdog();
+    final index = _index;
+    final attempt = ++_autoRecoverCount;
+    DiagProbe.event('auto-recover', <String, Object?>{
+      'index': index,
+      'reason': 'no-first-frame',
+      'source': source,
+      'sinceOpenMs': sinceOpenMs,
+      'positionMs': _player.positionInMilliseconds,
+      'textureId': _player.videoController?.id.value,
+      'retry': attempt,
+    });
+    final sw = Stopwatch()..start();
+    var disposeCalls = 0;
+    try {
+      _detachPlayerListeners();
+      _lastPositionTickMs = 0;
+      try {
+        // 单例按引用计数管理：若别的页面还持有旧实例，第一次 dispose 只会
+        // 减计数、不拆 texture，自愈就退化成「同一个实例再 open 一次」，
+        // 黑屏救不回来。这里补调用到引用计数归零（_instance 置空为标志），
+        // 最多 8 次，避免异常状态下无限拆。
+        while (disposeCalls < 8 && PlPlayerController.instance != null) {
+          _player.dispose();
+          disposeCalls++;
+        }
+      } catch (_) {}
+      if (!mounted || _disposed || _leaving) return;
+      final instanceCleared = PlPlayerController.instance == null;
+      _player = PlPlayerController.getInstance();
+      _attachPlayerListeners();
+      _progress.value = const _PlaybackProgress();
+      sw.stop();
+      DiagProbe.event('auto-recover-rebuilt', <String, Object?>{
+        'index': index,
+        'disposeMs': sw.elapsedMilliseconds,
+        'disposeCalls': disposeCalls,
+        'instanceCleared': instanceCleared,
+        'textureId': _player.videoController?.id.value,
+      });
+      await _open(index, source: 'auto-recover', force: true);
+    } catch (error) {
+      DiagProbe.event('auto-recover-failed', <String, Object?>{
+        'index': index,
+        'error': '$error',
+      });
+    } finally {
+      _recovering = false;
+      _consumePendingOpen();
     }
   }
 
@@ -716,6 +1148,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_isPlaying.value != isPlaying) {
       _isPlaying.value = isPlaying;
     }
+    _pushProgress(force: true);
     _publishPipState();
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
@@ -790,8 +1223,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       return;
     }
     final target = (_index - 1 + _queue.length) % _queue.length;
-    _diagSwitchRequest('next', target);
-    await _open(target, source: 'next');
+    _diagSwitchRequest('previous', target);
+    await _open(target, source: 'previous');
   }
 
   /// 打开播放列表。列表里调序会回调 [_applyPlaylistOrder]，
@@ -867,27 +1300,27 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ..addAll(entries);
       _index = target;
     });
-    // 点的就是当前这条：只把队列换成列表顺序，不重新加载打断播放。
+    // 点的就是当前这条：画面正常就只把队列换成列表顺序，不重新加载打断
+    // 播放；但如果现在是黑屏/卡在 buffering/错误态，这一点就是用户手动
+    // 救场，必须走和下拉列表选其它条一样的完整重建。
     if (key == wasCurrentKey) {
+      final healthy =
+          _firstFrameSeen && !_player.isBuffering.value && _error == null;
       _diagSwitchBlocked(
         'playlist-select',
-        'duplicate-target',
+        healthy ? 'duplicate-target' : 'duplicate-target-rebuild',
         targetIndex: target,
       );
+      if (!healthy && !_opening && !_recovering) {
+        _recoverStreak = 0;
+        unawaited(
+          _recoverNoFirstFrame(sinceOpenMs: 0, source: 'playlist-select'),
+        );
+      }
       return;
     }
-    // 正在解析/加载上一条时不能直接丢弃这次点击：列表已经关了，用户点了却
-    // 什么都没发生。记下来，等当前这次 _open 收尾时补跳。
-    if (_opening) {
-      _pendingOpenIndex = target;
-      _pendingOpenSource = 'playlist-select';
-      _diagSwitchBlocked(
-        'playlist-select',
-        'opening-deferred',
-        targetIndex: target,
-      );
-      return;
-    }
+    // 正在解析/加载上一条时也不能丢弃这次点击。_open 会把目标排队，并把
+    // 在途会话作废；列表页已经关了，用户点了就必须最终切过去。
     unawaited(_open(target, source: 'playlist-select'));
   }
 
@@ -899,6 +1332,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     // 只重建暂停/播放图标那一小块，不再 setState 整页。
     _isPlaying.value = _player.playerStatus.isPlaying;
+    // 首帧前暂停会让看门狗主动让路；恢复播放后补挂一次，别让黑屏没人管。
+    if (_player.playerStatus.isPlaying &&
+        !_firstFrameSeen &&
+        _firstFrameWatchdog == null &&
+        _watchdogSession >= 0 &&
+        _watchdogSession == _openSession) {
+      _armFirstFrameWatchdog(
+        session: _watchdogSession,
+        index: _watchdogIndex,
+        source: _watchdogSource,
+      );
+    }
+    _pushProgress(force: true);
     _publishPipState();
   }
 
@@ -1019,6 +1465,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final textureId = _player.videoController?.id.value;
+    _appPaused =
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.inactive;
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _bgTextureId = textureId;
@@ -1030,6 +1480,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'keepAlive': _bgKeepAliveApplied,
       });
     } else if (state == AppLifecycleState.resumed) {
+      _appPaused = false;
       DiagProbe.event('bg-return', <String, Object?>{
         'textureId': textureId,
         'previousTextureId': _bgTextureId,
@@ -1038,6 +1489,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'isPlaying': _player.playerStatus.isPlaying,
         'pipActive': IOSPipHelper.isActive,
       });
+      // 看门狗在后台时只记录不重建；回前台后如果仍然没有首帧，补一次
+      // 判定（_onFirstFrameWatchdog 会先确认当前状态确实没有画面）。
+      if (!_firstFrameSeen &&
+          _watchdogSession == _openSession &&
+          _watchdogSession >= 0 &&
+          !_disposed &&
+          !_leaving) {
+        _firstFrameWatchdog?.cancel();
+        _firstFrameWatchdog = Timer(
+          const Duration(milliseconds: 1000),
+          () => _onFirstFrameWatchdog(_watchdogSession),
+        );
+      }
       _bgTextureId = null;
     }
   }
@@ -1338,6 +1802,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _seekDragging = false;
     _player.position.value = _seekTargetMs ~/ 1000;
     unawaited(_player.seekTo(Duration(milliseconds: _seekTargetMs)));
+    _pushProgress(force: true);
     _publishPipState(_seekTargetMs);
     _hideHintSoon();
     sw.stop();
@@ -1644,44 +2109,42 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   Widget _bottomBar() {
     // playerStatus 是普通字段，不是 Rx；暂停/播放图标由 `_isPlaying` 单独
-    // 驱动，只重建这一个按钮。进度、缓冲、时长是 Rx，放进 Obx 里按秒刷新。
+    // 驱动，只重建这一个按钮。进度/缓冲/时长由 `_progress` 驱动，只重建
+    // 进度条和时间文本，不跟着 position 回调刷新整页。
     return _controls(
       Column(
         mainAxisAlignment: MainAxisAlignment.end,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Obx(() {
-            final total = _player.duration.value;
-            final progress = total <= 0
-                ? 0
-                : _player.position.value.clamp(0, total).toInt();
-            final buffered = total <= 0
-                ? 0
-                : _player.buffered.value.clamp(0, total).toInt();
-            return ProgressBar(
-              progress: progress,
-              buffered: buffered,
-              total: total,
-              baseBarColor: const Color(0x33FFFFFF),
-              progressBarColor: Colors.white,
-              bufferedBarColor: Colors.white24,
-              thumbColor: Colors.white,
-              thumbGlowColor: Colors.white24,
-              barHeight: 3.5,
-              thumbRadius: 7,
-              thumbGlowRadius: 25,
-              // RenderProgressBar 只有 onDragStart/onHover 非空时才参与命中
-              // 测试，否则整条进度条点不动。这里给一个空回调，只为了可拖。
-              onDragStart: (_) {},
-              onSeek: (milliseconds) {
-                _player.position.value = milliseconds ~/ 1000;
-                unawaited(
-                  _player.seekTo(Duration(milliseconds: milliseconds)),
-                );
-                _publishPipState(milliseconds);
-              },
-            );
-          }),
+          ValueListenableBuilder<_PlaybackProgress>(
+            valueListenable: _progress,
+            builder: (context, progress, _) {
+              return ProgressBar(
+                progress: progress.position,
+                buffered: progress.buffered,
+                total: progress.duration,
+                baseBarColor: const Color(0x33FFFFFF),
+                progressBarColor: Colors.white,
+                bufferedBarColor: Colors.white24,
+                thumbColor: Colors.white,
+                thumbGlowColor: Colors.white24,
+                barHeight: 3.5,
+                thumbRadius: 7,
+                thumbGlowRadius: 25,
+                // RenderProgressBar 只有 onDragStart/onHover 非空时才参与命中
+                // 测试，否则整条进度条点不动。这里给一个空回调，只为了可拖。
+                onDragStart: (_) {},
+                onSeek: (milliseconds) {
+                  _player.position.value = milliseconds ~/ 1000;
+                  unawaited(
+                    _player.seekTo(Duration(milliseconds: milliseconds)),
+                  );
+                  _pushProgress(force: true);
+                  _publishPipState(milliseconds);
+                },
+              );
+            },
+          ),
           const SizedBox(height: 2),
           Row(
             children: [
@@ -1714,11 +2177,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               ),
               Padding(
                 padding: const EdgeInsets.only(left: 6),
-                child: Obx(
-                  () => Text(
-                    '${DurationUtils.formatDuration(_player.position.value)}'
+                child: ValueListenableBuilder<_PlaybackProgress>(
+                  valueListenable: _progress,
+                  builder: (context, progress, _) => Text(
+                    '${DurationUtils.formatDuration(progress.position)}'
                     ' / '
-                    '${DurationUtils.formatDuration(_player.duration.value)}',
+                    '${DurationUtils.formatDuration(progress.duration)}',
                     style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 11,
@@ -2265,6 +2729,30 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 }
 
 enum _SwipeTarget { brightness, volume }
+
+/// 进度条与时间文本的局部状态。单位是秒，和 `PlPlayerController` 的
+/// `position/duration/buffered` 保持一致。
+class _PlaybackProgress {
+  const _PlaybackProgress({
+    this.position = 0,
+    this.duration = 0,
+    this.buffered = 0,
+  });
+
+  final int position;
+  final int duration;
+  final int buffered;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _PlaybackProgress &&
+      other.position == position &&
+      other.duration == duration &&
+      other.buffered == buffered;
+
+  @override
+  int get hashCode => Object.hash(position, duration, buffered);
+}
 
 class _GestureHint {
   const _GestureHint({
