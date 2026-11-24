@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:PiliPlus/pages/douyin/models.dart';
 import 'package:flutter/services.dart';
@@ -166,6 +167,45 @@ abstract final class ShortVideoWeb {
       return url;
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 展开 `v.douyin.com` / `vm.tiktok.com` 这类短链，返回最终地址。
+  ///
+  /// 短链的 `Location` 里就带着 videoId，只看重定向头，不下载整个页面。
+  /// 最多跟 5 跳，失败返回 null（由调用方提示用户粘贴完整链接）。
+  static Future<String?> expandShortLink(
+    String url, {
+    required String userAgent,
+  }) async {
+    final parsed = Uri.tryParse(url.trim());
+    if (parsed == null || !parsed.hasAuthority) return null;
+    var current = parsed;
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    try {
+      for (var hop = 0; hop < 5; hop++) {
+        final request = await client
+            .getUrl(current)
+            .timeout(const Duration(seconds: 8));
+        request.followRedirects = false;
+        request.headers.set(HttpHeaders.userAgentHeader, userAgent);
+        request.headers.set(HttpHeaders.acceptHeader, '*/*');
+        final response = await request.close().timeout(
+          const Duration(seconds: 8),
+        );
+        // 必须把响应体排空，否则连接会一直占着，下一跳复用不了。
+        await response.drain<void>().timeout(const Duration(seconds: 5));
+        final location = response.headers.value(HttpHeaders.locationHeader);
+        if (location == null || location.isEmpty) {
+          return response.isRedirect ? null : current.toString();
+        }
+        current = current.resolve(location);
+      }
+      return current.toString();
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
     }
   }
 

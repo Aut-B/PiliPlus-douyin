@@ -11,6 +11,7 @@ import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/rootscan_view.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
+import 'package:flutter/services.dart' show Clipboard;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
@@ -351,6 +352,158 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         () => _status = '新增 ${added.length} 条，跳过 ${result.skipped} 条，'
             '本地 ${_videos.length} 条',
       );
+    }
+  }
+
+  /// 正在从分享链接解析并加入一条收藏。
+  bool _addingLink = false;
+
+  Future<String?> _askShareLink() async {
+    var initial = '';
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      initial = data?.text?.trim() ?? '';
+    } catch (_) {}
+    if (!mounted) return null;
+    var text = initial;
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('粘贴链接添加'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('把抖音 / TikTok App 里的分享链接粘贴到这里，只加这一条，不用登录网页。'),
+            const SizedBox(height: 12),
+            TextFormField(
+              initialValue: initial,
+              autofocus: true,
+              minLines: 2,
+              maxLines: 4,
+              textInputAction: TextInputAction.done,
+              decoration: const InputDecoration(
+                hintText:
+                    'https://v.douyin.com/… 或 '
+                    'https://www.tiktok.com/@…/video/…',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (value) => text = value,
+              onFieldSubmitted: (value) =>
+                  Navigator.of(dialogContext).pop(value),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(text),
+            child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _linkFailed(String message) {
+    if (!mounted) return;
+    setState(() => _status = message);
+    SmartDialog.showToast(message);
+  }
+
+  /// 从一条分享链接加入收藏：短链先展开，再要一条可播直链，最后落库。
+  ///
+  /// 全程只复用现有的原生直链解析，不碰收藏夹登录和整套抓取流程。
+  Future<void> _addFromLink() async {
+    if (_addingLink) return;
+    final input = await _askShareLink();
+    if (!mounted || input == null) return;
+    var link = ShortVideoShareLink.parse(input);
+    if (link == null) {
+      _linkFailed('没识别到视频 id，请粘贴完整分享链接');
+      return;
+    }
+    setState(() => _addingLink = true);
+    try {
+      if (!link.hasVideoId) {
+        setState(() => _status = '正在展开短链…');
+        final expanded = await ShortVideoWeb.expandShortLink(
+          link.shortUrl!,
+          userAgent: link.platform.mobileUserAgent,
+        );
+        final reparsed = expanded == null
+            ? null
+            : ShortVideoShareLink.parse(expanded);
+        if (reparsed == null || !reparsed.hasVideoId) {
+          _linkFailed('没识别到视频 id，请粘贴完整分享链接');
+          return;
+        }
+        link = reparsed;
+      }
+      final target = link.platform;
+      final key = link.key;
+      final existing = target == platform
+          ? _videos
+          : ShortVideoRepo.load(target);
+      if (existing.any((e) => e.key == key)) {
+        _linkFailed(
+          target == platform
+              ? '这条视频已经在${target.album}收藏里了'
+              : '这条视频已经在${target.album}收藏里了，切到上方查看',
+        );
+        return;
+      }
+      if (mounted) setState(() => _status = '正在解析可播放直链…');
+      final playUrl = await ShortVideoWeb.resolvePlayUrl(
+        platformId: target.id,
+        videoId: link.videoId,
+        userAgent: target.mobileUserAgent,
+      );
+      if (!mounted) return;
+      if (playUrl == null || playUrl.isEmpty) {
+        _linkFailed('没拿到可播放直链，请稍后再试');
+        return;
+      }
+      final video = ShortVideo(
+        id: link.videoId,
+        platform: target.id,
+        desc: '分享链接添加的视频',
+        author: '',
+        cover: '',
+        durationMs: 0,
+        playUrl: playUrl,
+        videoId: link.videoId,
+        updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
+      );
+      existing.insert(0, video);
+      final written = ShortVideoRepo.save(target, existing);
+      if (written < 0) {
+        existing.removeWhere((e) => e.key == key);
+        _linkFailed('保存失败，请检查存储空间');
+        return;
+      }
+      ShortVideoRepo.unmarkDeleted(target, <String>[key]);
+      if (target == platform) {
+        if (!mounted) return;
+        setState(() {
+          _knownKeys.add(key);
+          _status = '已添加 1 条，本地 ${_videos.length} 条，点列表即可播放';
+        });
+        ShortVideoAutoCache.schedule();
+      } else {
+        if (!mounted) return;
+        setState(
+          () => _status = '已加入${target.album}收藏，切到上方${target.album}查看',
+        );
+      }
+      SmartDialog.showToast(
+        target == platform ? '已添加，点列表即可播放' : '已加入${target.album}收藏',
+      );
+    } finally {
+      if (mounted) setState(() => _addingLink = false);
     }
   }
 
@@ -771,7 +924,42 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           ),
         ],
       ),
-      body: _videos.isEmpty ? _empty(theme) : _list(theme),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '从 App 复制分享链接，免登录只加这一条',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _addingLink ? null : _addFromLink,
+                  icon: _addingLink
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.link, size: 18),
+                  label: const Text('粘贴链接添加'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _videos.isEmpty ? _empty(theme) : _list(theme),
+          ),
+        ],
+      ),
       // 底栏原来放在 Column 里。问题在于主界面用 MainLayout 布局：body 按
       // 整屏高度布局（bodyConstraints = 全高），底部导航栏是**叠画在 body
       // 之上**的，不是挤压。所以 body 里最后那排按钮正好被底栏盖住，点不到。
@@ -853,6 +1041,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             Text(
               '已经登录过就直接点「直接同步（只拉新增）」，'
               '只解析新收藏，旧条目不再重复处理。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '不想登录网页：把视频分享链接粘贴到上方「粘贴链接添加」，'
+              '只加这一条。',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
@@ -1088,4 +1285,5 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 }
+// findstr-anchor (GBK bytes, do not re-encode): 粘贴链接
 // findstr-anchor (GBK bytes, do not re-encode): 导出诊断

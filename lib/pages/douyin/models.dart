@@ -97,6 +97,146 @@ enum ShortVideoPlatform {
   }
 }
 
+/// 从抖音 / TikTok App 复制出来的一段分享文本里解析出的视频链接。
+///
+/// 完整链接直接带 videoId；`v.douyin.com` / `vm.tiktok.com` 这类短链本身
+/// 不含 id，先让 [ShortVideoWeb.expandShortLink] 跟一次 HTTP 重定向，再回来
+/// 重新解析。这样既不需要登录收藏夹，也不用在原生侧另开一个接口。
+class ShortVideoShareLink {
+  const ShortVideoShareLink({
+    required this.platform,
+    this.videoId = '',
+    this.shortUrl,
+  });
+
+  final ShortVideoPlatform platform;
+  final String videoId;
+
+  /// 短链地址；只有 [videoId] 为空、需要展开时才不为 null。
+  final String? shortUrl;
+
+  bool get hasVideoId => videoId.isNotEmpty;
+
+  /// 与本地收藏一致的唯一键。
+  String get key => '${platform.id}:$videoId';
+
+  /// 解析分享文本里的第一条可识别链接，找不到返回 null。
+  static ShortVideoShareLink? parse(String input) {
+    final text = input.trim();
+    if (text.isEmpty) return null;
+    for (final match in _urlPattern.allMatches(text)) {
+      final link = _parseUrl(_trimUrl(match.group(0)!));
+      if (link != null) return link;
+    }
+    return null;
+  }
+
+  static ShortVideoShareLink? _parseUrl(String raw) {
+    final uri = Uri.tryParse(raw);
+    if (uri == null || !uri.hasAuthority) return null;
+    final host = uri.host.toLowerCase();
+    final platform = _platformForHost(host);
+    if (platform == null) return null;
+    final videoId = _videoId(uri);
+    if (videoId.isNotEmpty) {
+      return ShortVideoShareLink(platform: platform, videoId: videoId);
+    }
+    if (_shortHosts.contains(host) || _isTiktokSharePath(uri)) {
+      return ShortVideoShareLink(
+        platform: platform,
+        shortUrl: uri.toString(),
+      );
+    }
+    return null;
+  }
+
+  static ShortVideoPlatform? _platformForHost(String host) {
+    if (host == 'douyin.com' ||
+        host.endsWith('.douyin.com') ||
+        host == 'iesdouyin.com' ||
+        host.endsWith('.iesdouyin.com')) {
+      return ShortVideoPlatform.douyin;
+    }
+    if (host == 'tiktok.com' || host.endsWith('.tiktok.com')) {
+      return ShortVideoPlatform.tiktok;
+    }
+    return null;
+  }
+
+  /// 抖音 `www.douyin.com/video/<id>`、`iesdouyin.com/share/video/<id>`，
+  /// TikTok `www.tiktok.com/@user/video/<id>`，以及移动版的 `/v/<id>.html`。
+  static String _videoId(Uri uri) {
+    final segments = uri.pathSegments;
+    for (var i = 0; i < segments.length - 1; i++) {
+      final segment = segments[i].toLowerCase();
+      if (segment != 'video' && segment != 'v') continue;
+      final match = RegExp(r'^(\d+)').firstMatch(segments[i + 1]);
+      if (match != null) return match.group(1)!;
+    }
+    for (final key in const ['modal_id', 'item_id', 'video_id']) {
+      final value = uri.queryParameters[key];
+      if (value != null && RegExp(r'^\d+$').hasMatch(value)) return value;
+    }
+    return '';
+  }
+
+  /// 分享文本经常把 URL 和中文标点粘在一起，先去掉尾部标点。
+  static String _trimUrl(String value) {
+    var end = value.length;
+    while (end > 0) {
+      final char = value[end - 1];
+      if (const {
+        '，',
+        '。',
+        '！',
+        '？',
+        '；',
+        '：',
+        '）',
+        '】',
+        '》',
+        '」',
+        '』',
+        '”',
+        '’',
+        ',',
+        '.',
+        '!',
+        '?',
+        ';',
+        ':',
+        ')',
+        ']',
+        '}',
+        '>',
+      }.contains(char)) {
+        end--;
+        continue;
+      }
+      break;
+    }
+    return value.substring(0, end);
+  }
+
+  static const Set<String> _shortHosts = {
+    'v.douyin.com',
+    'vm.tiktok.com',
+    'vt.tiktok.com',
+  };
+
+  /// TikTok App 分享常见 `https://www.tiktok.com/t/ZT…/` 这种短链，
+  /// 和 vm/vt 一样要跟一次重定向才能拿到带 id 的地址。
+  static bool _isTiktokSharePath(Uri uri) {
+    final segments = uri.pathSegments;
+    return segments.length >= 2 && segments.first.toLowerCase() == 't';
+  }
+
+  static final RegExp _urlPattern = RegExp(
+    r'https?://[^\s<>"“”‘’]+',
+    caseSensitive: false,
+  );
+}
+
 /// 一条短视频。字段名与 WebDAV 同步用的 JSON 一一对应，Kumone 和 PiliPlus
 /// 读写同一个远端文件。
 class ShortVideo {
