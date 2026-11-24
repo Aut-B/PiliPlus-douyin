@@ -108,6 +108,11 @@ final class PipPlugin: NSObject, FlutterPlugin {
     case "update":
       session?.update(args)
       result(nil)
+    case "requestStart":
+      // 由 Dart 在按 Home 退后台时显式请求。sample buffer contentSource
+      // 不会因为 canStartPictureInPictureAutomaticallyFromInline 自动起小窗。
+      session?.requestStart()
+      result(nil)
     case "disableAutoEnter":
       if let session {
         session.autoEnter = false
@@ -412,6 +417,9 @@ private final class PipSession: NSObject {
         // Also posted while active when PiP stops.
         if UIApplication.shared.applicationState == .background {
           self?.enteredBackground = true
+          // Dart 可能已在 inactive 阶段请求过；这里再推一次，确保
+          // 「后台才变 possible」的机型也能真正起小窗。
+          self?.startIfPending()
         }
       },
       NotificationCenter.default.addObserver(
@@ -515,17 +523,57 @@ private final class PipSession: NSObject {
   /// PiP window, as on Android where the whole activity becomes the window.
   func start() {
     guard !controller.isPictureInPictureActive else { return }
+    beginStart(backgroundOnStart: true)
+  }
+
+  /// 显式请求启动画中画，但不再主动把 App 推到后台（用户已经按了 Home）。
+  func requestStart() {
+    beginStart(backgroundOnStart: false)
+  }
+
+  private func beginStart(backgroundOnStart: Bool) {
+    guard !controller.isPictureInPictureActive else { return }
+    if pipStartRequested {
+      PipTrace.log("requestStart: ignored, start already in flight")
+      return
+    }
+    // 同一个退后台过程里 inactive / hidden / paused 会连续触发；只认第一次，
+    // 但允许在上一次 2s 兜底放弃后重试。
+    if pendingStart {
+      PipTrace.log("requestStart: ignored, already pending")
+      return
+    }
     pendingStart = true
-    backgroundOnStart = true
+    self.backgroundOnStart = backgroundOnStart
+    PipTrace.log(
+      "requestStart: hasFrame=\(hasFrame) autoEnter=\(autoEnter) "
+        + "appState=\(UIApplication.shared.applicationState.rawValue) "
+        + "possible=\(controller.isPictureInPicturePossible)"
+    )
     startIfPending()
     // Give up if PiP doesn't become possible shortly, so a stale request
     // doesn't start PiP unexpectedly later.
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-      guard let self, self.pendingStart else { return }
-      self.pendingStart = false
-      self.backgroundOnStart = false
-      self.sendEvent("onStateChanged", ["active": false, "error": "PiP is not possible"])
-      self.onStop?()
+      guard let self else { return }
+      if self.pendingStart {
+        self.pendingStart = false
+        self.backgroundOnStart = false
+        self.sendEvent("onStateChanged", ["active": false, "error": "PiP is not possible"])
+        self.onStop?()
+        return
+      }
+      // AVKit 既不回调 DidStart 也不回调 failedToStart 时，过渡标记会一直
+      // 挂着并挡住后续手动/自动请求；这里只清标记，不碰已激活的小窗。
+      if self.pipStartRequested && !self.isActive
+        && !self.controller.isPictureInPictureActive
+      {
+        self.pipStartRequested = false
+        PipTrace.log("requestStart: cleared stale pipStartRequested")
+      }
+      PipTrace.log(
+        "requestStart: after 2s active=\(self.isActive) "
+          + "pipActive=\(self.controller.isPictureInPictureActive)"
+      )
     }
   }
 

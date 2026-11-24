@@ -135,6 +135,15 @@ abstract final class IOSPipHelper {
     _channel.invokeMethod('update', state);
   }
 
+  /// 显式请求原生启动画中画。
+  ///
+  /// 本插件的 contentSource 是 `AVSampleBufferDisplayLayer`，
+  /// `canStartPictureInPictureAutomaticallyFromInline` 只对 AVPlayerLayer
+  /// 后端可靠生效，所以按 Home 退后台时必须由 Dart 主动发一次。
+  static void requestStart() {
+    _channel.invokeMethod('requestStart');
+  }
+
   static void disableAutoEnter() {
     if (_autoEnter) {
       _autoEnter = false;

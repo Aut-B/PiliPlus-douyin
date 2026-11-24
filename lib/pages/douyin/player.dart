@@ -114,6 +114,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 是否已武装 iOS 自动画中画（播放中按 Home 自动起小窗）。
   bool _pipAutoArmed = false;
 
+  /// 本次 arm 是否已显式请求原生启动 PiP。inactive / hidden / paused
+  /// 会连续回调，只认第一次，避免重复下发。
+  bool _pipStartRequested = false;
+
   /// 固定在实例上的回调引用，收尾时只清自己，避免误清下一个播放页。
   late final void Function() _pipAutoEnterHandler = _onPipAutoEnter;
 
@@ -1487,6 +1491,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final textureId = _player.videoController?.id.value;
     if (textureId == null) return;
     _pipAutoArmed = true;
+    _pipStartRequested = false;
     _player.enterPip(autoEnter: true);
     // arm 后原生要先拿到当前状态；显式 position 绕过状态签名去重。
     _publishPipState(_player.positionInMilliseconds);
@@ -1504,6 +1509,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _disarmPipAutoEnter(String reason) {
     if (!_pipAutoArmed) return;
     _pipAutoArmed = false;
+    _pipStartRequested = false;
     IOSPipHelper.disableAutoEnter();
     DiagProbe.event('pip-auto-arm', <String, Object?>{
       'armed': false,
@@ -1516,11 +1522,34 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   void _onPipAutoEnter() {
     if (_disposed) return;
+    _pipStartRequested = false;
     DiagProbe.event('pip-auto-enter', <String, Object?>{
       'textureId': _player.videoController?.id.value,
       'isPlaying': _player.playerStatus.isPlaying,
       'positionMs': _player.positionInMilliseconds,
       'autoArmed': _pipAutoArmed,
+    });
+  }
+
+  /// 按 Home 退后台时显式请求原生启动画中画。
+  ///
+  /// 本插件的 contentSource 是 `AVSampleBufferDisplayLayer`，
+  /// `canStartPictureInPictureAutomaticallyFromInline` 只对 AVPlayerLayer
+  /// 可靠生效，只 arm 不请求的话小窗永远不会自己起来。
+  void _requestPipAutoEnterOnBackground(String reason) {
+    if (_disposed || _leaving || !mounted) return;
+    if (!_pipAutoArmed || _pipStartRequested) return;
+    if (IOSPipHelper.isActive || !IOSPipHelper.isAvailable) return;
+    if (!_player.playerStatus.isPlaying) return;
+    _pipStartRequested = true;
+    IOSPipHelper.requestStart();
+    DiagProbe.event('pip-auto-start', <String, Object?>{
+      'reason': reason,
+      'textureId': _player.videoController?.id.value,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'positionMs': _player.positionInMilliseconds,
+      'autoArmed': _pipAutoArmed,
+      'pipActive': IOSPipHelper.isActive,
     });
   }
 
@@ -1658,6 +1687,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _bgTextureId = textureId;
+      _requestPipAutoEnterOnBackground('background-${state.name}');
       DiagProbe.event('bg-enter', <String, Object?>{
         'textureId': textureId,
         'positionMs': _player.positionInMilliseconds,
@@ -1665,8 +1695,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'pipActive': IOSPipHelper.isActive,
         'keepAlive': _bgKeepAliveApplied,
       });
+    } else if (state == AppLifecycleState.inactive) {
+      _requestPipAutoEnterOnBackground('inactive');
     } else if (state == AppLifecycleState.resumed) {
       _appPaused = false;
+      // 上一次后台请求可能失败（原生 2s 兜底会回 active:false）；回到前台
+      // 清掉请求标记，下次按 Home 还能再试一次。
+      _pipStartRequested = false;
       if (_player.playerStatus.isPlaying) {
         _armPipAutoEnter('resume');
       }
