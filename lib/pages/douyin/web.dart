@@ -143,6 +143,10 @@ abstract final class ShortVideoWeb {
   static final Map<String, String> _playUrlCache = {};
   static final Map<String, DateTime> _playUrlAt = {};
 
+  /// 最近一次直链解析失败的原因：
+  /// `network`（网络）/ `login`（需要登录）/ `notfound`（解析不到）。
+  static String lastPlayUrlError = '';
+
   /// 让原生这边开一个离屏网页，把一条视频的新直链重新解析出来。
   ///
   /// 收藏里存的是签名直链，过几个小时就 403；TikTok 官方的「长期地址」
@@ -152,7 +156,11 @@ abstract final class ShortVideoWeb {
     required String videoId,
     required String userAgent,
   }) async {
-    if (videoId.isEmpty) return null;
+    lastPlayUrlError = '';
+    if (videoId.isEmpty) {
+      lastPlayUrlError = 'notfound';
+      return null;
+    }
     final cacheKey = '$platformId:$videoId';
     final at = _playUrlAt[cacheKey];
     if (at != null &&
@@ -162,16 +170,31 @@ abstract final class ShortVideoWeb {
     }
     _ensureHandler();
     try {
-      final url = await _channel.invokeMethod<String>('resolvePlayUrl', {
+      final raw = await _channel.invokeMethod<dynamic>('resolvePlayUrl', {
         'platform': platformId,
         'videoId': videoId,
         'userAgent': userAgent,
       });
-      if (url == null || url.isEmpty) return null;
+      String? url;
+      var reason = '';
+      if (raw is Map) {
+        final value = raw['url'];
+        if (value is String && value.isNotEmpty) url = value;
+        final detail = raw['reason'];
+        if (detail is String) reason = detail;
+      } else if (raw is String && raw.isNotEmpty) {
+        // 兼容旧原生只返回 URL 的情况。
+        url = raw;
+      }
+      if (url == null || url.isEmpty) {
+        lastPlayUrlError = reason.isEmpty ? 'notfound' : reason;
+        return null;
+      }
       _playUrlCache[cacheKey] = url;
       _playUrlAt[cacheKey] = DateTime.now();
       return url;
     } catch (_) {
+      lastPlayUrlError = 'network';
       return null;
     }
   }
@@ -181,11 +204,12 @@ abstract final class ShortVideoWeb {
   /// 短链的 `Location` 里就带着 videoId，只看重定向头，不下载整个页面。
   /// 最多跟 5 跳，失败返回 null（由调用方提示用户粘贴完整链接）。
   static Future<String?> expandShortLink(
-    String url, {
+    String input, {
     required String userAgent,
   }) async {
-    final parsed = Uri.tryParse(url.trim());
+    final parsed = Uri.tryParse(_firstUrl(input));
     if (parsed == null || !parsed.hasAuthority) return null;
+    if (!parsed.isScheme('http') && !parsed.isScheme('https')) return null;
     var current = parsed;
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
     try {
@@ -213,6 +237,30 @@ abstract final class ShortVideoWeb {
     } finally {
       client.close(force: true);
     }
+  }
+
+  /// 用户常把 App 的整段分享文案一起粘过来（前面有说明、后面还有
+  /// `vSy:/ :8pm 05/06 i@C.hO` 这类尾巴）。这里只取第一个 http(s) 地址，
+  /// 并把粘在地址末尾的标点 / 中文去掉。
+  static final RegExp _urlPattern = RegExp(
+    r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
+    caseSensitive: false,
+  );
+
+  static final RegExp _trailingJunk = RegExp(
+    r'''[.,;:!?'"）)】\]》」』”’>]+$''',
+  );
+
+  static String _firstUrl(String input) {
+    final match = _urlPattern.firstMatch(input);
+    if (match == null) return input.trim();
+    var value = match.group(0)!;
+    while (value.isNotEmpty) {
+      final next = value.replaceFirst(_trailingJunk, '');
+      if (next == value) break;
+      value = next;
+    }
+    return value;
   }
 
   static int _downloadSeq = 0;

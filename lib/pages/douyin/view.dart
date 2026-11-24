@@ -371,6 +371,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 正在从分享链接解析并加入一条收藏。
   bool _addingLink = false;
 
+  /// 上一次链接解析失败是否需要用户去网页登录后再试。
+  bool _linkNeedsLogin = false;
+
   Future<String?> _askShareLink() async {
     var initial = '';
     try {
@@ -421,9 +424,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  void _linkFailed(String message) {
+  void _linkFailed(String message, {bool login = false}) {
     if (!mounted) return;
-    setState(() => _status = message);
+    setState(() {
+      _status = message;
+      _linkNeedsLogin = login;
+    });
     SmartDialog.showToast(message);
   }
 
@@ -439,7 +445,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _linkFailed('没识别到视频 id，请粘贴完整分享链接');
       return;
     }
-    setState(() => _addingLink = true);
+    setState(() {
+      _addingLink = true;
+      _linkNeedsLogin = false;
+    });
     try {
       if (!link.hasVideoId) {
         setState(() => _status = '正在展开短链…');
@@ -451,7 +460,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ? null
             : ShortVideoShareLink.parse(expanded);
         if (reparsed == null || !reparsed.hasVideoId) {
-          _linkFailed('没识别到视频 id，请粘贴完整分享链接');
+          _linkFailed(
+            '短链展开失败，请检查网络，或粘贴带视频 id 的完整链接',
+          );
           return;
         }
         link = reparsed;
@@ -477,7 +488,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       );
       if (!mounted) return;
       if (playUrl == null || playUrl.isEmpty) {
-        _linkFailed('没拿到可播放直链，请稍后再试');
+        switch (ShortVideoWeb.lastPlayUrlError) {
+          case 'network':
+            _linkFailed('网络请求失败，请检查网络后重试', login: true);
+          case 'login':
+            _linkFailed('需要登录网页后才能解析，请登录后再试', login: true);
+          case 'notfound':
+            _linkFailed(
+              '没解析到可播放直链，请打开网页登录后再试',
+              login: true,
+            );
+          default:
+            _linkFailed('没拿到可播放直链，请稍后再试', login: true);
+        }
         return;
       }
       final video = ShortVideo(
@@ -1230,6 +1253,19 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
+                ),
+              ),
+            if (_linkNeedsLogin)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _openWeb,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                  ),
+                  icon: const Icon(Icons.open_in_browser, size: 16),
+                  label: const Text('打开网页登录后再试'),
                 ),
               ),
             if (_cacheBytes > 0 || _selecting)

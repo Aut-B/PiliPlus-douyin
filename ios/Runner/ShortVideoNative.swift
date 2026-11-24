@@ -99,15 +99,17 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
       let args = call.arguments as? [String: Any] ?? [:]
       let videoId = args["videoId"] as? String ?? ""
       guard !videoId.isEmpty else {
-        result(nil)
+        result(["url": "", "reason": "notfound"])
         return
       }
       ShortVideoPlayResolver(
         videoId: videoId,
         platform: args["platform"] as? String ?? "tiktok",
         userAgent: args["userAgent"] as? String ?? ""
-      ) { url in
-        DispatchQueue.main.async { result(url) }
+      ) { url, reason in
+        DispatchQueue.main.async {
+          result(["url": url ?? "", "reason": reason])
+        }
       }.start()
     case "download":
       // TikTok 的 CDN 按网页会话校验：Dart 的 HttpClient 一个 cookie 都不带。
@@ -1413,27 +1415,47 @@ final class ShortVideoNativeDownloader: NSObject, URLSessionDownloadDelegate {
 
 // MARK: - 短视频：过期直链重解析
 
-/// 用离屏 WKWebView 打开视频页，从页面自带的 JSON 里取一条新直链。
+/// 用离屏 WKWebView 打开视频页，让页面自己把 aweme detail 请求发出来，
+/// 再从响应体里取 `play_addr.url_list`。
 ///
-/// TikTok 网页把整条视频的数据塞在 `__UNIVERSAL_DATA_FOR_REHYDRATION__`
-/// 这个 script 里（抖音在 `_ROUTER_DATA` 里）；不依赖具体结构，直接把所有
-/// 长得像 CDN 地址的字符串捞出来。
-final class ShortVideoPlayResolver: NSObject {
+/// 抖音原来的三条路现在都不能用了：`iteminfo` 接口返回空、
+/// `iesdouyin/share/video/<id>` 的 `_ROUTER_DATA` 里 `video_layout` 是 null、
+/// `www.douyin.com/video/<id>` 的服务端 HTML 也不含 `play_addr`（播放地址是
+/// 前端 JS 异步取的）。所以只能让页面真的跑起来：`atDocumentStart` 包住
+/// fetch / XMLHttpRequest，凡是响应体里带 `play_addr` 就回传；同时每 900ms
+/// 读一次 `video.src` 和 `__UNIVERSAL_DATA_FOR_REHYDRATION__` / `__pace_f`
+/// 做双保险。
+///
+/// TikTok 的 embed 页仍是服务端直出的，继续走原来的轻量 HTTP 预取。
+final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+  private static let handlerName = "shortvideo_resolve"
+  private static let mobileUA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
+    + "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    + "Version/15.0 Mobile/15E148 Safari/604.1"
+
   private let videoId: String
   private let platform: String
   private let userAgent: String
-  private let completion: (String?) -> Void
+  /// url 为空时 reason 会区分 network / login / notfound，Dart 侧据此给不同提示。
+  private let completion: (String?, String) -> Void
   private var webView: WKWebView?
   private var timer: Timer?
   private var ticks = 0
   private var candidate = 0
   private var finished = false
+  private var networkError = false
+  private var pageLoaded = false
+  private var loginDetected = false
+  /// `play_addr.uri` 拼出来的官方播放接口（302 到 mp4），直链找不到时兜底。
+  private var uriFallback: String?
+  private var uriFoundAt = 0
 
   init(
     videoId: String,
     platform: String,
     userAgent: String,
-    completion: @escaping (String?) -> Void
+    completion: @escaping (String?, String) -> Void
   ) {
     self.videoId = videoId
     self.platform = platform
@@ -1454,13 +1476,32 @@ final class ShortVideoPlayResolver: NSObject {
 
   private func pages() -> [String] {
     if platform == "douyin" {
-      return ["https://www.douyin.com/video/\(videoId)"]
+      return [
+        "https://www.douyin.com/video/\(videoId)",
+        "https://www.iesdouyin.com/share/video/\(videoId)/",
+        "https://m.douyin.com/share/video/\(videoId)",
+      ]
     }
     return [
       "https://www.tiktok.com/embed/v2/\(videoId)",
       "https://www.tiktok.com/@i/video/\(videoId)",
       "https://m.tiktok.com/v/\(videoId).html",
     ]
+  }
+
+  private func effectiveUserAgent() -> String {
+    if platform == "douyin" {
+      if userAgent.contains("Mobile") || userAgent.contains("Android") {
+        return userAgent
+      }
+      return ShortVideoPlayResolver.mobileUA
+    }
+    if userAgent.isEmpty {
+      return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        + "Version/17.4 Safari/605.1.15"
+    }
+    return userAgent
   }
 
   private func prefetch() {
@@ -1478,6 +1519,8 @@ final class ShortVideoPlayResolver: NSObject {
     )
     request.setValue("https://www.tiktok.com/", forHTTPHeaderField: "Referer")
     request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+    // 必须强引用 self：prefetch 阶段还没有 webView 持有 resolver，
+    // 弱引用会让对象在请求返回前就释放掉。
     let task = URLSession.shared.dataTask(with: request) { [self] data, _, _ in
       var found: String?
       if let data = data, data.count > 1024, data.count < 4_000_000,
@@ -1500,24 +1543,46 @@ final class ShortVideoPlayResolver: NSObject {
     guard !finished else { return }
     let config = WKWebViewConfiguration()
     config.websiteDataStore = .default()
-    config.defaultWebpagePreferences.preferredContentMode = .desktop
+    config.defaultWebpagePreferences.preferredContentMode =
+      platform == "douyin" ? .mobile : .desktop
+    let controller = WKUserContentController()
+    controller.add(self, name: ShortVideoPlayResolver.handlerName)
+    if platform == "douyin" {
+      controller.addUserScript(
+        WKUserScript(
+          source: ShortVideoPlayResolver.hookScript,
+          injectionTime: .atDocumentStart,
+          forMainFrameOnly: false
+        )
+      )
+    }
+    config.userContentController = controller
     let web = WKWebView(
       frame: CGRect(x: 0, y: 0, width: 390, height: 844),
       configuration: config
     )
-    if !userAgent.isEmpty {
-      web.customUserAgent = userAgent
-    }
+    web.customUserAgent = effectiveUserAgent()
+    web.navigationDelegate = self
     webView = web
     candidate = 0
-    if let url = URL(string: pages()[0]) {
-      web.load(URLRequest(url: url))
-    }
-    let ticker = Timer(timeInterval: 0.9, repeats: true) { [self] _ in
-      self.poll()
+    retries = 0
+    load(candidate: 0)
+    let ticker = Timer(timeInterval: 0.9, repeats: true) { [weak self] _ in
+      self?.poll()
     }
     RunLoop.main.add(ticker, forMode: .common)
     timer = ticker
+  }
+
+  private func load(candidate index: Int) {
+    guard !finished, let web = webView else { return }
+    let list = pages()
+    guard index >= 0, index < list.count, let url = URL(string: list[index]) else {
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(effectiveUserAgent(), forHTTPHeaderField: "User-Agent")
+    web.load(request)
   }
 
   private func poll() {
@@ -1525,64 +1590,335 @@ final class ShortVideoPlayResolver: NSObject {
     ticks += 1
     // 约 18 秒还没捞到就放弃，别把播放卡住。
     if ticks > 20 {
-      finish(nil)
+      finish(uriFallback, reason: failureReason())
       return
     }
-    // 第 7 / 13 个 tick 依次换下一个候选页：embed → 主页 → 移动版。
+    // 第 7 / 13 个 tick 依次换下一个候选页：
+    // 抖音 www → iesdouyin/share → m.douyin/share；
+    // TikTok embed → 主页 → 移动版。
     if ticks == 7 || ticks == 13 {
       let list = pages()
       let next = candidate + 1
       if next < list.count {
         candidate = next
-        if let url = URL(string: list[next]) {
-          web.load(URLRequest(url: url))
-        }
+        retries = 0
+        load(candidate: candidate)
         return
       }
     }
     let js = """
     (function () {
-      var el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
-      if (el && el.textContent) { return el.textContent; }
-      var other = document.getElementById('_ROUTER_DATA');
-      if (other && other.textContent) { return other.textContent; }
-      var html = document.documentElement ? document.documentElement.innerHTML : '';
-      return html.length > 900000 ? html.substring(0, 900000) : html;
+      var out = [];
+      try {
+        var v = document.querySelector('video');
+        if (v) {
+          var src = v.currentSrc || v.src || '';
+          if (src) { out.push(src); }
+        }
+      } catch (e) {}
+      var ids = ['__UNIVERSAL_DATA_FOR_REHYDRATION__', '__pace_f', '_ROUTER_DATA'];
+      for (var i = 0; i < ids.length; i++) {
+        try {
+          var el = document.getElementById(ids[i]);
+          if (el && el.textContent && el.textContent.length > 100) {
+            out.push(el.textContent);
+          }
+        } catch (e) {}
+      }
+      try {
+        if (window.__UNIVERSAL_DATA_FOR_REHYDRATION__) {
+          out.push(JSON.stringify(window.__UNIVERSAL_DATA_FOR_REHYDRATION__));
+        }
+      } catch (e) {}
+      try {
+        if (window.__pace_f) { out.push(String(window.__pace_f)); }
+      } catch (e) {}
+      try {
+        var html = document.documentElement ? document.documentElement.innerHTML : '';
+        if (html) { out.push(html.substring(0, 600000)); }
+      } catch (e) {}
+      return out.join('\\n');
     })()
     """
     web.evaluateJavaScript(js) { [self] value, _ in
       guard !self.finished else { return }
-      guard let text = value as? String, text.count > 200 else { return }
-      if let url = ShortVideoPlayResolver.pick(text) {
-        self.finish(url)
-      }
+      guard let text = value as? String, text.count > 80 else { return }
+      self.consume(text)
     }
   }
 
-  private func finish(_ url: String?) {
+  private func consume(_ text: String) {
+    if let url = ShortVideoPlayResolver.pick(text) {
+      finish(url)
+      return
+    }
+    if uriFallback == nil, let uri = ShortVideoPlayResolver.pickPlayURI(text) {
+      uriFallback = "https://www.iesdouyin.com/aweme/v1/play/"
+        + "?video_id=\(uri)&ratio=720p&line=0"
+      uriFoundAt = ticks
+    }
+    let lower = text.lowercased()
+    if lower.contains("captcha") || lower.contains("verify-center")
+      || lower.contains("passport") {
+      loginDetected = true
+    }
+  }
+
+  private func failureReason() -> String {
+    if loginDetected { return "login" }
+    if !pageLoaded { return networkError ? "network" : "notfound" }
+    return "notfound"
+  }
+
+  private func finish(_ url: String?, reason: String = "") {
     if finished { return }
     finished = true
     timer?.invalidate()
     timer = nil
     webView?.stopLoading()
+    webView?.navigationDelegate = nil
+    webView?.configuration.userContentController
+      .removeScriptMessageHandler(forName: ShortVideoPlayResolver.handlerName)
     webView = nil
-    completion(url)
+    let result = url ?? ""
+    let detail = result.isEmpty ? reason : ""
+    let done = completion
+    DispatchQueue.main.async {
+      done(result, detail)
+    }
   }
 
-  /// 在页面 JSON 里挑一条能直接下的地址。
+  // MARK: - WKNavigationDelegate
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    guard !finished else { return }
+    pageLoaded = true
+    // 登录墙通常会把地址跳到 passport / login，标题也会变。
+    webView.evaluateJavaScript(
+      "(function () { return (location.href || '') + '\\n' "
+        + "+ (document.title || ''); })()"
+    ) { [weak self] value, _ in
+      guard let self = self, !self.finished else { return }
+      guard let text = value as? String else { return }
+      let lower = text.lowercased()
+      if lower.contains("login") || lower.contains("passport")
+        || lower.contains("signin") || text.contains("登录") {
+        self.loginDetected = true
+      }
+    }
+  }
+
+  func webView(
+    _ webView: WKWebView,
+    didFailProvisionalNavigation navigation: WKNavigation!,
+    withError error: Error
+  ) {
+    handleNavigationFailure()
+  }
+
+  func webView(
+    _ webView: WKWebView,
+    didFail navigation: WKNavigation!,
+    withError error: Error
+  ) {
+    handleNavigationFailure()
+  }
+
+  private func handleNavigationFailure() {
+    guard !finished else { return }
+    networkError = true
+    // TikTok 每个候选页重试 2 次再换下一个。
+    if platform == "tiktok", retries < 2, ticks < 12 {
+      retries += 1
+      load(candidate: candidate)
+      return
+    }
+    // 抖音某个候选页打不开时直接往后走，别把 18 秒耗在同一个域名上。
+    if platform == "douyin", candidate + 1 < pages().count, ticks < 13 {
+      candidate += 1
+      retries = 0
+      load(candidate: candidate)
+    }
+  }
+
+  // MARK: - WKScriptMessageHandler
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard !finished, message.name == ShortVideoPlayResolver.handlerName else {
+      return
+    }
+    if let body = message.body as? [String: Any],
+       let text = body["body"] as? String {
+      consume(text)
+    } else if let text = message.body as? String {
+      consume(text)
+    }
+  }
+
+  /// 页面里注入的钩子：包住 fetch / XMLHttpRequest，把带播放地址的响应体回传。
+  private static let hookScript = #"""
+  (function () {
+    if (window.__piliShortVideoResolver) { return; }
+    window.__piliShortVideoResolver = true;
+    var HANDLER = 'shortvideo_resolve';
+    function interesting(text) {
+      if (!text || text.length < 80) { return false; }
+      return text.indexOf('play_addr') >= 0 || text.indexOf('url_list') >= 0;
+    }
+    function post(url, text) {
+      try {
+        if (!interesting(text)) { return; }
+        window.webkit.messageHandlers[HANDLER].postMessage({
+          url: String(url || ''),
+          body: text
+        });
+      } catch (e) {}
+    }
+    var originalFetch = window.fetch;
+    if (originalFetch) {
+      window.fetch = function () {
+        var args = arguments;
+        var url = '';
+        try { url = (args[0] && args[0].url) ? args[0].url : args[0]; } catch (e) {}
+        var promise = originalFetch.apply(this, args);
+        try {
+          promise.then(function (response) {
+            try {
+              response.clone().text().then(function (text) {
+                post(url, text);
+              }).catch(function () {});
+            } catch (e) {}
+          }).catch(function () {});
+        } catch (e) {}
+        return promise;
+      };
+    }
+    var open = XMLHttpRequest.prototype.open;
+    var send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__piliURL = url;
+      return open.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      try {
+        xhr.addEventListener('load', function () {
+          try {
+            var type = xhr.responseType;
+            var text = (type === '' || type === 'text') ? xhr.responseText : '';
+            if (!text && typeof xhr.response === 'string') {
+              text = xhr.response;
+            }
+            post(xhr.__piliURL, text);
+          } catch (e) {}
+        });
+      } catch (e) {}
+      return send.apply(this, arguments);
+    };
+  })();
+  """#
+
+  /// 在页面 JSON 里挑一条能直接下的地址：优先 play_addr.url_list。
   static func pick(_ text: String) -> String? {
+    if let url = pickPlayAddr(text) { return url }
+    return pickAnyCDN(text)
+  }
+
+  private static func pickPlayAddr(_ text: String) -> String? {
+    var searchStart = text.startIndex
+    while searchStart < text.endIndex,
+          let key = text.range(
+            of: "\"play_addr\"",
+            range: searchStart..<text.endIndex
+          ) {
+      let tail = String(text[key.lowerBound...].prefix(4000))
+      if let url = urlList(in: tail) { return url }
+      searchStart = key.upperBound
+    }
+    return nil
+  }
+
+  private static func urlList(in body: String) -> String? {
+    guard let key = body.range(of: "\"url_list\"") else { return nil }
+    guard let open = body.range(
+      of: "[",
+      range: key.upperBound..<body.endIndex
+    ) else { return nil }
+    guard let close = body.range(
+      of: "]",
+      range: open.upperBound..<body.endIndex
+    ) else { return nil }
+    let array = body[open.upperBound..<close.lowerBound]
     var fallback: String?
-    for raw in text.split(separator: "\"") {
-      guard raw.contains("http") else { continue }
-      let token = unescape(String(raw))
-      guard token.hasPrefix("http") else { continue }
-      guard token.contains("/video/tos/")
-        || token.contains("aweme/v1/play/")
-        || token.contains("douyinvod") else { continue }
+    for raw in array.split(separator: "\"") {
+      var token = unescape(String(raw))
+      guard token.hasPrefix("http"), isPlayable(token) else { continue }
+      if token.contains("playwm") {
+        token = token.replacingOccurrences(of: "playwm", with: "play")
+      }
       if token.contains("mime_type=video_mp4") { return token }
       if fallback == nil { fallback = token }
     }
     return fallback
+  }
+
+  private static func pickAnyCDN(_ text: String) -> String? {
+    var fallback: String?
+    for raw in text.split(separator: "\"") {
+      guard raw.contains("http") else { continue }
+      var token = unescape(String(raw))
+      guard token.hasPrefix("http"), isPlayable(token) else { continue }
+      if token.contains("playwm") {
+        token = token.replacingOccurrences(of: "playwm", with: "play")
+      }
+      if token.contains("mime_type=video_mp4") { return token }
+      if fallback == nil { fallback = token }
+    }
+    return fallback
+  }
+
+  private static func isPlayable(_ token: String) -> Bool {
+    return token.contains("/video/tos/")
+      || token.contains("aweme/v1/play/")
+      || token.contains("douyinvod")
+      || token.contains("mime_type=video_mp4")
+  }
+
+  /// `play_addr.uri` 是官方播放接口的参数，直链都拿不到时用它兜底。
+  static func pickPlayURI(_ text: String) -> String? {
+    var searchStart = text.startIndex
+    while searchStart < text.endIndex,
+          let key = text.range(
+            of: "\"play_addr\"",
+            range: searchStart..<text.endIndex
+          ) {
+      let tail = String(text[key.lowerBound...].prefix(4000))
+      if let uri = uriValue(in: tail) { return uri }
+      searchStart = key.upperBound
+    }
+    return nil
+  }
+
+  private static func uriValue(in body: String) -> String? {
+    guard let key = body.range(of: "\"uri\"") else { return nil }
+    guard let colon = body.range(
+      of: ":",
+      range: key.upperBound..<body.endIndex
+    ) else { return nil }
+    guard let open = body.range(
+      of: "\"",
+      range: colon.upperBound..<body.endIndex
+    ) else { return nil }
+    guard let close = body.range(
+      of: "\"",
+      range: open.upperBound..<body.endIndex
+    ) else { return nil }
+    let uri = unescape(String(body[open.upperBound..<close.lowerBound]))
+    guard !uri.isEmpty, !uri.contains(" ") else { return nil }
+    return uri
   }
 
   /// JSON 里的 `\/`、`\u002F`、`\u0026` 都要还原，否则地址是坏的。
