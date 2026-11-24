@@ -14,11 +14,13 @@ import 'package:PiliPlus/pages/douyin/web.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
+import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
+import 'package:PiliPlus/utils/storage.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -85,7 +87,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   int? _pendingOpenIndex;
   String? _pendingOpenSource;
   String? _error;
+
+  /// 随机播放开关。和 [_repeat] 互斥展示：开着随机时按钮显示 shuffle，
+  /// 播完从牌堆取；关掉后回到 [_repeat] 的五种模式之一。
   bool _shuffle = false;
+
+  /// 播放模式，和 B 站 PlayRepeat 对齐。默认列表循环，保持旧版
+  /// 「播完自动下一条、末尾回到第一条」的行为。
+  PlayRepeat _repeat = PlayRepeat.listCycle;
+
+  /// 播放模式落盘：0..4 对应 [PlayRepeat.index]，5 表示随机。
+  static const String _playModeStoreKey = 'douyin.player.playMode';
+  static const int _shufflePlayModeCode = 5;
 
   /// 只读诊断标志：只要有一次切条在途（open 中或列表点击已排队）就算真。
   bool get _switching => _opening || _pendingOpenIndex != null;
@@ -222,6 +235,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   bool _recovering = false;
   int _autoRecoverCount = 0;
   int _recoverStreak = 0;
+
   /// 自动连播（复用同一 texture）累计条数；每 [_autoRebuildInterval] 条
   /// 主动整实例重建一次，避免 texture/解码器长期复用累积劣化。
   int _autoPlaysSinceRebuild = 0;
@@ -287,10 +301,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   QueueEntry get _current => _queue[_index];
 
+  String get _playModeLabel => _shuffle ? '随机播放' : _repeat.label;
+
+  IconData get _playModeIcon {
+    if (_shuffle) return Icons.shuffle;
+    return switch (_repeat) {
+      PlayRepeat.pause => Icons.pause_circle_outline,
+      PlayRepeat.listOrder => Icons.format_list_numbered,
+      PlayRepeat.singleCycle => Icons.repeat_one,
+      PlayRepeat.listCycle => Icons.repeat,
+      PlayRepeat.autoPlayRelated => Icons.play_circle_outline,
+    };
+  }
+
+  Color get _playModeColor => !_shuffle && _repeat == PlayRepeat.listOrder
+      ? Colors.white
+      : Colors.lightBlueAccent;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _restorePlayMode();
     _attachPlayerListeners();
     _pushProgress(force: true);
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
@@ -1224,9 +1256,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 算下一条要预热谁的 key。顺序模式取队列下一条，随机模式取牌堆首项。
   String _prefetchTargetKey() {
     if (_queue.length <= 1) return '';
-    final key = _shuffle && _deck.isNotEmpty
-        ? _deck.first
-        : _queue[(_index + 1) % _queue.length].key;
+    final String? key = _shuffle
+        ? (_deck.isNotEmpty
+              ? _deck.first
+              : _queue[(_index + 1) % _queue.length].key)
+        : switch (_repeat) {
+            PlayRepeat.pause => null,
+            PlayRepeat.singleCycle => null,
+            PlayRepeat.listOrder =>
+              _index + 1 < _queue.length ? _queue[_index + 1].key : null,
+            PlayRepeat.listCycle => _queue[(_index + 1) % _queue.length].key,
+            PlayRepeat.autoPlayRelated =>
+              _queue[(_index + 1) % _queue.length].key,
+          };
+    if (key == null) return '';
     return key == _current.key ? '' : key;
   }
 
@@ -1267,7 +1310,48 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (_player.dataStatus.value != DataStatus.loaded) return;
       _completionArmed = false;
       if (_opening || _leaving || _disposed || !mounted) return;
-      unawaited(_next());
+      unawaited(_handleCompleted());
+    }
+  }
+
+  /// 播完这一条后按当前模式决定下一步。
+  ///
+  /// 随机优先：开了随机就继续从牌堆取，牌堆空了 [_refillDeck] 会重开一轮，
+  /// 所以播完仍然是列表循环的语义。五种固定模式的对应关系：
+  /// 播完暂停 = 停在末尾；单个循环 = 重播本条；顺序播放 = 到末尾停；
+  /// 列表循环 / 自动连播 = 到末尾回到第一条（收藏列表没有相关视频，
+  /// 自动连播与列表循环等价）。
+  Future<void> _handleCompleted() async {
+    DiagProbe.event('repeat-completed', <String, Object?>{
+      'mode': _shuffle ? 'shuffle' : _repeat.name,
+      'index': _index,
+      'queueLength': _queue.length,
+    });
+    if (_shuffle) {
+      await _next();
+      return;
+    }
+    switch (_repeat) {
+      case PlayRepeat.pause:
+        return;
+      case PlayRepeat.singleCycle:
+        try {
+          await _player.play(repeat: true);
+          if (!mounted || _disposed || _leaving) return;
+          _completionArmed = true;
+          _armedSession = _openSession;
+          _isPlaying.value = _player.playerStatus.isPlaying;
+          _pushProgress(force: true);
+          _publishPipState();
+        } catch (error) {
+          if (mounted) setState(() => _error = '重播失败：$error');
+        }
+        return;
+      case PlayRepeat.listOrder:
+      case PlayRepeat.listCycle:
+      case PlayRepeat.autoPlayRelated:
+        await _next();
+        return;
     }
   }
 
@@ -1288,7 +1372,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       return;
     }
     if (!_shuffle) {
-      final next = (_index + 1) % _queue.length;
+      final int? next = switch (_repeat) {
+        PlayRepeat.pause => _index + 1 < _queue.length ? _index + 1 : null,
+        PlayRepeat.listOrder => _index + 1 < _queue.length ? _index + 1 : null,
+        PlayRepeat.singleCycle => (_index + 1) % _queue.length,
+        PlayRepeat.listCycle => (_index + 1) % _queue.length,
+        PlayRepeat.autoPlayRelated => (_index + 1) % _queue.length,
+      };
+      if (next == null) {
+        _diagSwitchRequest(source, _index);
+        _diagSwitchBlocked(source, 'end-of-queue', targetIndex: _index);
+        return;
+      }
       _diagSwitchRequest(source, next);
       if (source == 'auto' && await _maybeAutoRebuildBeforeNext(next)) return;
       await _open(next, source: source);
@@ -1730,17 +1825,60 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
-  void _toggleShuffle() {
+  /// 循环切换播放模式：顺序 → 列表循环 → 单个循环 → 播完暂停 →
+  /// 自动连播 → 随机 → 回到顺序。随机也占一个状态，所以按钮永远只显示
+  /// 当前那一种模式，不需要再单独放一个随机开关。
+  void _cyclePlayMode() {
     _prefetchKey = null;
     _prefetchFuture = null;
     setState(() {
-      _shuffle = !_shuffle;
       if (_shuffle) {
+        _shuffle = false;
+        _repeat = PlayRepeat.listOrder;
+      } else if (_repeat == PlayRepeat.listOrder) {
+        _repeat = PlayRepeat.listCycle;
+      } else if (_repeat == PlayRepeat.listCycle) {
+        _repeat = PlayRepeat.singleCycle;
+      } else if (_repeat == PlayRepeat.singleCycle) {
+        _repeat = PlayRepeat.pause;
+      } else if (_repeat == PlayRepeat.pause) {
+        _repeat = PlayRepeat.autoPlayRelated;
+      } else {
+        _shuffle = true;
+        _repeat = PlayRepeat.listCycle;
         _deck.clear();
         _refillDeck();
       }
     });
+    unawaited(_persistPlayMode());
+    SmartDialog.showToast('播放模式：$_playModeLabel');
     _prefetchNext();
+  }
+
+  /// 下次进播放页沿用上次选中的模式。
+  void _restorePlayMode() {
+    try {
+      final saved = GStorage.video.get(_playModeStoreKey);
+      if (saved is! int) return;
+      if (saved == _shufflePlayModeCode) {
+        _shuffle = true;
+        _repeat = PlayRepeat.listCycle;
+        return;
+      }
+      if (saved >= 0 && saved < PlayRepeat.values.length) {
+        _repeat = PlayRepeat.values[saved];
+        _shuffle = false;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _persistPlayMode() async {
+    try {
+      await GStorage.video.put(
+        _playModeStoreKey,
+        _shuffle ? _shufflePlayModeCode : _repeat.index,
+      );
+    } catch (_) {}
   }
 
   @override
@@ -2316,12 +2454,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 tooltip: '播放列表',
               ),
               ComBtn(
-                icon: Icon(
-                  _shuffle ? Icons.shuffle : Icons.swap_vert,
-                  color: _shuffle ? Colors.lightBlueAccent : Colors.white,
-                ),
-                onTap: _toggleShuffle,
-                tooltip: _shuffle ? '随机播放（开）' : '顺序播放',
+                icon: Icon(_playModeIcon, color: _playModeColor),
+                onTap: _cyclePlayMode,
+                tooltip: _playModeLabel,
               ),
               ComBtn(
                 icon: const Icon(
@@ -2720,10 +2855,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             onTap: _rotateVideo,
           ),
           _sheetTile(
-            icon: _shuffle ? Icons.shuffle : Icons.swap_vert,
+            icon: _playModeIcon,
             title: '播放模式',
-            subtitle: _shuffle ? '随机播放' : '顺序播放',
-            onTap: _toggleShuffle,
+            subtitle: '$_playModeLabel · 点击切换',
+            onTap: _cyclePlayMode,
           ),
           _sheetTile(
             icon: Icons.picture_in_picture_alt_outlined,
