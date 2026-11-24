@@ -257,6 +257,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 网页弹层是否正在打开，避免连点叠两个。
   bool _openingWeb = false;
 
+  /// 网页里是否明确处于未登录状态；由原生状态文字驱动。
+  bool _webLoggedOut = false;
+
   void _installWebHandlers() {
     _rawCount = 0;
     _knownKeys = <String>{
@@ -266,11 +269,21 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     };
     ShortVideoWeb.onPayload = _ingest;
     ShortVideoWeb.onStatus = (text) {
-      if (mounted) setState(() => _status = text);
+      if (!mounted) return;
+      setState(() {
+        _status = text;
+        if (text.contains('未登录')) {
+          _webLoggedOut = true;
+        } else if (text.contains('已登录') || text.contains('登录成功')) {
+          _webLoggedOut = false;
+        }
+      });
     };
     ShortVideoWeb.onClosed = () {
       if (!mounted) return;
       _reload();
+      // 未登录提示保留到下次真的检测到登录态：关掉网页也能看到
+      // 「未登录，点右上角登录」，不会以为已经登录过了。
       setState(() => _status = '本地 ${_videos.length} 条');
       ShortVideoAutoCache.schedule();
       _sync(silent: true);
@@ -926,6 +939,39 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       ),
       body: Column(
         children: [
+          if (_webLoggedOut)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.errorContainer,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.info_outline,
+                      size: 18,
+                      color: theme.colorScheme.onErrorContainer,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '未登录，点右上角登录',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onErrorContainer,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
             child: Row(

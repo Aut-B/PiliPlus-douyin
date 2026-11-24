@@ -63,6 +63,12 @@ abstract final class ShortVideoWeb {
       'url': platform.homeUrl,
       'favoritesUrl': platform.favoritesUrl,
       'loginUrl': platform.loginUrl,
+      // 1.5s 内没看到登录浮层时原生直接 load 这个地址：抖音只有首页前端
+      // 会拉起登录浮层，TikTok 用自己的 /login 页。
+      'loginFallbackUrl': platform.id == 'douyin'
+          ? platform.siteUrl
+          : 'https://www.tiktok.com/login',
+      'cookieDomain': platform.cookieDomainNeedle,
       'userAgent': platform.userAgent,
       'title': '${platform.album} · 登录与抓取',
       'hookScript': hookJs(platform),

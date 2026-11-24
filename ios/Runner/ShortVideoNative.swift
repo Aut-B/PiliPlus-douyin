@@ -224,6 +224,16 @@ final class ShortVideoWebViewController: UIViewController {
   private var loginWatchGeneration = 0
   /// 这次点登录之后，登录浮层到底有没有出现过。
   private var loginDialogSeen = false
+  /// 点登录的这次尝试：1.5s 兜底加载和 8s 慢加载提示都靠它判定是否过期。
+  private var loginAttemptGeneration = 0
+  /// 这次登录是否已经成功；成功后不再触发兜底加载 / 慢加载提示。
+  private var loginSucceeded = false
+  /// 兜底登录地址是否已加载过，避免 1.5s 检查重复整页 load。
+  private var loginFallbackLoaded = false
+  /// 兜底地址加载完后又点过一次官方登录入口，避免反复 reload 兜底页。
+  private var loginFallbackClicked = false
+  /// 页面加载完后探测登录态的代号：旧的回调不能覆盖新页面的提示。
+  private var loginStateProbeGeneration = 0
 
   static func armedHookScript(hookScript: String) -> String {
     """
@@ -262,6 +272,27 @@ final class ShortVideoWebViewController: UIViewController {
   private var userAgent: String { args["userAgent"] as? String ?? "" }
   private var hookScript: String { args["hookScript"] as? String ?? "" }
   private var driverScript: String { args["driverScript"] as? String ?? "" }
+  /// 确定能拉起登录 UI 的地址：抖音的浮层只有 www.douyin.com 前端会拉起，
+  /// TikTok 则直接用自己的 /login 页。Dart 侧可以显式传，没传就按站点推断。
+  private var loginFallbackURL: String {
+    if let explicit = args["loginFallbackUrl"] as? String, !explicit.isEmpty {
+      return explicit
+    }
+    if loginURL.contains("douyin") {
+      if homeURL.contains("douyin.com") { return homeURL }
+      return "https://www.douyin.com/"
+    }
+    if loginURL.contains("tiktok") { return "https://www.tiktok.com/login" }
+    return homeURL
+  }
+  private var cookieDomainNeedle: String {
+    if let explicit = args["cookieDomain"] as? String, !explicit.isEmpty {
+      return explicit
+    }
+    if homeURL.contains("douyin") { return "douyin.com" }
+    if homeURL.contains("tiktok") { return "tiktok.com" }
+    return ""
+  }
   private var titleText: String { args["title"] as? String ?? "抓取" }
 
   init(args: [String: Any], emit: @escaping (String, Any?) -> Void) {
@@ -411,18 +442,96 @@ final class ShortVideoWebViewController: UIViewController {
   /// 登录浮层必须由 `www.douyin.com` 自己的前端拉起来，才有回调可以把 cookie
   /// 写进 douyin.com 域。卸载重装后 WKWebView 的 data store 是空的，未登录的
   /// 抖音首页会把侧栏「我的」和头像入口做成点不动的样式，用户于是「根本没有登录
-  /// 入口」。这里改成：先在当前页面里用 JS 点官方登录按钮，点不到再退回 SSO。
+  /// 入口」。这里改成：先在当前页面里用 JS 点官方登录按钮；1.5s 内没看到登录
+  /// 浮层就 load 一个确定能拉起登录 UI 的地址；8s 仍没有任何登录界面就明确提示。
   @objc private func openLogin() {
+    // 顺序：JS 点官方登录入口 → 1.5s 确认浮层可见 → 不可见就 load 兜底
+    // 地址；8s 还没有任何登录 UI 就明确提示，避免用户一直干等。
+    loginAttemptGeneration += 1
+    let generation = loginAttemptGeneration
+    loginDialogSeen = false
+    loginSucceeded = false
+    loginFallbackLoaded = false
+    loginFallbackClicked = false
+    setStatus("正在打开登录…")
     let script = ShortVideoWebViewController.loginTriggerScript
+    watchLoginCompletion()
+    scheduleSlowLoginHint(generation: generation)
     webView.evaluateJavaScript(script) { [weak self] result, error in
-      guard let self else { return }
+      guard let self, generation == self.loginAttemptGeneration,
+            !self.loginSucceeded else { return }
       if error == nil, ShortVideoWebViewController.truthy(result) {
         self.setStatus("已调出登录浮层，扫码或手机号登录后等待自动刷新…")
-        self.watchLoginCompletion()
+        self.scheduleLoginConfirm(generation: generation)
         return
       }
-      // 页面没渲染登录按钮（还没加载完、或站点改版）：退回站点自己的登录页。
-      self.load(self.loginURL)
+      // 点了但浮层不一定真的出来，1.5s 后再确认；仍没有就 load 兜底地址。
+      self.scheduleLoginConfirm(generation: generation)
+    }
+  }
+
+  /// 1.5s 后确认登录 UI 到底出没出现；没出现就直接 load 兜底地址。
+  private func scheduleLoginConfirm(generation: Int) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+      self?.confirmLoginVisible(generation: generation)
+    }
+  }
+
+  private func confirmLoginVisible(generation: Int) {
+    guard generation == loginAttemptGeneration, !loginSucceeded else { return }
+    let current = (webView.url?.absoluteString ?? "").lowercased()
+    if current.contains("login") || current.contains("sso") {
+      loginDialogSeen = true
+      hintButton.isHidden = true
+      setStatus("已打开登录页，登录后会自动刷新…")
+      return
+    }
+    webView.evaluateJavaScript(ShortVideoWebViewController.loginVisibleProbe) {
+      [weak self] result, _ in
+      guard let self, generation == self.loginAttemptGeneration,
+            !self.loginSucceeded else { return }
+      let map = result as? [String: Any] ?? [:]
+      if ShortVideoWebViewController.truthy(map["visible"]) {
+        self.loginDialogSeen = true
+        self.hintButton.isHidden = true
+        self.setStatus("已调出登录界面，扫码或手机号登录后会自动刷新…")
+        return
+      }
+      guard !self.loginFallbackLoaded else {
+        // 兜底页已经加载并又点过一次入口，浮层还是没出来：别再整页 load。
+        self.setStatus("仍未看到登录界面，可点右上角刷新或在 Safari 打开")
+        self.hintButton.isHidden = false
+        return
+      }
+      self.loginFallbackLoaded = true
+      self.setStatus("没有调到登录浮层，正在直接打开登录页…")
+      self.load(self.loginFallbackURL)
+    }
+  }
+
+  /// 点登录 8s 后既没看到浮层、也没跳到登录页：明确提示，别让用户干等。
+  private func scheduleSlowLoginHint(generation: Int) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+      guard let self, generation == self.loginAttemptGeneration,
+            !self.loginSucceeded else { return }
+      if self.loginDialogSeen { return }
+      let current = (self.webView.url?.absoluteString ?? "").lowercased()
+      if current.contains("login") || current.contains("sso") { return }
+      // 兜底 load 之后浮层可能晚一点才出来，先再探一次再决定要不要提示。
+      self.webView.evaluateJavaScript(
+        ShortVideoWebViewController.loginVisibleProbe
+      ) { [weak self] result, _ in
+        guard let self, generation == self.loginAttemptGeneration,
+              !self.loginSucceeded else { return }
+        let map = result as? [String: Any] ?? [:]
+        if ShortVideoWebViewController.truthy(map["visible"]) {
+          self.loginDialogSeen = true
+          self.setStatus("已调出登录界面，扫码或手机号登录后会自动刷新…")
+          return
+        }
+        self.setStatus("加载较慢，可点右上角刷新或在 Safari 打开")
+        self.hintButton.isHidden = false
+      }
     }
   }
 
@@ -432,6 +541,46 @@ final class ShortVideoWebViewController: UIViewController {
     if let flag = value as? Bool { return flag }
     if let number = value as? NSNumber { return number.boolValue }
     return false
+  }
+
+  /// 1.5s 兜底判断和轮询共用：只认真正可见的登录浮层。
+  static let loginVisibleProbe: String = """
+  (function () {
+    function visible(el) {
+      if (!el) { return false; }
+      var style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') { return false; }
+      var rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) { return false; }
+      var opacity = parseFloat(style.opacity || '1');
+      return !(opacity < 0.05);
+    }
+    var selector = '[class*=login-container], [class*=loginModal], '
+      + '[class*=login-modal], [id*=login-modal], [id*=login-panel], '
+      + '[class*=LoginModal], [data-e2e=login-modal], [class*=TUXModal]';
+    var dialog = document.querySelector(selector);
+    if (visible(dialog)) { return { visible: true, seen: true }; }
+    var dialogs = document.querySelectorAll('[role=dialog]');
+    for (var i = 0; i < dialogs.length; i++) {
+      var text = (dialogs[i].innerText || dialogs[i].textContent || '');
+      if (text.length > 0
+          && /登录|扫码|手机号|Log in|Sign up/i.test(text)
+          && visible(dialogs[i])) {
+        return { visible: true, seen: true };
+      }
+    }
+    return { visible: false, seen: !!dialog };
+  })();
+  """
+
+  /// 登录成功：停掉轮询并刷新当前页，把会话 cookie 带进页面渲染。
+  private func finishLoginSuccess() {
+    guard !loginSucceeded else { return }
+    loginSucceeded = true
+    loginWatchGeneration += 1
+    hintButton.isHidden = true
+    setStatus("登录成功，正在刷新页面…")
+    webView.reload()
   }
 
   /// 等登录完成，然后刷新当前页把登录态带进来。
@@ -447,10 +596,32 @@ final class ShortVideoWebViewController: UIViewController {
 
   private func pollLoginState(generation: Int, attempt: Int) {
     guard generation == loginWatchGeneration, attempt < 60 else { return }
+    // 先查会话 cookie：登录成功后站点写的是 httpOnly cookie，DOM 浮层
+    // 不一定关闭，只看页面会一直等下去。
+    ShortVideoCookies.hasSession(for: cookieDomainNeedle) { [weak self] loggedIn in
+      guard let self, generation == self.loginWatchGeneration else { return }
+      // 只有这次登录流程真的开始过（看到浮层 / 已跳登录页 / 走过兜底），
+      // cookie 才算「这次登录成功」；否则用户本来就有会话时点登录会白刷一次。
+      let current = (self.webView.url?.absoluteString ?? "").lowercased()
+      let onLoginPage = current.contains("login") || current.contains("sso")
+      let started = self.loginDialogSeen || onLoginPage ||
+        self.loginFallbackLoaded
+      if loggedIn && started {
+        self.finishLoginSuccess()
+        return
+      }
+      self.probeLoginState(generation: generation, attempt: attempt)
+    }
+  }
+
+  private func probeLoginState(generation: Int, attempt: Int) {
+    guard generation == loginWatchGeneration, attempt < 60 else { return }
     let probe = """
     (function () {
       var dialog = document.querySelector(
-        '[class*=login-container], [class*=loginModal], [id*=login-modal]'
+        '[class*=login-container], [class*=loginModal], [class*=login-modal], '
+        + '[id*=login-modal], [id*=login-panel], [class*=LoginModal], '
+        + '[data-e2e=login-modal], [class*=TUXModal]'
       );
       var dialogVisible = false;
       if (dialog) {
@@ -478,13 +649,11 @@ final class ShortVideoWebViewController: UIViewController {
       if seen { self.loginDialogSeen = true }
       // 判定登录完成：浮层曾出现过、现在已关闭，且页面上出现了登录态节点。
       if self.loginDialogSeen && !visible && avatar {
-        self.loginWatchGeneration += 1
-        self.setStatus("登录成功，正在刷新页面…")
-        self.webView.reload()
+        self.finishLoginSuccess()
         return
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-        self.pollLoginState(generation: generation, attempt: attempt + 1)
+        self.probeLoginState(generation: generation, attempt: attempt + 1)
       }
     }
   }
@@ -495,6 +664,13 @@ final class ShortVideoWebViewController: UIViewController {
   /// 返回 true 表示点到了至少一个候选元素。
   static let loginTriggerScript: String = """
   (function () {
+    var direct = document.querySelector(
+      '[data-e2e=login-button], [data-e2e=nav-login], a[href*="/login"]'
+    );
+    if (direct) {
+      var dr = direct.getBoundingClientRect();
+      if (dr.width > 0 && dr.height > 0) { direct.click(); return true; }
+    }
     var texts = ['登录', '立即登录', 'Log in', 'Log in to TikTok', '登录/注册'];
     var nodes = document.querySelectorAll(
       'button, a, div[role=button], [data-e2e*=login], [class*=login]'
@@ -574,6 +750,26 @@ final class ShortVideoWebViewController: UIViewController {
       stopCollecting(message: "已停止，收到 \(received) 段数据")
     } else {
       startCollecting()
+    }
+  }
+
+  /// 进页面先看会话 cookie：没有就明确告诉用户「未登录，点右上角登录」。
+  private func reportLoginState() {
+    loginStateProbeGeneration += 1
+    let generation = loginStateProbeGeneration
+    ShortVideoCookies.hasSession(for: cookieDomainNeedle) { [weak self] loggedIn in
+      guard let self, generation == self.loginStateProbeGeneration,
+            !self.collecting else { return }
+      if loggedIn {
+        self.setStatus("已登录：点右上角「开始抓取」")
+        return
+      }
+      let current = (self.webView.url?.absoluteString ?? "").lowercased()
+      if current.contains("login") || current.contains("sso") {
+        self.setStatus("请在登录页完成登录，成功后自动刷新")
+        return
+      }
+      self.setStatus("未登录，点右上角登录")
     }
   }
 
@@ -756,7 +952,24 @@ extension ShortVideoWebViewController: WKNavigationDelegate {
       return
     }
     if !collecting {
-      setStatus("页面已加载：登录后点右上角「开始抓取」")
+      let current = (webView.url?.absoluteString ?? "").lowercased()
+      let onLoginPage = current.contains("login") || current.contains("sso")
+      if loginFallbackLoaded && !loginFallbackClicked && !loginSucceeded &&
+          !onLoginPage {
+        // 兜底地址刚加载完：首页本身不会自动弹浮层，再点一次官方登录入口。
+        loginFallbackClicked = true
+        setStatus("正在打开登录界面…")
+        let generation = loginAttemptGeneration
+        webView.evaluateJavaScript(ShortVideoWebViewController.loginTriggerScript) {
+          [weak self] _, _ in
+          guard let self, generation == self.loginAttemptGeneration,
+                !self.loginSucceeded else { return }
+          self.scheduleLoginConfirm(generation: generation)
+        }
+      } else {
+        setStatus("页面已加载，正在确认登录状态…")
+        reportLoginState()
+      }
     }
   }
 
@@ -999,6 +1212,25 @@ final class ShortVideoPopupController: UIViewController, WKNavigationDelegate {
 
 /// 请求头。TikTok 的 CDN 就是按这个会话认人的。
 enum ShortVideoCookies {
+  /// 抖音 / TikTok 登录后都会写这几个 httpOnly 会话 cookie。
+  static let sessionNames: Set<String> = [
+    "sessionid",
+    "sessionid_ss",
+    "sid_tt",
+  ]
+
+  /// 判断某个站点是否已有登录态。cookie 域里没会话 cookie 就按未登录处理。
+  static func hasSession(for needle: String, completion: @escaping (Bool) -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      let found = cookies.contains { cookie in
+        if !needle.isEmpty, !cookie.domain.contains(needle) { return false }
+        guard sessionNames.contains(cookie.name) else { return false }
+        return !cookie.value.isEmpty
+      }
+      DispatchQueue.main.async { completion(found) }
+    }
+  }
+
   static func header(for needle: String, completion: @escaping (String) -> Void) {
     WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
       let picked = cookies.filter { needle.isEmpty || $0.domain.contains(needle) }
