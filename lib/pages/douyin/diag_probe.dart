@@ -68,6 +68,15 @@ const int _mpvSnapshotIntervalMs = 3000;
 const int _writeBatchLines = 32;
 const int _writeFlushDelayMs = 500;
 
+/// diag_playback.log 单文件上限。超过后只保留末尾约一半，避免常开诊断
+/// 把 Documents 撑到几十 MB。
+const int _maxPlaybackLogBytes = 8 * 1024 * 1024;
+const int _playbackLogKeepBytes = _maxPlaybackLogBytes ~/ 2;
+
+/// ticker-gap 只有超过 3 倍上报间隔（500ms × 3）才算真实停顿。
+/// 调用方按 500ms 节拍上报，阈值放在写入口统一过滤，避免每秒一条噪声。
+const int _tickerGapThresholdMs = 1500;
+
 /// 3 秒内丢帧增量达到这个值，视为「暴涨」。
 const int _dropFrameJumpThreshold = 30;
 
@@ -89,6 +98,9 @@ abstract final class DiagProbe {
   static Future<Directory>? _documentsDir;
   static final List<String> _writeBuffer = <String>[];
   static int _writeBatchCount = 0;
+
+  /// 已落盘的 diag_playback.log 字节数；-1 表示尚未探测。
+  static int _playbackBytes = -1;
 
   /// 本页会话内的 open 序号与按来源统计。`stop()` 时汇总成
   /// `session-summary`，用来直接对比自动连播与手动选播。
@@ -170,7 +182,7 @@ abstract final class DiagProbe {
       out['dataStatus'] = player.dataStatus.value.name;
     } catch (_) {}
 
-    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。每秒
+    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。每次
     // 读 11 项看起来不多，但叠上切条/seek 时的锁竞争就足以把主 isolate
     // 卡成秒级。这里只降频，不删指标：完整快照最多 3 秒一次。
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -230,11 +242,13 @@ abstract final class DiagProbe {
     return out;
   }
 
-  /// 播放期间每秒一行 JSONL。诊断包常开，普通包直接 return。
+  /// 播放期间每 2 秒一行 JSONL。诊断包常开，普通包直接 return。
+  ///
+  /// 采样会同步读 mpv 属性，降到 2 秒一次可明显减少主 isolate 的 FFI 读取。
   static void startSampling() {
     if (!kDiagEnabled) return;
     _sampleTimer?.cancel();
-    _sampleTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _sampleTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       final sw = Stopwatch()..start();
       _append('playback', snapshot());
       _eventIfSlow('snapshot', sw);
@@ -250,6 +264,12 @@ abstract final class DiagProbe {
   /// 写一条 `diag_event`，用于记录 Dart 主 isolate 的卡顿等一次性事件。
   static void event(String event, [Map<String, Object?> fields = const {}]) {
     if (!kDiagEnabled) return;
+    // ticker-gap 由 500ms 定时器逐拍上报；这里统一按 3 倍间隔过滤，
+    // 只在真正停顿时留证，避免单类事件刷出几万条。
+    if (event == 'ticker-gap') {
+      final gapMs = _asInt(fields['gapMs']);
+      if (gapMs == null || gapMs <= _tickerGapThresholdMs) return;
+    }
     _append('diag_event', <String, Object?>{'event': event, ...fields});
   }
 
@@ -480,6 +500,9 @@ abstract final class DiagProbe {
       // pip_trace 是逐帧日志，大包能到几十 MB；压缩放在单独 isolate，
       // 避免导出按钮点下去主 isolate 整块卡住。
       await Isolate.run(() => _encodeZip(zipEntries, zipPath));
+      // 新包写成之后再清旧包：压缩失败时至少还留着上一份可用的诊断包。
+      // 诊断包只需要最新一份，避免 Documents 里越攒越多。
+      await _deleteOldExports(dir, keep: zipPath);
       try {
         await _channel.invokeMethod<bool>('shareFile', <String, Object?>{
           'path': zipFile.path,
@@ -494,6 +517,22 @@ abstract final class DiagProbe {
       }
       return null;
     }
+  }
+
+  static Future<void> _deleteOldExports(Directory dir, {required String keep}) async {
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        if (entity.path == keep) continue;
+        final name = entity.uri.pathSegments.isEmpty
+            ? ''
+            : entity.uri.pathSegments.last;
+        if (!name.startsWith('diag_') || !name.endsWith('.zip')) continue;
+        try {
+          await entity.delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   static void _pollOpen() {
@@ -565,27 +604,26 @@ abstract final class DiagProbe {
         });
       }
       final elapsed = now - tracker.startedAt;
-      // 3 秒仍没有起播位置、或者 mpv 还没给出视频宽高：记首帧缺失。
-      // 强制实时判断有没有声音，区分「黑屏但有声」。
-      if (!tracker.firstFrameMissLogged && elapsed >= _blackScreenCheckMs) {
-        final snap = snapshot();
-        final videoParamsW = _asNum(snap['video-params/w']);
-        if (position == 0 || videoParamsW == null) {
-          tracker.firstFrameMissLogged = true;
-          _markBlack(tracker);
-          _append('first-frame-miss', <String, Object?>{
-            'seq': tracker.seq,
-            'source': tracker.source,
-            'index': tracker.index,
-            'key': tracker.key,
-            'afterOpenMs': elapsed,
-            'positionMs': position,
-            'videoParamsW': videoParamsW,
-            'dataStatus': status.name,
-            'textureId': textureId,
-            'audioReady': _audioReady(player),
-          });
-        }
+      // 只有确实没拿到首帧（firstFrameAt 仍为空）才记首帧缺失。
+      // video-params/w 必须实时读：3 秒缓存快照在刚切条时可能是 null，
+      // 会把正常播放误判成黑屏，污染证据。
+      if (!tracker.firstFrameMissLogged &&
+          tracker.firstFrameAt == null &&
+          elapsed >= _blackScreenCheckMs) {
+        tracker.firstFrameMissLogged = true;
+        _markBlack(tracker);
+        _append('first-frame-miss', <String, Object?>{
+          'seq': tracker.seq,
+          'source': tracker.source,
+          'index': tracker.index,
+          'key': tracker.key,
+          'afterOpenMs': elapsed,
+          'positionMs': position,
+          'videoParamsW': _liveNum(player, 'video-params/w'),
+          'dataStatus': status.name,
+          'textureId': textureId,
+          'audioReady': _audioReady(player),
+        });
       }
       // open 已收尾后计时器还要留到 3 秒黑屏判定，不能把正常完成的一批
       // 误记成「5 秒没结束」。
@@ -608,7 +646,7 @@ abstract final class DiagProbe {
           now - checkFrom >= _blackScreenCheckMs &&
           position > 0) {
         tracker.blackChecked = true;
-        _checkBlackScreen(tracker, position, elapsed);
+        _checkBlackScreen(tracker, player, position, elapsed);
       }
       if (elapsed >= _openProbeTimeoutMs) {
         if (tracker.firstFrameAt == null) {
@@ -631,13 +669,13 @@ abstract final class DiagProbe {
 
   static void _checkBlackScreen(
     _OpenTracker tracker,
+    PlPlayerController player,
     int position,
     int elapsed,
   ) {
-    // 黑屏判定复用最近一次采样缓存即可，避免同步 FFI 再读 11 项。
-    final snap = snapshot();
-    final width = _asNum(snap['video-params/w']);
-    final drop = _asNum(snap['drop-frame-count']);
+    // 判定用实时读取，不能吃缓存：切条后的旧快照宽高可能是 null。
+    final width = _liveNum(player, 'video-params/w');
+    final drop = _liveNum(player, 'drop-frame-count');
     final delta = drop != null && tracker.dropBaseline != null
         ? drop - tracker.dropBaseline!
         : null;
@@ -648,6 +686,8 @@ abstract final class DiagProbe {
       reason = 'drop-frame-count-jump';
     }
     if (reason == null) return;
+    // 真的要留证时才完整刷新一次，保证日志里的宽高/解码字段不是陈旧值。
+    final snap = snapshot(full: true);
     _markBlack(tracker);
     _append('diag_event', <String, Object?>{
       'event': 'blackscreen-suspect',
@@ -764,12 +804,46 @@ abstract final class DiagProbe {
   static Future<void> _writeChunk(String chunk, {required bool sync}) async {
     try {
       final dir = await _docDir();
-      await File('${dir.path}/$kDiagPlaybackFile').writeAsString(
+      final file = File('${dir.path}/$kDiagPlaybackFile');
+      if (_playbackBytes < 0) {
+        _playbackBytes = file.existsSync() ? file.lengthSync() : 0;
+      }
+      await file.writeAsString(
         chunk,
         mode: FileMode.append,
         flush: sync,
       );
+      _playbackBytes += utf8.encode(chunk).length;
+      if (_playbackBytes > _maxPlaybackLogBytes) {
+        _playbackBytes = await _rotatePlaybackLog(file);
+      }
     } catch (_) {}
+  }
+
+  /// 超过上限时只保留末尾约一半，并丢掉第一行残片，保证 JSONL 完整。
+  static Future<int> _rotatePlaybackLog(File file) async {
+    try {
+      final length = await file.length();
+      if (length <= _playbackLogKeepBytes) return length;
+      final raf = await file.open(mode: FileMode.read);
+      List<int> tail;
+      try {
+        await raf.setPosition(length - _playbackLogKeepBytes);
+        tail = await raf.read(_playbackLogKeepBytes);
+      } finally {
+        await raf.close();
+      }
+      final firstNewline = tail.indexOf(0x0A);
+      if (firstNewline >= 0 && firstNewline + 1 < tail.length) {
+        tail = tail.sublist(firstNewline + 1);
+      }
+      await file.writeAsBytes(tail, flush: false);
+      return tail.length;
+    } catch (_) {
+      // 截断失败：把计数标成未知，下次写重新 stat 真实大小，
+      // 避免用错误计数把滚动判定卡死。
+      return -1;
+    }
   }
 
   /// 导出前/退出时把缓冲刷干净。
@@ -806,6 +880,15 @@ abstract final class DiagProbe {
   }
 
   static int? _asInt(Object? value) => _asNum(value)?.toInt();
+
+  /// 实时读取单个 mpv 属性，绕过 [_mpvCache]。
+  static num? _liveNum(PlPlayerController player, String key) {
+    try {
+      final raw = player.videoPlayerController?.getProperty(key);
+      if (raw != null && raw.isNotEmpty) return num.tryParse(raw);
+    } catch (_) {}
+    return null;
+  }
 
   static String _timestamp() {
     final now = DateTime.now();

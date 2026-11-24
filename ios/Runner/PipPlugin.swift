@@ -142,6 +142,11 @@ final class PipPlugin: NSObject, FlutterPlugin {
 // 只写不读，任何异常都吞掉，绝不影响播放。
 enum PipTrace {
   private static let queue = DispatchQueue(label: "com.example.piliplus.piptrace")
+  /// 单文件上限 8MB；超过后只保留末尾一半，避免逐帧日志无限增长。
+  private static let maxBytes = 8 * 1024 * 1024
+  private static let keepBytes = maxBytes / 2
+  /// 逐帧的 pts/enqueue/frame 三连日志每 60 帧采样一次；异常日志不降频。
+  private static let frameSampleEvery = 60
   private static var fileURL: URL? = {
     guard
       let dir = FileManager.default.urls(
@@ -151,18 +156,102 @@ enum PipTrace {
     return dir.appendingPathComponent("pip_trace.log")
   }()
 
+  /// 以下状态只在 `queue` 上读写：常驻句柄避免每行 open/close。
+  private static var handle: FileHandle?
+  /// 当前文件字节数；-1 表示尚未探测。
+  private static var fileBytes = -1
+
+  /// 逐帧日志采样计数。`process` 在 frameQueue 上调用，单独加锁。
+  private static let sampleLock = NSLock()
+  private static var frameCount = 0
+
+  /// 每帧调用一次，决定这一帧是否写逐帧日志（首帧与每 60 帧一次）。
+  static func shouldLogFrame() -> Bool {
+    sampleLock.lock()
+    defer { sampleLock.unlock() }
+    frameCount &+= 1
+    return frameCount == 1 || frameCount % frameSampleEvery == 0
+  }
+
   static func log(_ message: String) {
     let line = "[\(Date().timeIntervalSince1970)] \(message)\n"
     queue.async {
       guard let url = fileURL, let data = line.data(using: .utf8) else { return }
-      if let handle = try? FileHandle(forWritingTo: url) {
-        defer { try? handle.close() }
-        try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
-      } else {
-        try? data.write(to: url)
+      writeLocked(data, url: url)
+    }
+  }
+
+  /// 只在 `queue` 上调用：追加一行，必要时滚动截断。
+  private static func writeLocked(_ data: Data, url: URL) {
+    // 句柄打不开时直接丢这一行：绝不能退回 `data.write(to:)`，那会把
+    // 已有日志整文件覆盖掉。日志允许丢行，但不允许毁证据。
+    guard let fileHandle = openHandle(url) else { return }
+    do {
+      // 常驻句柄的写位置停在上次结尾；显式 seek 到末尾保证只追加，
+      // 否则句柄位置不对会覆盖已有日志。
+      _ = try fileHandle.seekToEnd()
+      try fileHandle.write(contentsOf: data)
+      fileBytes += data.count
+      if fileBytes > maxBytes {
+        fileBytes = rotate(url: url, handle: fileHandle)
+      }
+    } catch {
+      // 句柄失效（例如文件被外部删掉）：丢弃缓存，下次重开。
+      try? fileHandle.close()
+      handle = nil
+      fileBytes = -1
+    }
+  }
+
+  /// 只在 `queue` 上调用。
+  private static func openHandle(_ url: URL) -> FileHandle? {
+    if let existing = handle { return existing }
+    if !FileManager.default.fileExists(atPath: url.path) {
+      _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+    }
+    guard let opened = try? FileHandle(forWritingTo: url) else { return nil }
+    if fileBytes < 0 {
+      let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+      fileBytes = (attributes?[.size] as? Int) ?? 0
+    }
+    handle = opened
+    return opened
+  }
+
+  /// 超过上限时截断为末尾约一半，并丢掉第一行残片保证整行完整。
+  /// 只在 `queue` 上调用，返回截断后的字节数。
+  private static func rotate(url: URL, handle: FileHandle) -> Int {
+    try? handle.close()
+    PipTrace.handle = nil
+    // 只读末尾一半：升级用户可能已有上百 MB 的旧日志，整文件读入会
+    // 在后台瞬间申请同等内存。失败返回 -1（未知），下一次写重新 stat。
+    guard let reader = try? FileHandle(forReadingFrom: url) else { return -1 }
+    defer { try? reader.close() }
+    guard let size = try? reader.seekToEnd() else { return -1 }
+    let keep = UInt64(keepBytes)
+    guard size > keep else { return Int(size) }
+    let tailData: Data?
+    do {
+      try reader.seek(toOffset: size - keep)
+      tailData = try reader.read(upToCount: keepBytes)
+    } catch {
+      return -1
+    }
+    guard let tailData else { return -1 }
+    var tail = tailData[...]
+    if let newline = tail.firstIndex(of: 0x0A) {
+      let afterNewline = tail.index(after: newline)
+      if afterNewline < tail.endIndex {
+        tail = tail[afterNewline...]
       }
     }
+    let trimmed = Data(tail)
+    do {
+      try trimmed.write(to: url, options: .atomic)
+    } catch {
+      return -1
+    }
+    return trimmed.count
   }
 }
 
@@ -259,6 +348,8 @@ private final class PipSession: NSObject {
   private var identicalRunsSum = 0
   private var lastOutputHash: UInt32 = 0
   private var hasOutputHash = false
+  /// 上一次输出指纹判定；nil 表示还没判过，用于只在 true/false 翻转时补日志。
+  private var lastOutputChanged: Bool?
   private var verdictWritten = false
   /// 只在兜底渲染尺寸变化时写一次，避免每帧刷屏。
   private var lastFallbackLogSignature = ""
@@ -561,11 +652,13 @@ private final class PipSession: NSObject {
       var stage = "copy"
       var enqueued = false
       var direct = false
+      // 逐帧三连日志每 60 帧采样一次；异常日志（copy-slow / 失败分支）不降频。
+      let verbose = PipTrace.shouldLogFrame()
       let sourceFormat = CVPixelBufferGetPixelFormatType(source)
       self.recordSourceFingerprint(source, active: active)
       let pixelBuffer: CVPixelBuffer?
       if Self.isDisplayableFormat(sourceFormat),
-        let directCopy = self.copyDirect(source, stage: &stage)
+        let directCopy = self.copyDirect(source, stage: &stage, verbose: verbose)
       {
         pixelBuffer = directCopy
         direct = true
@@ -573,27 +666,36 @@ private final class PipSession: NSObject {
         pixelBuffer = self.copy(
           source,
           fallbackRenderSize: fallbackRenderSize,
-          stage: &stage
+          stage: &stage,
+          verbose: verbose
         )
       }
-      PipTrace.log(
-        "direct-enqueue: pixfmt=\(Self.pixelFormatName(sourceFormat)) "
-          + "skipRender=\(direct ? "YES" : "NO") "
-          + "src=\(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))"
-      )
+      if verbose {
+        PipTrace.log(
+          "direct-enqueue: pixfmt=\(Self.pixelFormatName(sourceFormat)) "
+            + "skipRender=\(direct ? "YES" : "NO") "
+            + "src=\(CVPixelBufferGetWidth(source))x\(CVPixelBufferGetHeight(source))"
+        )
+      }
       if let pixelBuffer,
-        let sampleBuffer = self.makeSampleBuffer(pixelBuffer, stage: &stage)
+        let sampleBuffer = self.makeSampleBuffer(
+          pixelBuffer,
+          stage: &stage,
+          verbose: verbose
+        )
       {
-        enqueued = self.enqueue(sampleBuffer, stage: &stage)
+        enqueued = self.enqueue(sampleBuffer, stage: &stage, verbose: verbose)
       }
       let layerStatus = self.displayLayer.status.rawValue
       let ready = self.displayLayer.isReadyForMoreMediaData
-      PipTrace.log(
-        "frame: enqueued=\(enqueued) stage=\(stage) direct=\(direct ? "YES" : "NO") "
-          + "layerStatus=\(layerStatus) "
-          + "ready=\(ready) size=\(CVPixelBufferGetWidth(source))x"
-          + "\(CVPixelBufferGetHeight(source))"
-      )
+      if verbose {
+        PipTrace.log(
+          "frame: enqueued=\(enqueued) stage=\(stage) direct=\(direct ? "YES" : "NO") "
+            + "layerStatus=\(layerStatus) "
+            + "ready=\(ready) size=\(CVPixelBufferGetWidth(source))x"
+            + "\(CVPixelBufferGetHeight(source))"
+        )
+      }
       DispatchQueue.main.async {
         guard self.frameGeneration == generation else { return }
         self.frameInFlight = false
@@ -635,7 +737,8 @@ private final class PipSession: NSObject {
   private func copy(
     _ source: CVPixelBuffer,
     fallbackRenderSize: CGSize,
-    stage: inout String
+    stage: inout String,
+    verbose: Bool
   ) -> CVPixelBuffer? {
     let started = CFAbsoluteTimeGetCurrent()
     let sourceWidth = Double(CVPixelBufferGetWidth(source))
@@ -653,7 +756,9 @@ private final class PipSession: NSObject {
         + "pixelBufferMs=\(Int(pixelBufferMs)) renderMs=\(Int(renderMs)) "
         + "src=\(Int(sourceWidth))x\(Int(sourceHeight)) "
         + "out=\(outputWidth)x\(outputHeight) lite=\(pipLiteMode ? 1 : 0)"
-      PipTrace.log("copy-timing: \(details)")
+      if verbose {
+        PipTrace.log("copy-timing: \(details)")
+      }
       let stages: [(String, Double)] = [
         ("size", sizeMs),
         ("pool", poolMs),
@@ -772,7 +877,7 @@ private final class PipSession: NSObject {
     }
     ciContext.render(image, to: output)
     renderMs = (CFAbsoluteTimeGetCurrent() - renderStarted) * 1000
-    recordOutputFingerprint(output)
+    recordOutputFingerprint(output, verbose: verbose)
     stage = "done"
     return output
   }
@@ -809,7 +914,8 @@ private final class PipSession: NSObject {
   /// the layer after enqueue.
   private func copyDirect(
     _ source: CVPixelBuffer,
-    stage: inout String
+    stage: inout String,
+    verbose: Bool
   ) -> CVPixelBuffer? {
     let started = CFAbsoluteTimeGetCurrent()
     let format = CVPixelBufferGetPixelFormatType(source)
@@ -864,11 +970,13 @@ private final class PipSession: NSObject {
     let details =
       "pixfmt=\(formatName) src=\(width)x\(height) "
       + "directMs=\(totalMs) lite=\(pipLiteMode ? 1 : 0)"
-    PipTrace.log("copy-timing: direct \(details)")
+    if verbose {
+      PipTrace.log("copy-timing: direct \(details)")
+    }
     if totalMs > 30 {
       PipTrace.log("copy-slow: stage=direct-copy ms=\(totalMs) \(details)")
     }
-    recordOutputFingerprint(output)
+    recordOutputFingerprint(output, verbose: verbose)
     stage = "done"
     return output
   }
@@ -1007,17 +1115,29 @@ private final class PipSession: NSObject {
     }
   }
 
-  /// 对 render 后的 output 算指纹。每帧都写一次，true/false 直接对应
-  /// 「这一帧和上一帧的渲染结果是否不同」。
-  private func recordOutputFingerprint(_ output: CVPixelBuffer) {
+  /// 对 render 后的 output 算指纹。采样帧写 true/false，直接对应
+  /// 「这一帧和上一帧的渲染结果是否不同」；非采样帧只在 changed=false
+  /// （疑似卡住）时补一条，保证异常证据不丢。
+  private func recordOutputFingerprint(
+    _ output: CVPixelBuffer,
+    verbose: Bool
+  ) {
     guard let hash = pixelFingerprint(output) else {
-      PipTrace.log("out-hash-changed: false (lock failed)")
+      if verbose {
+        PipTrace.log("out-hash-changed: false (lock failed)")
+      }
       return
     }
     let changed = !hasOutputHash || hash != lastOutputHash
     hasOutputHash = true
     lastOutputHash = hash
-    PipTrace.log("out-hash-changed: \(changed)")
+    // 采样帧记录 true/false；非采样帧只在状态翻转时补一条。冻结期间每帧
+    // 都写 false 会重新制造大量噪声，异常持续性由 stale-source 留证。
+    let flipped = lastOutputChanged != changed
+    lastOutputChanged = changed
+    if verbose || flipped {
+      PipTrace.log("out-hash-changed: \(changed)")
+    }
   }
 
   private func flushForStale(run: Int) {
@@ -1089,7 +1209,8 @@ private final class PipSession: NSObject {
 
   private func makeSampleBuffer(
     _ pixelBuffer: CVPixelBuffer,
-    stage: inout String
+    stage: inout String,
+    verbose: Bool
   ) -> CMSampleBuffer? {
     stage = "format"
     let matches =
@@ -1134,9 +1255,11 @@ private final class PipSession: NSObject {
     let deltaMs =
       pts.isValid && now.isValid
       ? CMTimeSubtract(now, pts).seconds * 1000 : Double.nan
-    PipTrace.log(
-      "pts: value=\(pts.seconds) timebase=\(now.seconds) deltaMs=\(deltaMs)"
-    )
+    if verbose {
+      PipTrace.log(
+        "pts: value=\(pts.seconds) timebase=\(now.seconds) deltaMs=\(deltaMs)"
+      )
+    }
 
     // Frames are already paced by mpv.
     if let attachments = CMSampleBufferGetSampleAttachmentsArray(
@@ -1157,7 +1280,11 @@ private final class PipSession: NSObject {
     return sampleBuffer
   }
 
-  private func enqueue(_ sampleBuffer: CMSampleBuffer, stage: inout String) -> Bool {
+  private func enqueue(
+    _ sampleBuffer: CMSampleBuffer,
+    stage: inout String,
+    verbose: Bool
+  ) -> Bool {
     stage = "enqueue"
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     let before = CMTimebaseGetTime(timebase)
@@ -1168,45 +1295,53 @@ private final class PipSession: NSObject {
     let enqueued: Bool
     if #available(iOS 17.0, *) {
       let renderer = displayLayer.sampleBufferRenderer
-      PipTrace.log(
-        "enqueue(before): isReadyForMoreMediaData="
-          + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
-          + "layerStatus=\(displayLayer.status.rawValue) "
-          + "requiresFlush=\(renderer.requiresFlushToResumeDecoding) "
-          + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
-      )
+      if verbose {
+        PipTrace.log(
+          "enqueue(before): isReadyForMoreMediaData="
+            + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
+            + "layerStatus=\(displayLayer.status.rawValue) "
+            + "requiresFlush=\(renderer.requiresFlushToResumeDecoding) "
+            + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
+        )
+      }
       if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
         renderer.flush()
       }
       renderer.enqueue(sampleBuffer)
       enqueued = renderer.status != .failed
       let elapsedMs = Int((CACurrentMediaTime() - began) * 1000)
-      PipTrace.log(
-        "enqueue(after): isReadyForMoreMediaData="
-          + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
-          + "layerStatus=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
-          + "elapsedMs=\(elapsedMs)"
-      )
+      if verbose || !enqueued || elapsedMs > 30 {
+        PipTrace.log(
+          "enqueue(after): isReadyForMoreMediaData="
+            + "\(renderer.isReadyForMoreMediaData) status=\(renderer.status.rawValue) "
+            + "layerStatus=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
+            + "elapsedMs=\(elapsedMs)"
+        )
+      }
     } else {
-      PipTrace.log(
-        "enqueue(before): isReadyForMoreMediaData="
-          + "\(displayLayer.isReadyForMoreMediaData) "
-          + "status=\(displayLayer.status.rawValue) "
-          + "requiresFlush=\(displayLayer.requiresFlushToResumeDecoding) "
-          + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
-      )
+      if verbose {
+        PipTrace.log(
+          "enqueue(before): isReadyForMoreMediaData="
+            + "\(displayLayer.isReadyForMoreMediaData) "
+            + "status=\(displayLayer.status.rawValue) "
+            + "requiresFlush=\(displayLayer.requiresFlushToResumeDecoding) "
+            + "pts=\(pts.seconds) ptsAgeMs=\(ptsAgeMs)"
+        )
+      }
       if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
         displayLayer.flush()
       }
       displayLayer.enqueue(sampleBuffer)
       enqueued = displayLayer.status != .failed
       let elapsedMs = Int((CACurrentMediaTime() - began) * 1000)
-      PipTrace.log(
-        "enqueue(after): isReadyForMoreMediaData="
-          + "\(displayLayer.isReadyForMoreMediaData) "
-          + "status=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
-          + "elapsedMs=\(elapsedMs)"
-      )
+      if verbose || !enqueued || elapsedMs > 30 {
+        PipTrace.log(
+          "enqueue(after): isReadyForMoreMediaData="
+            + "\(displayLayer.isReadyForMoreMediaData) "
+            + "status=\(displayLayer.status.rawValue) enqueued=\(enqueued) "
+            + "elapsedMs=\(elapsedMs)"
+        )
+      }
     }
     if enqueued {
       stage = "done"
