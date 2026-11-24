@@ -17,6 +17,9 @@ abstract final class IOSPipHelper {
 
   static bool _autoEnter = false;
 
+  /// 自动画中画真正进入时回调，只用于 Dart 侧写诊断日志。
+  static void Function()? onAutoEnter;
+
   /// Whether the native side needs playback state updates.
   static bool get needsUpdate => isActive || _autoEnter;
 
@@ -33,7 +36,11 @@ abstract final class IOSPipHelper {
     switch (call.method) {
       case 'onStateChanged':
         final args = call.arguments as Map;
+        final wasActive = isActive;
         isActive = args['active'] as bool;
+        if (!wasActive && isActive && _autoEnter) {
+          onAutoEnter?.call();
+        }
         final isResumed =
             WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
         if (args['error'] != null && isResumed) {

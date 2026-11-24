@@ -111,6 +111,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 是否点过小窗按钮。返回时要先把系统小窗关掉，否则页面退了自己还在后台播。
   bool _pipEntered = false;
 
+  /// 是否已武装 iOS 自动画中画（播放中按 Home 自动起小窗）。
+  bool _pipAutoArmed = false;
+
+  /// 固定在实例上的回调引用，收尾时只清自己，避免误清下一个播放页。
+  late final void Function() _pipAutoEnterHandler = _onPipAutoEnter;
+
   /// 后台保活。B站链路由 video 页写入 audio_service 的 mediaItem，
   /// `onUpdateState` 才会驱动 Now Playing / 音频会话；抖音页此前一条
   /// mediaItem 都没有，iOS 进后台后 Flutter texture 会被冻结，PiP 只能
@@ -281,6 +287,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     DiagProbe.startSession();
     DiagProbe.startSampling();
     _startPipTicker();
+    IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
     _scheduleChromeHide();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
@@ -365,6 +372,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    _disarmPipAutoEnter('shutdown');
+    if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
+      IOSPipHelper.onAutoEnter = null;
+    }
     DiagProbe.stop();
     _stopPipTicker();
     _prefetchKey = null;
@@ -417,6 +428,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 置位后 PopScope 回调会直接返回，真正的收尾交给下面的 postFrame。
     _leaving = true;
 
+    _disarmPipAutoEnter('leave');
     _stopPipTicker();
     final navigator = Navigator.of(context);
     if (navigator.canPop()) {
@@ -551,6 +563,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         _index = target;
         _error = null;
       });
+      _disarmPipAutoEnter('switch');
       // 必须先于 setDataSource/play：audio_service 只有在 _item 非空时
       // 才会真正写入后台播放状态。
       _applyBackgroundKeepAlive();
@@ -662,6 +675,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         return;
       }
       _publishPipState();
+      _armPipAutoEnter('open');
       _completionArmed = true;
       _armedSession = session;
       _armFirstFrameWatchdog(
@@ -1226,6 +1240,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_isPlaying.value != isPlaying) {
       _isPlaying.value = isPlaying;
     }
+    if (status == PlayerStatus.playing) {
+      _armPipAutoEnter('status-playing');
+    } else {
+      _disarmPipAutoEnter('status-${status.name}');
+    }
     _pushProgress(force: true);
     _publishPipState();
     if (status == PlayerStatus.completed) {
@@ -1427,6 +1446,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _pushProgress(force: true);
     _publishPipState();
+    if (_player.playerStatus.isPlaying) {
+      _armPipAutoEnter('toggle-play');
+    } else {
+      _disarmPipAutoEnter('toggle-pause');
+    }
   }
 
   Future<void> _enterPip() async {
@@ -1441,6 +1465,50 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 必须先 enter 再 update：PipSession 还不存在时 update 会被原生直接丢掉。
     unawaited(_pushPipLiteMode());
     _publishPipState();
+  }
+
+  /// 播放中武装自动画中画：原生置
+  /// `canStartPictureInPictureAutomaticallyFromInline = true`，按 Home 退后台即起小窗。
+  void _armPipAutoEnter(String reason) {
+    if (_disposed || _leaving || !mounted || _appPaused) return;
+    if (_pipAutoArmed || !IOSPipHelper.isAvailable) return;
+    final textureId = _player.videoController?.id.value;
+    if (textureId == null) return;
+    _pipAutoArmed = true;
+    _player.enterPip(autoEnter: true);
+    _publishPipState();
+    DiagProbe.event('pip-auto-arm', <String, Object?>{
+      'armed': true,
+      'reason': reason,
+      'textureId': textureId,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'positionMs': _player.positionInMilliseconds,
+      'pipActive': IOSPipHelper.isActive,
+    });
+  }
+
+  /// 暂停、切条、离开页面时收起 arm，避免残留后在后台误弹小窗。
+  void _disarmPipAutoEnter(String reason) {
+    if (!_pipAutoArmed) return;
+    _pipAutoArmed = false;
+    IOSPipHelper.disableAutoEnter();
+    DiagProbe.event('pip-auto-arm', <String, Object?>{
+      'armed': false,
+      'reason': reason,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'positionMs': _player.positionInMilliseconds,
+      'pipActive': IOSPipHelper.isActive,
+    });
+  }
+
+  void _onPipAutoEnter() {
+    if (_disposed) return;
+    DiagProbe.event('pip-auto-enter', <String, Object?>{
+      'textureId': _player.videoController?.id.value,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'positionMs': _player.positionInMilliseconds,
+      'autoArmed': _pipAutoArmed,
+    });
   }
 
   Future<void> _pushPipLiteMode([bool? value]) async {
@@ -1562,6 +1630,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       });
     } else if (state == AppLifecycleState.resumed) {
       _appPaused = false;
+      if (_player.playerStatus.isPlaying) {
+        _armPipAutoEnter('resume');
+      }
       DiagProbe.event('bg-return', <String, Object?>{
         'textureId': textureId,
         'previousTextureId': _bgTextureId,
