@@ -137,6 +137,9 @@ abstract final class ShortVideoWeb {
     _cookieAt.clear();
     _playUrlCache.clear();
     _playUrlAt.clear();
+    _commentCache.clear();
+    _commentAt.clear();
+    _commentErrorCache.clear();
   }
 
   /// 重新解析出来的直链，20 分钟内复用。
@@ -196,6 +199,81 @@ abstract final class ShortVideoWeb {
     } catch (_) {
       lastPlayUrlError = 'network';
       return null;
+    }
+  }
+
+  /// 评论列表，同一条视频 10 分钟内复用，避免每次打开面板都开一次网页。
+  static final Map<String, List<ShortVideoComment>> _commentCache = {};
+  static final Map<String, DateTime> _commentAt = {};
+  static final Map<String, String> _commentErrorCache = {};
+
+  /// 最近一次评论抓取失败的原因：
+  /// `network`（网络）/ `login`（需要登录）/ `empty`（页面没有评论）/
+  /// `notfound`（页面没打开或接口没触发）。
+  static String lastCommentError = '';
+
+  /// 让原生开一个离屏视频页，截取评论接口的响应并解析成评论列表。
+  ///
+  /// 收藏接口本身只有视频元数据，评论必须回到 `www.douyin.com/video/<id>`
+  /// （或 TikTok 的视频页）里拿。原生侧最多等 12 秒；这里只负责通道和缓存。
+  static Future<List<ShortVideoComment>> resolveComments({
+    required String platformId,
+    required String videoId,
+    required String userAgent,
+    int limit = 40,
+    bool force = false,
+  }) async {
+    lastCommentError = '';
+    if (videoId.isEmpty) {
+      lastCommentError = 'notfound';
+      return const [];
+    }
+    final cacheKey = '$platformId:$videoId';
+    final at = _commentAt[cacheKey];
+    if (!force &&
+        at != null &&
+        DateTime.now().difference(at) < const Duration(minutes: 10)) {
+      final cached = _commentCache[cacheKey];
+      if (cached != null) {
+        lastCommentError = _commentErrorCache[cacheKey] ?? '';
+        return cached;
+      }
+    }
+    _ensureHandler();
+    try {
+      final raw = await _channel
+          .invokeMethod<dynamic>('resolveComments', {
+            'platform': platformId,
+            'videoId': videoId,
+            'userAgent': userAgent,
+            'limit': limit,
+          })
+          .timeout(const Duration(seconds: 16));
+      final list = <ShortVideoComment>[];
+      var reason = '';
+      if (raw is Map) {
+        final items = raw['comments'];
+        if (items is List) {
+          for (final item in items) {
+            final comment = ShortVideoComment.fromJson(item);
+            if (comment != null) list.add(comment);
+          }
+        }
+        final detail = raw['reason'];
+        if (detail is String) reason = detail;
+      }
+      _commentCache[cacheKey] = list;
+      _commentAt[cacheKey] = DateTime.now();
+      if (list.isEmpty) {
+        lastCommentError = reason.isEmpty ? 'notfound' : reason;
+        _commentErrorCache[cacheKey] = lastCommentError;
+        return const [];
+      }
+      _commentErrorCache.remove(cacheKey);
+      return list;
+    } catch (_) {
+      lastCommentError = 'network';
+      return const [];
     }
   }
 
@@ -319,6 +397,39 @@ abstract final class ShortVideoWeb {
   static Future<void> stop() => _channel.invokeMethod('stop');
 
   static Future<void> close() => _channel.invokeMethod('close');
+}
+
+/// 一条视频评论。
+class ShortVideoComment {
+  const ShortVideoComment({
+    required this.author,
+    required this.text,
+    this.likes = 0,
+    this.time = 0,
+  });
+
+  final String author;
+  final String text;
+  final int likes;
+
+  /// 平台返回的 `create_time`，单位是秒；0 表示未知。
+  final int time;
+
+  String get authorText => author.trim().isEmpty ? '匿名用户' : author.trim();
+
+  static ShortVideoComment? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final text = '${raw['text'] ?? ''}'.trim();
+    if (text.isEmpty) return null;
+    final likes = raw['likes'];
+    final time = raw['time'];
+    return ShortVideoComment(
+      author: '${raw['author'] ?? ''}',
+      text: text,
+      likes: likes is num ? likes.toInt() : 0,
+      time: time is num ? time.toInt() : 0,
+    );
+  }
 }
 
 /// 包住 `fetch` / `XMLHttpRequest`，凡是返回体里带平台特征字段的都回传原生。

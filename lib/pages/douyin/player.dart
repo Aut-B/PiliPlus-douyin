@@ -28,6 +28,7 @@ import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// 抖音 / TikTok / B 站收藏的整页播放器。
 ///
@@ -190,6 +191,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 这条页面是 `Get.to` 推进来的，`showModalBottomSheet` / `PopupMenuButton`
   /// 生成的 overlay 在 iOS 真机上点开看不到（表现为「按钮按不动」）。
   _PlayerPanel? _panel;
+
+  /// 评论面板的数据。key 用来判断是不是同一条视频，切条后旧结果作废。
+  List<ShortVideoComment> _comments = const [];
+  bool _commentsLoading = false;
+  String _commentsError = '';
+  String _commentsKey = '';
+  int _commentsSession = 0;
 
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
@@ -381,6 +389,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     WidgetsBinding.instance.removeObserver(this);
     _stopPipTicker();
     _chromeTimer?.cancel();
+    _commentsSession++;
     _firstFrameWatchdog?.cancel();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
@@ -608,7 +617,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       setState(() {
         _index = target;
         _error = null;
+        _resetComments();
       });
+      // 评论面板开着时切条，旧结果已经作废，需要按新视频重新抓一次。
+      if (_panel == _PlayerPanel.comments) {
+        unawaited(_ensureComments());
+      }
       _disarmPipAutoEnter('switch');
       // 必须先于 setDataSource/play：audio_service 只有在 _item 非空时
       // 才会真正写入后台播放状态。
@@ -2701,12 +2715,71 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _openPanel(_PlayerPanel panel) {
     _chromeTimer?.cancel();
     setState(() => _panel = panel);
+    if (panel == _PlayerPanel.comments) unawaited(_ensureComments());
   }
 
   void _closePanel() {
     if (_panel == null) return;
     setState(() => _panel = null);
     _scheduleChromeHide();
+  }
+
+  void _resetComments() {
+    _commentsSession++;
+    _comments = const [];
+    _commentsLoading = false;
+    _commentsError = '';
+    _commentsKey = '';
+  }
+
+  /// 打开评论面板时抓一次评论。同一条视频的加载中/成功结果直接复用，
+  /// 切条后 [_resetComments] 会把 key 清掉，旧请求的回包也会被 session 丢弃。
+  Future<void> _ensureComments({bool force = false}) async {
+    final entry = _current;
+    final video = entry.short;
+    final platform =
+        ShortVideoPlatform.fromId(video?.platform) ?? ShortVideoPlatform.douyin;
+    final videoId = video?.videoId ?? '';
+    if (videoId.isEmpty) {
+      setState(() {
+        _commentsKey = '${platform.id}:';
+        _comments = const [];
+        _commentsLoading = false;
+        _commentsError = 'unsupported';
+      });
+      return;
+    }
+    final key = '${platform.id}:$videoId';
+    if (!force &&
+        key == _commentsKey &&
+        (_commentsLoading ||
+            _comments.isNotEmpty ||
+            _commentsError.isNotEmpty)) {
+      return;
+    }
+    final session = ++_commentsSession;
+    setState(() {
+      _commentsKey = key;
+      _comments = const [];
+      _commentsLoading = true;
+      _commentsError = '';
+    });
+    final list = await ShortVideoWeb.resolveComments(
+      platformId: platform.id,
+      videoId: videoId,
+      userAgent: platform.userAgent,
+      force: force,
+    );
+    if (!mounted || session != _commentsSession) return;
+    setState(() {
+      _commentsLoading = false;
+      _comments = list;
+      _commentsError = list.isEmpty
+          ? (ShortVideoWeb.lastCommentError.isEmpty
+                ? 'notfound'
+                : ShortVideoWeb.lastCommentError)
+          : '';
+    });
   }
 
   /// 页内面板：半透明遮罩 + 底部卡片。
@@ -2753,51 +2826,265 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 评论入口。
-  ///
-  /// 抖音 / TikTok 的收藏抓取接口只返回视频元数据，没有评论列表；B 站播放页
-  /// 那个「发弹幕」的位置在这里换成评论，但没有数据时只显示「暂无评论」，
-  /// 不编造、也不额外请求接口。
+  /// 评论面板：打开时回视频页抓评论，加载中给骨架，失败给网页入口。
   Widget _commentsPanelBody() {
     final entry = _current;
+    final video = entry.short;
     final platform =
-        ShortVideoPlatform.fromId(entry.short?.platform) ??
-        ShortVideoPlatform.douyin;
+        ShortVideoPlatform.fromId(video?.platform) ?? ShortVideoPlatform.douyin;
+    final videoId = video?.videoId ?? '';
+    final bvid = entry.bvid ?? '';
+    final shareUrl = bvid.isNotEmpty
+        ? 'https://www.bilibili.com/video/$bvid'
+        : (videoId.isEmpty ? '' : platform.shareUrl(videoId));
+    return SizedBox(
+      height: MediaQuery.sizeOf(context).height * 0.62,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: Column(
+          children: [
+            _sheetHeader('评论'),
+            const SizedBox(height: 4),
+            Text(
+              entry.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+            const SizedBox(height: 10),
+            Expanded(
+              child: _commentsBody(platform: platform, shareUrl: shareUrl),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _commentsBody({
+    required ShortVideoPlatform platform,
+    required String shareUrl,
+  }) {
+    if (_commentsLoading) return _commentsLoadingBody();
+    if (_comments.isNotEmpty) {
+      return ListView.separated(
+        padding: EdgeInsets.zero,
+        itemCount: _comments.length,
+        separatorBuilder: (context, index) => const Divider(
+          height: 1,
+          thickness: 0.5,
+          color: Color(0x1FFFFFFF),
+        ),
+        itemBuilder: (context, index) => _commentTile(_comments[index]),
+      );
+    }
+    return Center(
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _commentsError == 'unsupported'
+                  ? Icons.block
+                  : Icons.chat_bubble_outline,
+              size: 32,
+              color: Colors.white24,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _commentsEmptyTitle(),
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              _commentsHint(platform.album),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            const SizedBox(height: 16),
+            if (shareUrl.isNotEmpty)
+              OutlinedButton.icon(
+                onPressed: () => unawaited(_openCommentPage(shareUrl)),
+                icon: const Icon(Icons.open_in_browser, size: 16),
+                label: const Text('在浏览器中打开该视频'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white70,
+                  side: const BorderSide(color: Color(0x33FFFFFF)),
+                ),
+              ),
+            if (_commentsError != 'unsupported')
+              TextButton(
+                onPressed: () => unawaited(_ensureComments(force: true)),
+                child: const Text('重新加载'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _commentsLoadingBody() {
+    return Column(
+      children: [
+        const LinearProgressIndicator(
+          minHeight: 2,
+          color: Colors.lightBlueAccent,
+          backgroundColor: Color(0x22FFFFFF),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          '正在从视频页读取评论…',
+          style: TextStyle(color: Colors.white38, fontSize: 11),
+        ),
+        const SizedBox(height: 10),
+        Expanded(
+          child: ListView.builder(
+            padding: EdgeInsets.zero,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: 6,
+            itemBuilder: (context, index) => const _CommentSkeletonTile(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _commentTile(ShortVideoComment comment) {
+    final time = _commentTimeText(comment.time);
+    final likes = _likeText(comment.likes);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _sheetHeader('评论'),
-          const SizedBox(height: 6),
-          Text(
-            entry.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          CircleAvatar(
+            radius: 15,
+            backgroundColor: const Color(0xFF2A2A2A),
+            child: Text(
+              _avatarText(comment.authorText),
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
           ),
-          const SizedBox(height: 20),
-          const Icon(
-            Icons.chat_bubble_outline,
-            size: 32,
-            color: Colors.white24,
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        comment.authorText,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    if (time.isNotEmpty)
+                      Text(
+                        time,
+                        style: const TextStyle(
+                          color: Colors.white30,
+                          fontSize: 10,
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  comment.text,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 8),
-          const Text(
-            '暂无评论',
-            style: TextStyle(color: Colors.white70, fontSize: 14),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            '${platform.album}的收藏接口不返回评论数据，'
-            '这里只显示本地能拿到的内容。',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white38, fontSize: 11),
-          ),
+          if (likes.isNotEmpty) ...[
+            const SizedBox(width: 8),
+            Column(
+              children: [
+                const Icon(
+                  Icons.favorite_border,
+                  size: 14,
+                  color: Colors.white38,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  likes,
+                  style: const TextStyle(color: Colors.white38, fontSize: 10),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
+  }
+
+  String _avatarText(String name) {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return '?';
+    return String.fromCharCode(trimmed.runes.first);
+  }
+
+  String _commentTimeText(int seconds) {
+    if (seconds <= 0) return '';
+    final at = DateTime.fromMillisecondsSinceEpoch(seconds * 1000);
+    final diff = DateTime.now().difference(at);
+    if (diff.inMinutes < 1) return '刚刚';
+    if (diff.inHours < 1) return '${diff.inMinutes} 分钟前';
+    if (diff.inDays < 1) return '${diff.inHours} 小时前';
+    if (diff.inDays < 30) return '${diff.inDays} 天前';
+    final month = at.month.toString().padLeft(2, '0');
+    final day = at.day.toString().padLeft(2, '0');
+    return '${at.year}-$month-$day';
+  }
+
+  String _likeText(int likes) {
+    if (likes <= 0) return '';
+    if (likes >= 10000) {
+      return '${(likes / 10000).toStringAsFixed(1)}万';
+    }
+    return '$likes';
+  }
+
+  String _commentsEmptyTitle() {
+    if (_commentsError == 'unsupported') return '无法读取评论';
+    if (_commentsError == 'login' ||
+        _commentsError == 'network' ||
+        _commentsError == 'notfound') {
+      return '评论加载失败';
+    }
+    return '该视频暂无评论';
+  }
+
+  String _commentsHint(String album) {
+    return switch (_commentsError) {
+      'login' => '需要先在网页抓取里登录$album，才能读到评论。',
+      'network' => '网络不稳定，评论加载失败，可稍后重试。',
+      'unsupported' => '当前只抓抖音 / TikTok 的评论，可先去网页查看。',
+      'notfound' => '没等到评论接口，可能被平台风控拦截，可去网页里看。',
+      _ => '平台没有公开评论，或这条视频还没有人评论。',
+    };
+  }
+
+  Future<void> _openCommentPage(String url) async {
+    if (url.isEmpty) return;
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) SmartDialog.showToast('无法打开浏览器');
+    } catch (_) {
+      SmartDialog.showToast('无法打开浏览器');
+    }
   }
 
   /// 画质：接口没有档位，只显示当前实际使用的「默认」，点开说明原因。
@@ -2913,6 +3200,55 @@ enum _SwipeTarget { brightness, volume }
 
 /// 播放页内嵌面板的类型。
 enum _PlayerPanel { comments, more, quality }
+
+/// 评论加载中的占位行，和真实评论保持同一套间距。
+class _CommentSkeletonTile extends StatelessWidget {
+  const _CommentSkeletonTile();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            decoration: const BoxDecoration(
+              color: Color(0xFF2A2A2A),
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _bar(width: 88, height: 9),
+                const SizedBox(height: 8),
+                _bar(height: 10),
+                const SizedBox(height: 6),
+                _bar(width: 160, height: 10),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bar({double? width, required double height}) {
+    return Container(
+      width: width ?? double.infinity,
+      height: height,
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A2A2A),
+        borderRadius: BorderRadius.circular(4),
+      ),
+    );
+  }
+}
 
 /// 进度条与时间文本的局部状态。单位是秒，和 `PlPlayerController` 的
 /// `position/duration/buffered` 保持一致。
