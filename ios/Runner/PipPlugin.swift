@@ -259,8 +259,9 @@ enum PipTrace {
 private final class PipSession: NSObject {
   /// Upper bound of the longest side of the frames sent to PiP.
   private static let maxDimension = 1920.0
-  /// Frame interval used while armed for auto-enter but not yet in PiP.
-  private static let idleFrameInterval = 0.25
+  /// 预热节流间隔：只用于「已 arm / 已请求启动，但 PiP 还没真正显示」的阶段。
+  /// 一旦进入 PiP 就完全不节流，只保留 latest-wins 的在途帧合并。
+  private static let idleFrameInterval = 0.5
 
   let textureId: Int64
   var onStop: (() -> Void)?
@@ -287,6 +288,9 @@ private final class PipSession: NSObject {
   private var positionMs: Int64 = 0
   private var duration = CMTime.zero
   private var pendingStart = false
+  /// `startPictureInPicture()` 已调用、但还没收到 DidStart/DidStop 的过渡期。
+  /// 这段时间必须满帧供片，否则起小窗的动画会卡。
+  private var pipStartRequested = false
   private var stopRequested = false
   private var restoring = false
   /// Whether to leave the app once PiP has started, see `start()`.
@@ -298,6 +302,8 @@ private final class PipSession: NSObject {
   private var textureCallbackCount = 0
   private var frameInFlightDropCount = 0
   private var throttleDropCount = 0
+  /// 进入 PiP 那一刻的 throttle 计数，用来在 DidStop 里证明「PiP 期间零节流」。
+  private var throttleDropsAtEnter = 0
   private var enqueuedFrameCount = 0
   private var shownFrameCount = 0
   private var droppedOldFrameCount = 0
@@ -530,6 +536,7 @@ private final class PipSession: NSObject {
     )
     guard pendingStart, hasFrame, controller.isPictureInPicturePossible else { return }
     pendingStart = false
+    pipStartRequested = true
     controller.startPictureInPicture()
   }
 
@@ -540,6 +547,7 @@ private final class PipSession: NSObject {
 
   func invalidate() {
     pendingStart = false
+    pipStartRequested = false
     pendingFrameRequested = false
     possibleObservation?.invalidate()
     observers.forEach(NotificationCenter.default.removeObserver)
@@ -555,11 +563,12 @@ private final class PipSession: NSObject {
     controller.contentSource = nil
     sourceView.removeFromSuperview()
     PipTrace.log(
-      "summary: textureCallbacks=\(textureCallbackCount) "
+      "summary: isActive=\(isActive) textureCallbacks=\(textureCallbackCount) "
         + "frameInFlightDrops=\(frameInFlightDropCount) "
         + "throttleDrops=\(throttleDropCount) enqueued=\(enqueuedFrameCount) "
         + "shown=\(shownFrameCount) droppedOld=\(droppedOldFrameCount) "
-        + "direct=\(directFrameCount) render=\(renderFrameCount)"
+        + "direct=\(directFrameCount) render=\(renderFrameCount) "
+        + "idleMs=\(Int(Self.idleFrameInterval * 1000))"
     )
     // 同步在 frameQueue 上取快照：tearDown() 随后会把 session 置空，
     // 异步闭包可能已经拿不到统计值。
@@ -601,7 +610,7 @@ private final class PipSession: NSObject {
       return
     }
     let now = CACurrentMediaTime()
-    if !force && !isActive && now - lastFrameTime < Self.idleFrameInterval {
+    if !force && shouldThrottleForIdle(now: now) {
       throttleDropCount += 1
       return
     }
@@ -620,6 +629,23 @@ private final class PipSession: NSObject {
       return
     }
     process(source)
+  }
+
+  /// 只有「还没进 PiP 的预热阶段」才限速。
+  ///
+  /// 不能只看自己的 `isActive`：自动进入画中画时 delegate 回调可能滞后，
+  /// 甚至整段丢失，一旦漏置位就会把整个 PiP 期间都按 idle 节流（实测
+  /// throttleDrops 占到 87%）。所以这里同时采信 AVKit 的
+  /// `isPictureInPictureActive`，任一为真都视为已经在出小窗。
+  private func shouldThrottleForIdle(now: CFTimeInterval) -> Bool {
+    if isActive || controller.isPictureInPictureActive { return false }
+    // 正在启动 / 已 arm 且 App 已退后台：PiP 马上要显示，这一段不能降到
+    // 2fps，否则起小窗的动画和首帧都会明显卡。
+    if pendingStart || pipStartRequested { return false }
+    if autoEnter && UIApplication.shared.applicationState != .active {
+      return false
+    }
+    return now - lastFrameTime < Self.idleFrameInterval
   }
 
   /// Runs one frame on `frameQueue`. Must be called on the main thread.
@@ -1392,9 +1418,14 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     isActive = true
+    pipStartRequested = false
+    throttleDropsAtEnter = throttleDropCount
     stopRequested = false
     restoring = false
-    PipTrace.log("WILL start: sourceViewInTree=\(sourceView.superview != nil)")
+    PipTrace.log(
+      "WILL start: isActive=\(isActive) sourceViewInTree=\(sourceView.superview != nil) "
+        + "throttleDrops=\(throttleDropCount)"
+    )
     frameAvailable(force: true)
     sendEvent("onStateChanged", ["active": true])
   }
@@ -1402,7 +1433,20 @@ extension PipSession: AVPictureInPictureControllerDelegate {
   func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
-    PipTrace.log("DID start: layerInTree=\(displayLayer.superlayer != nil) hasFrame=\(hasFrame)")
+    // DidStart 是「小窗真的显示了」的唯一可靠信号。delegate 顺序理论上
+    // WillStart 在前，但自动进入时可能只收到 DidStart，这里再置一次，
+    // 保证此后 frameAvailable 不再走 idle 节流。
+    isActive = true
+    pipStartRequested = false
+    // WillStart 可能在自动进入时被整段跳过，这里再取一次基线，
+    // 否则 DidStop 的 throttleDropsDuringPip 会把预热期的丢帧也算进来。
+    throttleDropsAtEnter = throttleDropCount
+    PipTrace.log(
+      "DID start: isActive=\(isActive) layerInTree=\(displayLayer.superlayer != nil) "
+        + "hasFrame=\(hasFrame) idleMs=\(Int(Self.idleFrameInterval * 1000))"
+    )
+    sendEvent("onStateChanged", ["active": true])
+    frameAvailable(force: true)
     if backgroundOnStart {
       backgroundOnStart = false
       Self.moveToBackground()
@@ -1414,6 +1458,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     failedToStartPictureInPictureWithError error: Error
   ) {
     isActive = false
+    pipStartRequested = false
     backgroundOnStart = false
     PipTrace.log("FAILED to start: \(error.localizedDescription)")
     sendEvent("onStateChanged", ["active": false, "error": error.localizedDescription])
@@ -1435,11 +1480,15 @@ extension PipSession: AVPictureInPictureControllerDelegate {
   func pictureInPictureControllerDidStopPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
+    let throttledDuringPip = throttleDropCount - throttleDropsAtEnter
     isActive = false
+    pipStartRequested = false
     // Neither restored nor stopped by the app: closed from the PiP window.
     let closed = !restoring && !stopRequested
     PipTrace.log(
-      "DID stop: closed=\(closed) restoring=\(restoring) stopRequested=\(stopRequested) "
+      "DID stop: isActive=\(isActive) closed=\(closed) restoring=\(restoring) "
+        + "stopRequested=\(stopRequested) "
+        + "throttleDropsDuringPip=\(throttledDuringPip) "
         + "sourceViewInTree=\(sourceView.superview != nil)"
     )
     stopRequested = false
