@@ -2279,7 +2279,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 ),
               ),
               const SizedBox(width: 4),
-              // 右侧四个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              // 右侧三个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
               Expanded(
                 child: Align(
                   alignment: Alignment.centerRight,
@@ -2288,7 +2288,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        _qualityButton(),
                         ComBtn(
                           icon: const Icon(
                             Icons.chat_bubble_outline,
@@ -2331,24 +2330,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           ),
         ],
       ),
-    );
-  }
-
-  /// 抖音/TikTok 的播放地址没有清晰度字段，这里不伪造档位：显示当前值
-  /// 「默认」，点开用页内面板说明原因。之前用 PopupMenuButton，菜单路由
-  /// 在这条页面里弹不出来，用户看到的就是「按不动」。
-  Widget _qualityButton() {
-    return ComBtn(
-      icon: const Center(
-        child: Text(
-          '默认',
-          style: TextStyle(color: Colors.white70, fontSize: 12),
-        ),
-      ),
-      onTap: () => _openPanel(_PlayerPanel.quality),
-      tooltip: '画质',
-      width: 40,
-      height: 30,
     );
   }
 
