@@ -82,45 +82,21 @@ class _ShortVideoPageState extends State<ShortVideoPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final platform in <ShortVideoPlatform>[
-              ShortVideoPlatform.douyin,
-              ShortVideoPlatform.tiktok,
-            ])
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 2),
-                child: TextButton(
-                  onPressed: () {
-                    setState(() => _platform = platform);
-                  },
-                  style: TextButton.styleFrom(
-                    minimumSize: const Size(64, 32),
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                    backgroundColor: _platform == platform
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : null,
-                  ),
-                  child: Text(platform.album),
-                ),
-              ),
-          ],
-        ),
-      ),
-      // 换平台就换一份 State，避免两个平台的列表状态互相污染。
-      body: ShortVideoFavoritesPage(
-        key: ValueKey(_platform.id),
-        platform: _platform,
-        selecting: _selecting,
-        selected: _selected,
-        onSelectingChanged: _setSelecting,
-        onToggleSelect: _toggleSelect,
-        onToggleAll: _toggleAll,
-        onRemoveSelected: _removeSelected,
-      ),
+    // 只保留收藏页自己的 Scaffold：平台切换放进它的 AppBar 底部，
+    // 避免外面再套一层 AppBar 出现两条标题栏。
+    return ShortVideoFavoritesPage(
+      key: ValueKey(_platform.id),
+      platform: _platform,
+      onPlatformChanged: (value) {
+        if (value == _platform) return;
+        setState(() => _platform = value);
+      },
+      selecting: _selecting,
+      selected: _selected,
+      onSelectingChanged: _setSelecting,
+      onToggleSelect: _toggleSelect,
+      onToggleAll: _toggleAll,
+      onRemoveSelected: _removeSelected,
     );
   }
 }
@@ -133,6 +109,7 @@ class ShortVideoFavoritesPage extends StatefulWidget {
   const ShortVideoFavoritesPage({
     super.key,
     required this.platform,
+    required this.onPlatformChanged,
     required this.selecting,
     required this.selected,
     required this.onSelectingChanged,
@@ -142,6 +119,7 @@ class ShortVideoFavoritesPage extends StatefulWidget {
   });
 
   final ShortVideoPlatform platform;
+  final ValueChanged<ShortVideoPlatform> onPlatformChanged;
   final bool selecting;
   final Map<String, ShortVideo> selected;
   final ValueChanged<bool> onSelectingChanged;
@@ -150,7 +128,8 @@ class ShortVideoFavoritesPage extends StatefulWidget {
   final ValueChanged<Iterable<ShortVideo>> onRemoveSelected;
 
   @override
-  State<ShortVideoFavoritesPage> createState() => _ShortVideoFavoritesPageState();
+  State<ShortVideoFavoritesPage> createState() =>
+      _ShortVideoFavoritesPageState();
 }
 
 class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
@@ -239,7 +218,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       if (_videos.isEmpty && result.total > 0) {
         // 总数不为 0、本页却是空的：说明那些条目不属于当前平台，
         // 或者落库失败。两种都在 summary 里写清楚了，别再说「同步成功」。
-        text = '同步到 ${result.total} 条，但${platform.album}一条都没有（${result.summary}）';
+        text =
+            '同步到 ${result.total} 条，但${platform.album}一条都没有（${result.summary}）';
       } else if (_videos.isNotEmpty) {
         text = '$text；本页 ${_videos.length} 条';
       }
@@ -351,7 +331,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     if (added.isEmpty) {
       if (mounted && result.parsed == 0) {
         setState(
-          () => _status = '收到 $_rawCount 段数据，无新增'
+          () => _status =
+              '收到 $_rawCount 段数据，无新增'
               '（跳过 ${result.skipped} 条）',
         );
       }
@@ -362,7 +343,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     ShortVideoAutoCache.schedule();
     if (mounted) {
       setState(
-        () => _status = '新增 ${added.length} 条，跳过 ${result.skipped} 条，'
+        () => _status =
+            '新增 ${added.length} 条，跳过 ${result.skipped} 条，'
             '本地 ${_videos.length} 条',
       );
     }
@@ -709,8 +691,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       for (var i = 0; i < removed.length; i++) {
         final video = removed[i].copyWith(updatedAt: now);
         if (_videos.any((e) => e.key == video.key)) continue;
-        final at = (i < positions.length ? positions[i] : _videos.length)
-            .clamp(0, _videos.length);
+        final at = (i < positions.length ? positions[i] : _videos.length).clamp(
+          0,
+          _videos.length,
+        );
         _videos.insert(at, video);
       }
       _status = '已恢复 ${removed.length} 条，本地 ${_videos.length} 条';
@@ -799,7 +783,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     if (!mounted) return;
     setState(() {
       _caching = false;
-      _status = '缓存完成：新增 $ok 条'
+      _status =
+          '缓存完成：新增 $ok 条'
           '${skipped > 0 ? '，已有 $skipped 条' : ''}'
           '${failures.isEmpty ? '' : '，失败 ${failures.length} 条'}';
     });
@@ -823,16 +808,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final mb = bytes / 1024 / 1024;
     if (mb >= 1024) return '${(mb / 1024).toStringAsFixed(1)} GB';
     return '${mb.toStringAsFixed(mb >= 10 ? 0 : 1)} MB';
-  }
-
-  /// 状态信息按句分行，避免长句和缓存按钮挤在同一行。
-  Iterable<String> get _statusLines {
-    final lines = _status
-        .split(RegExp(r'[；;\n]'))
-        .map((line) => line.trim())
-        .where((line) => line.isNotEmpty)
-        .toList(growable: false);
-    return lines.isEmpty ? const ['就绪'] : lines;
   }
 
   /// 插到「下一首播放」：正在播的 B 站 / 抖音队列播完这一条就接上它。
@@ -902,63 +877,47 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
-        titleSpacing: 12,
+        titleSpacing: 16,
         actions: [
-          // 根因诊断入口。放在最前面，用户随时能打开看结论并截屏。
-          _headAction(
-            label: '诊断',
-            icon: const Icon(Icons.monitor_heart_outlined, size: 20),
-            onTap: () => Get.to(() => const RootScanPage()),
-          ),
-          if (kDiagEnabled)
-            _headAction(
-              label: '导出诊断',
-              icon: const Icon(Icons.ios_share, size: 20),
-              onTap: _exportDiagnostics,
-            ),
-          _headAction(
-            label: '列表',
+          _headIcon(
+            tooltip: '播放列表',
             icon: const Icon(Icons.queue_music, size: 20),
             onTap: () => Get.to(() => const ShortVideoPlaylistPage()),
           ),
-          // 管理类操作和上面的「查看」分开，避免一排图标挤在一起分不清。
-          Container(
-            width: 1,
-            height: 22,
-            margin: const EdgeInsets.symmetric(horizontal: 3),
-            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.6),
-          ),
-          _headAction(
-            label: '同步',
+          _headIcon(
+            tooltip: _syncing ? '同步中' : '同步',
             onTap: _syncing ? null : () => _sync(),
             icon: _syncing
                 ? const SizedBox(
-                    width: 18,
-                    height: 18,
+                    width: 16,
+                    height: 16,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : const Icon(Icons.sync, size: 20),
           ),
-          _headAction(
-            label: '清空',
-            icon: const Icon(Icons.delete_outline, size: 20),
-            onTap: _videos.isEmpty ? null : _clear,
-          ),
-          _headAction(
-            label: _selecting ? '退出' : '多选',
-            onTap: _videos.isEmpty && !_selecting
-                ? null
-                : _toggleSelectMode,
+          _headIcon(
+            tooltip: _selecting ? '退出多选' : '多选',
+            onTap: _videos.isEmpty && !_selecting ? null : _toggleSelectMode,
             icon: Badge(
               isLabelVisible: _selecting && _selectedCount > 0,
-              label: Text('$_selectedCount', style: const TextStyle(fontSize: 10)),
+              label: Text(
+                '$_selectedCount',
+                style: const TextStyle(fontSize: 10),
+              ),
               child: Icon(
                 _selecting ? Icons.close : Icons.checklist,
                 size: 20,
               ),
             ),
           ),
+          _moreMenu(theme),
+          const SizedBox(width: 4),
         ],
+        // 分段控件放在标题栏底部，固定在顶部，避免滚动时平台入口消失。
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(56),
+          child: _platformSwitcher(theme),
+        ),
       ),
       body: Column(
         children: [
@@ -995,37 +954,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 ),
               ),
             ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '从 App 复制分享链接，免登录只加这一条',
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: _addingLink ? null : _addFromLink,
-                  icon: _addingLink
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.link, size: 18),
-                  label: const Text('粘贴链接添加'),
-                ),
-              ],
-            ),
-          ),
+          _statusBar(theme),
           Expanded(
-            child: _videos.isEmpty ? _empty(theme) : _list(theme),
+            child: _videos.isEmpty
+                ? _empty(theme)
+                : Column(
+                    children: [
+                      _listHeader(theme),
+                      Expanded(child: _list(theme)),
+                    ],
+                  ),
           ),
         ],
       ),
@@ -1035,44 +973,109 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       // 放进 bottomNavigationBar 由 Scaffold 自己避让；同时因为 body 被
       // 撑满整屏，Scaffold 算出来的 bottom padding 不可靠，_bottomBar 里
       // 再按 MediaQuery.viewPadding 显式补一份。
-      bottomNavigationBar: _bottomBar(theme),
+      bottomNavigationBar: _videos.isEmpty ? null : _bottomBar(theme),
     );
   }
 
-  /// 顶部操作：图标下面带文字，单独看一个图标也知道是干什么的。
-  ///
-  /// 保留 tooltip 是为了读屏和长按提示，但不再依赖它——用户第一眼要能
-  /// 看到「诊断 / 列表 / 同步 / 清空 / 多选」。
-  Widget _headAction({
-    required String label,
+  Widget _headIcon({
+    required String tooltip,
     required Widget icon,
     required VoidCallback? onTap,
   }) {
-    return Tooltip(
-      message: label,
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
-        child: Opacity(
-          opacity: onTap == null ? 0.38 : 1,
-          child: SizedBox(
-            width: 42,
-            height: 48,
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                SizedBox(
-                  width: 22,
-                  height: 22,
-                  child: Center(child: icon),
-                ),
-                const SizedBox(height: 1),
-                Text(
-                  label,
-                  maxLines: 1,
-                  style: const TextStyle(fontSize: 10, height: 1.1),
-                ),
-              ],
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onTap,
+      icon: icon,
+      iconSize: 20,
+      visualDensity: VisualDensity.compact,
+    );
+  }
+
+  /// 诊断、导出、清空这类低频操作收进更多菜单，顶栏只留图标。
+  Widget _moreMenu(ThemeData theme) {
+    return PopupMenuButton<String>(
+      tooltip: '更多',
+      icon: const Icon(Icons.more_horiz),
+      onSelected: (value) {
+        switch (value) {
+          case 'diagnose':
+            Get.to(() => const RootScanPage());
+          case 'export':
+            _exportDiagnostics();
+          case 'clear':
+            _clear();
+        }
+      },
+      itemBuilder: (context) => [
+        _menuItem('diagnose', Icons.monitor_heart_outlined, '根因诊断'),
+        if (kDiagEnabled) _menuItem('export', Icons.ios_share, '导出诊断包'),
+        const PopupMenuDivider(),
+        PopupMenuItem<String>(
+          value: 'clear',
+          enabled: _videos.isNotEmpty,
+          child: _menuRow(
+            Icons.delete_outline,
+            '清空收藏',
+            color: _videos.isEmpty ? null : theme.colorScheme.error,
+          ),
+        ),
+      ],
+    );
+  }
+
+  PopupMenuItem<String> _menuItem(
+    String value,
+    IconData icon,
+    String label,
+  ) {
+    return PopupMenuItem<String>(
+      value: value,
+      child: _menuRow(icon, label),
+    );
+  }
+
+  Widget _menuRow(IconData icon, String label, {Color? color}) {
+    final tint = color ?? Theme.of(context).colorScheme.onSurface;
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: tint),
+        const SizedBox(width: 10),
+        Text(label, style: TextStyle(color: tint)),
+      ],
+    );
+  }
+
+  /// 平台切换：居中的胶囊分段控件，当前平台用主题色高亮。
+  Widget _platformSwitcher(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+      child: Center(
+        child: SegmentedButton<ShortVideoPlatform>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(
+              value: ShortVideoPlatform.douyin,
+              label: Text('抖音'),
+            ),
+            ButtonSegment(
+              value: ShortVideoPlatform.tiktok,
+              label: Text('TikTok'),
+            ),
+          ],
+          selected: {platform},
+          onSelectionChanged: (selection) =>
+              widget.onPlatformChanged(selection.first),
+          style: SegmentedButton.styleFrom(
+            minimumSize: const Size(104, 36),
+            visualDensity: VisualDensity.compact,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            backgroundColor: scheme.surfaceContainerHighest,
+            foregroundColor: scheme.onSurfaceVariant,
+            selectedBackgroundColor: scheme.primaryContainer,
+            selectedForegroundColor: scheme.onPrimaryContainer,
+            side: BorderSide(
+              color: scheme.outlineVariant.withValues(alpha: 0.7),
             ),
           ),
         ),
@@ -1080,57 +1083,47 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  Widget _empty(ThemeData theme) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+  /// 柔和的状态条：同步、缓存、链接解析都走这里，不再塞进底部按钮区。
+  Widget _statusBar(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    final busy = _syncing || _caching || _addingLink;
+    final text = _status.trim().isEmpty ? '就绪' : _status.trim();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest.withValues(alpha: 0.6),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
           children: [
-            Icon(
-              Icons.video_library_outlined,
-              size: 44,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              '还没有收藏',
-              style: theme.textTheme.titleMedium,
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '点下面「打开网页」，在网页里登录 ${platform.album}，'
-              '然后点「开始抓取」，抓完回来自动带过来。',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
+            if (busy)
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.primary,
+                ),
+              )
+            else
+              Icon(
+                Icons.info_outline,
+                size: 16,
+                color: scheme.onSurfaceVariant,
               ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '已经登录过就直接点「直接同步（只拉新增）」，'
-              '只解析新收藏，旧条目不再重复处理。',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '不想登录网页：把视频分享链接粘贴到上方「粘贴链接添加」，'
-              '只加这一条。',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              '网页打不开也不要紧：在 Kumone 里抓同一份收藏，'
-              '两台手机配同一个 WebDAV，这里点右上角同步就行。',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.8),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                text,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                  height: 1.35,
+                ),
               ),
             ),
           ],
@@ -1139,82 +1132,460 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
+  Widget _listHeader(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 8, 0),
+      child: Row(
+        children: [
+          Text(
+            '本地 ${_videos.length} 条',
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          if (_selecting && _selectedCount > 0) ...[
+            const SizedBox(width: 8),
+            Text(
+              '已选 $_selectedCount',
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: scheme.primary,
+              ),
+            ),
+          ],
+          const Spacer(),
+          TextButton.icon(
+            onPressed: _addingLink ? null : _addFromLink,
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+            ),
+            icon: _addingLink
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.link, size: 18),
+            label: const Text('粘贴链接'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _empty(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final minHeight = constraints.maxHeight > 32
+            ? constraints.maxHeight - 32
+            : 0.0;
+        return SingleChildScrollView(
+          // 主界面导航栏叠画在 body 之上，这里补足它的高度，保证
+          // 快捷入口和底部说明都能滚到可见区域。
+          padding: EdgeInsets.fromLTRB(
+            20,
+            16,
+            20,
+            safeBottom + _mainBottomNavHeight + 16,
+          ),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: minHeight),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 460),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 128,
+                      height: 116,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          Container(
+                            width: 104,
+                            height: 104,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              gradient: LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [
+                                  scheme.primaryContainer,
+                                  scheme.tertiaryContainer,
+                                ],
+                              ),
+                            ),
+                            child: Icon(
+                              Icons.video_library_rounded,
+                              size: 46,
+                              color: scheme.onPrimaryContainer,
+                            ),
+                          ),
+                          Positioned(
+                            top: 4,
+                            right: 8,
+                            child: Icon(
+                              Icons.auto_awesome,
+                              size: 20,
+                              color: scheme.primary.withValues(alpha: 0.7),
+                            ),
+                          ),
+                          Positioned(
+                            bottom: 2,
+                            left: 8,
+                            child: Container(
+                              padding: const EdgeInsets.fromLTRB(8, 4, 10, 4),
+                              decoration: BoxDecoration(
+                                color: scheme.surface,
+                                borderRadius: BorderRadius.circular(999),
+                                border: Border.all(
+                                  color: scheme.outlineVariant.withValues(
+                                    alpha: 0.6,
+                                  ),
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.play_arrow_rounded,
+                                    size: 16,
+                                    color: scheme.primary,
+                                  ),
+                                  const SizedBox(width: 2),
+                                  Text(
+                                    '收藏',
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Text(
+                      '还没有${platform.album}收藏',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '登录一次${platform.album}网页，之后就能增量拉取；'
+                      '也可以直接粘贴单条分享链接。',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                        height: 1.5,
+                      ),
+                    ),
+                    const SizedBox(height: 22),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _addingLink ? null : _addFromLink,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size.fromHeight(48),
+                        ),
+                        icon: _addingLink
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.link_rounded, size: 20),
+                        label: Text(
+                          _addingLink ? '正在解析链接…' : '粘贴链接添加',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _openingWeb ? null : _openWeb,
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size.fromHeight(48),
+                        ),
+                        icon: const Icon(Icons.public_rounded, size: 20),
+                        label: const Text('打开网页抓取'),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: _openingWeb ? null : _directSync,
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size.fromHeight(48),
+                        ),
+                        icon: const Icon(Icons.sync_alt_rounded, size: 20),
+                        label: const Text('直接同步（只拉新增）'),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      '网页打不开时，可在 Kumone 抓同一份收藏，'
+                      '两台手机共用 WebDAV 后点右上角同步。',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant.withValues(alpha: 0.8),
+                        height: 1.45,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _list(ThemeData theme) {
     return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
         final checked = widget.selected.containsKey(video.key);
-        return ListTile(
-          onTap: () => _selecting ? _toggleSelect(video) : _play(index),
-          onLongPress: () {
-            if (!_selecting) widget.onSelectingChanged(true);
-            _toggleSelect(video);
-          },
-          selected: _selecting && checked,
-          leading: _selecting
-              ? Icon(
-                  checked
-                      ? Icons.check_circle
-                      : Icons.radio_button_unchecked,
-                  color: checked ? theme.colorScheme.primary : null,
-                )
-              : ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: SizedBox(
-                    width: 48,
-                    height: 64,
-                    child: video.cover.isEmpty
-                        ? Container(
-                            color: theme.dividerColor.withValues(alpha: 0.1),
-                          )
-                        : Image.network(
-                            video.cover,
-                            fit: BoxFit.cover,
-                            cacheWidth: 180,
-                            errorBuilder: (_, _, _) => Container(
-                              color: theme.dividerColor.withValues(alpha: 0.1),
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Material(
+            color: _selecting && checked
+                ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
+                : theme.colorScheme.surfaceContainerLow,
+            clipBehavior: Clip.antiAlias,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: BorderSide(
+                color: _selecting && checked
+                    ? theme.colorScheme.primary.withValues(alpha: 0.7)
+                    : theme.colorScheme.outlineVariant.withValues(alpha: 0.45),
+              ),
+            ),
+            child: InkWell(
+              onTap: () => _selecting ? _toggleSelect(video) : _play(index),
+              onLongPress: () {
+                if (!_selecting) widget.onSelectingChanged(true);
+                _toggleSelect(video);
+              },
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _videoCover(theme, video, checked),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            video.title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleSmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                              height: 1.35,
                             ),
                           ),
-                  ),
+                          const SizedBox(height: 5),
+                          Text(
+                            video.author.trim().isEmpty
+                                ? '未知作者'
+                                : video.author.trim(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 7,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: theme.colorScheme.primaryContainer
+                                      .withValues(alpha: 0.75),
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  platform.album,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    color: theme.colorScheme.onPrimaryContainer,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Icon(
+                                Icons.schedule_rounded,
+                                size: 13,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                              const SizedBox(width: 3),
+                              Text(
+                                video.durationText,
+                                style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    SizedBox(
+                      width: 40,
+                      height: 40,
+                      child: _selecting
+                          ? Icon(
+                              checked
+                                  ? Icons.check_circle_rounded
+                                  : Icons.radio_button_unchecked_rounded,
+                              color: checked
+                                  ? theme.colorScheme.primary
+                                  : theme.colorScheme.onSurfaceVariant,
+                            )
+                          : PopupMenuButton<String>(
+                              tooltip: '更多',
+                              padding: EdgeInsets.zero,
+                              icon: const Icon(
+                                Icons.more_vert_rounded,
+                                size: 20,
+                              ),
+                              onSelected: (value) {
+                                switch (value) {
+                                  case 'play':
+                                    _play(index);
+                                  case 'next':
+                                    _queueNext([video]);
+                                  case 'playlist':
+                                    _addToPlaylist([video]);
+                                  case 'cache':
+                                    _cacheVideos([video]);
+                                  case 'delete':
+                                    _deleteOne(video);
+                                }
+                              },
+                              itemBuilder: (context) => const [
+                                PopupMenuItem(
+                                  value: 'play',
+                                  child: Text('播放'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'next',
+                                  child: Text('下一首播放'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'playlist',
+                                  child: Text('加入播放列表'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'cache',
+                                  child: Text('缓存到本地'),
+                                ),
+                                PopupMenuItem(
+                                  value: 'delete',
+                                  child: Text('删除（含缓存）'),
+                                ),
+                              ],
+                            ),
+                    ),
+                  ],
                 ),
-          title: Text(
-            video.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: Text(
-            '${video.author.isEmpty ? platform.album : video.author} · ${video.durationText}',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: PopupMenuButton<String>(
-            tooltip: '更多',
-            icon: const Icon(Icons.more_vert),
-            onSelected: (value) {
-              switch (value) {
-                case 'play':
-                  _play(index);
-                case 'next':
-                  _queueNext([video]);
-                case 'playlist':
-                  _addToPlaylist([video]);
-                case 'cache':
-                  _cacheVideos([video]);
-                case 'delete':
-                  _deleteOne(video);
-              }
-            },
-            itemBuilder: (context) => const [
-              PopupMenuItem(value: 'play', child: Text('播放')),
-              PopupMenuItem(value: 'next', child: Text('下一首播放')),
-              PopupMenuItem(value: 'playlist', child: Text('加入播放列表')),
-              PopupMenuItem(value: 'cache', child: Text('缓存到本地')),
-              PopupMenuItem(value: 'delete', child: Text('删除（含缓存）')),
-            ],
+              ),
+            ),
           ),
         );
       },
+    );
+  }
+
+  Widget _videoCover(ThemeData theme, ShortVideo video, bool checked) {
+    final scheme = theme.colorScheme;
+    Widget placeholder() => DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            scheme.primaryContainer.withValues(alpha: 0.55),
+            scheme.surfaceContainerHighest,
+          ],
+        ),
+      ),
+      child: Center(
+        child: Icon(
+          Icons.movie_creation_outlined,
+          size: 28,
+          color: scheme.onSurfaceVariant,
+        ),
+      ),
+    );
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: SizedBox(
+        width: 68,
+        height: 92,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (video.cover.isEmpty)
+              placeholder()
+            else
+              Image.network(
+                video.cover,
+                fit: BoxFit.cover,
+                cacheWidth: 220,
+                errorBuilder: (_, _, _) => placeholder(),
+              ),
+            if (_selecting && checked)
+              ColoredBox(
+                color: scheme.primary.withValues(alpha: 0.14),
+              ),
+            Positioned(
+              right: 5,
+              bottom: 5,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.62),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  video.durationText,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: Colors.white,
+                    fontSize: 10,
+                    height: 1.1,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1240,130 +1611,118 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         safeBottom + _mainBottomNavHeight + 4,
       ),
       child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // 同步结果里常有「已同步：…；本页 N 条」两段信息。原来和缓存
-            // 按钮挤在同一个 Row 里，窄屏上被压成一坨；现在一段一行。
-            for (final line in _statusLines)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 2),
-                child: Text(
-                  line,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_linkNeedsLogin)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: _openWeb,
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                ),
+                icon: const Icon(Icons.open_in_browser, size: 16),
+                label: const Text('打开网页登录后再试'),
+              ),
+            ),
+          if (_cacheBytes > 0 || _selecting)
+            Row(
+              children: [
+                if (_selecting)
+                  Text(
+                    '已选 $_selectedCount 条',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                const Spacer(),
+                if (_cacheBytes > 0)
+                  TextButton(
+                    onPressed: _caching ? null : _clearCache,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    child: Text(
+                      '缓存 ${_fmtBytes(_cacheBytes)}',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+              ],
+            ),
+          const SizedBox(height: 8),
+          if (_selecting)
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _videos.isEmpty ? null : _selectAll,
+                  icon: const Icon(Icons.select_all),
+                  label: Text(_allLocalSelected ? '取消全选' : '全选'),
+                ),
+                FilledButton.icon(
+                  onPressed: _selectedCount == 0 ? null : _playSelected,
+                  icon: const Icon(Icons.playlist_play),
+                  label: Text('播放所选 $_selectedCount 条'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
+                  icon: const Icon(Icons.queue_play_next),
+                  label: Text('下一首 $_selectedCount 条'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _selectedCount == 0
+                      ? null
+                      : _addSelectedToPlaylist,
+                  icon: const Icon(Icons.playlist_add),
+                  label: Text('加入列表 $_selectedCount 条'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: localSelected.isEmpty || _caching
+                      ? null
+                      : _cacheSelected,
+                  icon: const Icon(Icons.download_for_offline_outlined),
+                  label: Text('缓存 ${localSelected.length} 条'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: localSelected.isEmpty ? null : _deleteSelected,
+                  icon: const Icon(Icons.delete_outline),
+                  label: Text('删除 ${localSelected.length} 条'),
+                ),
+              ],
+            )
+          else ...[
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _openWeb,
+                    icon: const Icon(Icons.public),
+                    label: const Text('打开网页 / 抓取'),
                   ),
                 ),
-              ),
-            if (_linkNeedsLogin)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: TextButton.icon(
-                  onPressed: _openWeb,
-                  style: TextButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                  ),
-                  icon: const Icon(Icons.open_in_browser, size: 16),
-                  label: const Text('打开网页登录后再试'),
+                const SizedBox(width: 12),
+                OutlinedButton(
+                  onPressed: _videos.isEmpty ? null : _playAll,
+                  child: const Text('全部播放'),
                 ),
-              ),
-            if (_cacheBytes > 0 || _selecting)
-              Row(
-                children: [
-                  if (_selecting)
-                    Text(
-                      '已选 $_selectedCount 条',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.primary,
-                      ),
-                    ),
-                  const Spacer(),
-                  if (_cacheBytes > 0)
-                    TextButton(
-                      onPressed: _caching ? null : _clearCache,
-                      style: TextButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                      ),
-                      child: Text(
-                        '缓存 ${_fmtBytes(_cacheBytes)}',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                    ),
-                ],
-              ),
+              ],
+            ),
             const SizedBox(height: 8),
-            if (_selecting)
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  OutlinedButton.icon(
-                    onPressed: _videos.isEmpty ? null : _selectAll,
-                    icon: const Icon(Icons.select_all),
-                    label: Text(_allLocalSelected ? '取消全选' : '全选'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: _selectedCount == 0 ? null : _playSelected,
-                    icon: const Icon(Icons.playlist_play),
-                    label: Text('播放所选 $_selectedCount 条'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
-                    icon: const Icon(Icons.queue_play_next),
-                    label: Text('下一首 $_selectedCount 条'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: _selectedCount == 0
-                        ? null
-                        : _addSelectedToPlaylist,
-                    icon: const Icon(Icons.playlist_add),
-                    label: Text('加入列表 $_selectedCount 条'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: localSelected.isEmpty || _caching
-                        ? null
-                        : _cacheSelected,
-                    icon: const Icon(Icons.download_for_offline_outlined),
-                    label: Text('缓存 ${localSelected.length} 条'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: localSelected.isEmpty ? null : _deleteSelected,
-                    icon: const Icon(Icons.delete_outline),
-                    label: Text('删除 ${localSelected.length} 条'),
-                  ),
-                ],
-              )
-            else ...[
-              Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _openWeb,
-                      icon: const Icon(Icons.public),
-                      label: const Text('打开网页 / 抓取'),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  OutlinedButton(
-                    onPressed: _videos.isEmpty ? null : _playAll,
-                    child: const Text('全部播放'),
-                  ),
-                ],
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _openingWeb ? null : _directSync,
+                icon: const Icon(Icons.sync_alt),
+                label: const Text('直接同步（只拉新增）'),
               ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _openingWeb ? null : _directSync,
-                  icon: const Icon(Icons.sync_alt),
-                  label: const Text('直接同步（只拉新增）'),
-                ),
-              ),
-            ],
+            ),
           ],
-        ),
+        ],
+      ),
     );
   }
 }
