@@ -20,6 +20,14 @@ import 'package:path_provider/path_provider.dart';
 /// 诊断阶段结束后再改成默认关闭。
 const bool kDiagEnabled = !bool.fromEnvironment('PILIPLUS_DIAG_OFF');
 
+/// 深度诊断开关。
+///
+/// 默认关闭：常规包只保留低频、轻量的采样，避免同步 FFI 把主 isolate
+/// 拖住。需要抓解码/渲染细节时用
+/// `--dart-define=PILIPLUS_DIAG_VERBOSE=true` 打开，采样恢复为每次整轮
+/// 读取全部 mpv 指标。
+const bool kDiagVerbose = bool.fromEnvironment('PILIPLUS_DIAG_VERBOSE');
+
 /// mpv 解码/渲染侧需要入证的指标。读不到就记 null，不抛错。
 const List<String> kMpvDiagKeys = <String>[
   'hwdec-current',
@@ -61,8 +69,14 @@ const int _openSlowPollMs = 500;
 /// 单段同步工作超过这个值就写一条 `ui-block`，供下一份诊断包定位。
 const int _uiBlockMs = 50;
 
-/// mpv 属性每 3 秒完整刷新一次，其余采样复用缓存。
-const int _mpvSnapshotIntervalMs = 3000;
+/// 常规模式：播放采样只每 10 秒补一次丢帧计数。
+///
+/// 其余 mpv 指标只在 open / 异常取证时实时读；整轮 11 次 `getProperty`
+/// 每次要 50~70ms，绝不能跟着 2 秒采样节拍跑。
+const int _mpvLightRefreshMs = 10000;
+
+/// verbose 模式：每次采样都整轮刷新 mpv 指标。
+const int _mpvVerboseRefreshMs = 1000;
 
 /// 诊断日志批量落盘：攒够行数或等 500ms 再写，不再每行 flush。
 const int _writeBatchLines = 32;
@@ -93,6 +107,8 @@ abstract final class DiagProbe {
   static Timer? _openTimer;
   static Timer? _writeFlushTimer;
   static bool _openSlowPoll = false;
+  static bool _samplingRequested = false;
+  static int _samplingSuspended = 0;
   static _OpenTracker? _tracker;
   static Future<void> _writeChain = Future<void>.value();
   static Future<Directory>? _documentsDir;
@@ -121,6 +137,7 @@ abstract final class DiagProbe {
 
   /// 上一次完整读取 mpv 属性的时间与结果。
   static int _mpvCacheAt = 0;
+  static int _mpvLightRefreshAt = 0;
   static final Map<String, Object?> _mpvCache = <String, Object?>{};
 
   static Future<Directory> _docDir() =>
@@ -182,25 +199,19 @@ abstract final class DiagProbe {
       out['dataStatus'] = player.dataStatus.value.name;
     } catch (_) {}
 
-    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。每次
-    // 读 11 项看起来不多，但叠上切条/seek 时的锁竞争就足以把主 isolate
-    // 卡成秒级。这里只降频，不删指标：完整快照最多 3 秒一次。
+    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。常规
+    // 路径只每 10 秒补一次丢帧计数，其余指标留给 open / 异常取证；
+    // verbose 模式才整轮刷新。
     final now = DateTime.now().millisecondsSinceEpoch;
-    final refresh =
-        full ||
-        _mpvCache.isEmpty ||
-        now - _mpvCacheAt >= _mpvSnapshotIntervalMs;
-    if (refresh) {
-      final native = player.videoPlayerController;
-      for (final key in kMpvDiagKeys) {
-        String? value;
-        try {
-          final raw = native?.getProperty(key);
-          if (raw != null && raw.isNotEmpty) value = raw;
-        } catch (_) {}
-        _mpvCache[key] = value;
+    if (full) {
+      _refreshMpv(player, now);
+    } else if (kDiagVerbose) {
+      if (now - _mpvCacheAt >= _mpvVerboseRefreshMs) {
+        _refreshMpv(player, now);
       }
-      _mpvCacheAt = now;
+    } else if (now - _mpvLightRefreshAt >= _mpvLightRefreshMs) {
+      _mpvLightRefreshAt = now;
+      _readMpvKey(player, 'drop-frame-count');
     }
     for (final key in kMpvDiagKeys) {
       out[key] = _mpvCache[key];
@@ -208,11 +219,29 @@ abstract final class DiagProbe {
     return out;
   }
 
+  static void _refreshMpv(PlPlayerController player, int now) {
+    for (final key in kMpvDiagKeys) {
+      _readMpvKey(player, key);
+    }
+    _mpvCacheAt = now;
+    _mpvLightRefreshAt = now;
+  }
+
+  static void _readMpvKey(PlPlayerController player, String key) {
+    String? value;
+    try {
+      final raw = player.videoPlayerController?.getProperty(key);
+      if (raw != null && raw.isNotEmpty) value = raw;
+    } catch (_) {}
+    _mpvCache[key] = value;
+  }
+
   /// 切条前后 mpv 状态会整体换掉，缓存必须作废，否则新视频的宽高/解码
   /// 指标要等到下一次完整刷新才更新。
   static void invalidateSnapshotCache() {
     _mpvCache.clear();
     _mpvCacheAt = 0;
+    _mpvLightRefreshAt = 0;
   }
 
   /// App 版本 / 构建号 / 系统 / 机型。
@@ -244,10 +273,18 @@ abstract final class DiagProbe {
 
   /// 播放期间每 2 秒一行 JSONL。诊断包常开，普通包直接 return。
   ///
-  /// 采样会同步读 mpv 属性，降到 2 秒一次可明显减少主 isolate 的 FFI 读取。
+  /// 常规模式每行只读 position/texture/status，mpv 指标走低频缓存；
+  /// 切条/seek 期间由调用方 suspend，避免和 mpv 锁竞争。
   static void startSampling() {
     if (!kDiagEnabled) return;
+    _samplingRequested = true;
+    _restartSampleTimer();
+  }
+
+  static void _restartSampleTimer() {
     _sampleTimer?.cancel();
+    _sampleTimer = null;
+    if (!_samplingRequested || _samplingSuspended > 0) return;
     _sampleTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       final sw = Stopwatch()..start();
       _append('playback', snapshot());
@@ -257,8 +294,24 @@ abstract final class DiagProbe {
 
   static void stopSampling() {
     if (!kDiagEnabled) return;
+    _samplingRequested = false;
+    _samplingSuspended = 0;
     _sampleTimer?.cancel();
     _sampleTimer = null;
+  }
+
+  /// 切条 / seek 期间暂停采样，避免同步读 mpv 属性撞上解码锁。
+  static void suspendSampling() {
+    if (!kDiagEnabled) return;
+    _samplingSuspended += 1;
+    _sampleTimer?.cancel();
+    _sampleTimer = null;
+  }
+
+  static void resumeSampling() {
+    if (!kDiagEnabled) return;
+    if (_samplingSuspended > 0) _samplingSuspended -= 1;
+    if (_samplingSuspended == 0) _restartSampleTimer();
   }
 
   /// 写一条 `diag_event`，用于记录 Dart 主 isolate 的卡顿等一次性事件。
@@ -317,7 +370,9 @@ abstract final class DiagProbe {
     _stopOpenProbe();
     invalidateSnapshotCache();
     final startedAt = DateTime.now().millisecondsSinceEpoch;
-    final snap = snapshot(full: true);
+    // 常规模式不再为一次 open 同步读全部 mpv 指标；drop-frame-count 会在
+    // 缓存作废后由 snapshot() 补读一次，足够作为丢帧基线。
+    final snap = snapshot();
     final seq = ++_openSeq;
     if (oldTextureId != null) _sessionTextureIds.add(oldTextureId);
     _sessionOpenBySource[source] = (_sessionOpenBySource[source] ?? 0) + 1;
@@ -592,7 +647,7 @@ abstract final class DiagProbe {
       if (tracker.firstFrameAt == null && position > 0 && newVideoWindow) {
         tracker.firstFrameAt = now;
         // 丢帧基线改在首帧时采，避免拿上一条的累计丢帧数算增量。
-        tracker.dropBaseline = _asInt(snapshot()['drop-frame-count']);
+        tracker.dropBaseline = _liveNum(player, 'drop-frame-count')?.toInt();
         _append('open-first-frame', <String, Object?>{
           'index': tracker.index,
           'textureId': textureId,

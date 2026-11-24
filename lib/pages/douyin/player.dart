@@ -265,6 +265,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 上一次 ticker 触发的墙钟时间，用来量化 Dart 主 isolate 的卡顿。
   int _lastPipTickMs = 0;
 
+  /// 上一次推给原生的非 position 状态签名。
+  ///
+  /// 非 PiP 时 position 会随解码不断变化，但原生拿不到 PiP 会话也用不上；
+  /// 这里只比较播放/缓冲/时长/轻量模式等真正影响小窗的状态，避免
+  /// 500ms ticker 空跑一次 method channel。
+  int? _lastPipStateSig;
+
   /// PiP 轻量模式的本地镜像。持久化是异步的，开关回调若再从 DiagProbe
   /// 读值会和落盘抢时序；这里以本地值为准，再异步写回。
   late bool _pipLite = DiagProbe.pipLiteMode;
@@ -558,6 +565,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         oldTextureId: oldTextureId,
         source: source,
       );
+      // 切条期间 mpv 正持有解码锁，后台采样再去同步读属性只会把主
+      // isolate 一起堵住；采样在 open 收尾后恢复。
+      DiagProbe.suspendSampling();
       DiagProbe.openPhase('resolve');
       setState(() {
         _index = target;
@@ -699,6 +709,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
       DiagProbe.endOpen(error: openError);
+      DiagProbe.resumeSampling();
       // 只有仍然持有 `_opening` 的会话才有资格收尾。被新请求作废的旧
       // open 可能刚醒过来，不能把新 open 的标志清掉、也不能替它消费
       // pending，否则新 open 会立刻被当成「已结束」而丢状态。
@@ -1464,7 +1475,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _player.enterPip(autoEnter: false);
     // 必须先 enter 再 update：PipSession 还不存在时 update 会被原生直接丢掉。
     unawaited(_pushPipLiteMode());
-    _publishPipState();
+    // 显式带上 position：进入 PiP 必须强制下发一次，不能命中「状态未变」跳过。
+    _publishPipState(_player.positionInMilliseconds);
   }
 
   /// 播放中武装自动画中画：原生置
@@ -1476,7 +1488,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (textureId == null) return;
     _pipAutoArmed = true;
     _player.enterPip(autoEnter: true);
-    _publishPipState();
+    // arm 后原生要先拿到当前状态；显式 position 绕过状态签名去重。
+    _publishPipState(_player.positionInMilliseconds);
     DiagProbe.event('pip-auto-arm', <String, Object?>{
       'armed': true,
       'reason': reason,
@@ -1528,8 +1541,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 启动画中画状态推送。播放中每 500ms 推一次 position，原生 timebase
-  /// 才会前进；只在进入画中画时推一次的话，老机型依旧会卡帧。
+  /// 启动画中画状态推送。
+  ///
+  /// PiP 活跃时每 500ms 推一次 position，原生 timebase 才会前进；只在进入
+  /// 画中画时推一次的话，老机型依旧会卡帧。非活跃时 [_publishPipState]
+  /// 只在状态变化时真正下发，不再每 500ms 走一次 method channel。
   void _startPipTicker() {
     _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
       final nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -1556,13 +1572,34 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 字段形状与 pl_player 的 `_iosPipState()` 对齐；position/duration 用毫秒。
   void _publishPipState([int? positionMs]) {
     if (_disposed || !mounted || !IOSPipHelper.needsUpdate) return;
+    final isPlaying = _player.playerStatus.isPlaying;
+    final isBuffering = _player.isBuffering.value;
+    final isLive = _player.isLive;
+    final duration = _player.durationInMilliseconds;
+    final speed = _player.playbackSpeed;
+    // position 不参与签名：非 PiP 时它每拍都在变，算进去等于没降频。
+    // 显式传入 positionMs 的调用（seek / 进入 PiP）仍强制下发一次。
+    final sig = Object.hash(
+      isPlaying,
+      isBuffering,
+      isLive,
+      duration,
+      speed,
+      _pipLite,
+    );
+    if (!IOSPipHelper.isActive &&
+        positionMs == null &&
+        sig == _lastPipStateSig) {
+      return;
+    }
+    _lastPipStateSig = sig;
     IOSPipHelper.update(<String, Object>{
-      'isPlaying': _player.playerStatus.isPlaying,
-      'isBuffering': _player.isBuffering.value,
-      'isLive': _player.isLive,
+      'isPlaying': isPlaying,
+      'isBuffering': isBuffering,
+      'isLive': isLive,
       'position': positionMs ?? _player.positionInMilliseconds,
-      'duration': _player.durationInMilliseconds,
-      'speed': _player.playbackSpeed,
+      'duration': duration,
+      'speed': speed,
       'pipLite': _pipLite,
     });
   }
@@ -1931,6 +1968,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final durationMs = _player.durationInMilliseconds;
     _seekDragging = durationMs > 0;
     if (!_seekDragging) return;
+    // 拖动本身不 seek，但松手后马上会 seek；从拖动开始就暂停后台采样，
+    // 避免采样在 seek 的锁竞争窗口里同步读 mpv 属性。
+    DiagProbe.suspendSampling();
     var start = _player.positionInMilliseconds;
     if (start <= 0) start = _player.position.value * 1000;
     _seekStartMs = start.clamp(0, durationMs).toInt();
@@ -1960,7 +2000,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (!_seekDragging) return;
     _seekDragging = false;
     _player.position.value = _seekTargetMs ~/ 1000;
-    unawaited(_player.seekTo(Duration(milliseconds: _seekTargetMs)));
+    unawaited(
+      _player
+          .seekTo(Duration(milliseconds: _seekTargetMs))
+          .whenComplete(DiagProbe.resumeSampling),
+    );
     _pushProgress(force: true);
     _publishPipState(_seekTargetMs);
     _hideHintSoon();
@@ -1971,6 +2015,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _onHorizontalDragCancel() {
     if (!_seekDragging) return;
     _seekDragging = false;
+    DiagProbe.resumeSampling();
     _hideHintSoon();
   }
 
@@ -2295,8 +2340,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 onDragStart: (_) {},
                 onSeek: (milliseconds) {
                   _player.position.value = milliseconds ~/ 1000;
+                  // seek 会短暂抢 mpv 解码锁，采样先让开，完成后再恢复。
+                  DiagProbe.suspendSampling();
                   unawaited(
-                    _player.seekTo(Duration(milliseconds: milliseconds)),
+                    _player
+                        .seekTo(Duration(milliseconds: milliseconds))
+                        .whenComplete(DiagProbe.resumeSampling),
                   );
                   _pushProgress(force: true);
                   _publishPipState(milliseconds);
