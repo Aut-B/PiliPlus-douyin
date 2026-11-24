@@ -1468,6 +1468,8 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
   private var networkError = false
   private var pageLoaded = false
   private var loginDetected = false
+  /// TikTok 页解析失败后的重试次数（最多 2 次）。
+  private var retries = 0
   /// `play_addr.uri` 拼出来的官方播放接口（302 到 mp4），直链找不到时兜底。
   private var uriFallback: String?
   private var uriFoundAt = 0
