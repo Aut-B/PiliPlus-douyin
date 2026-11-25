@@ -298,6 +298,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 能恢复，说明重建有效；这里提前做，防止累积到黑屏才被动救。
   static const int _autoRebuildInterval = 20;
 
+  /// 抖音 / TikTok 短视频显式走 VideoToolbox（auto-copy）。
+  ///
+  /// 全局硬解开关被用户关掉时也不能退化成软解：6S 上软解这些缓存视频一样卡，
+  /// 表现和「网络慢」几乎一样。B 站播放页不传这个覆盖，行为保持不变。
+  static const String _hwdec = 'auto-copy';
+
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
 
@@ -687,6 +693,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'key': entry.key,
         'local': media.isLocal,
         'host': Uri.tryParse(media.url)?.host,
+        'hwdecRequested': _hwdec,
       });
       // 抖音 / TikTok 的 CDN 认网页 UA 和 referer，上游 controller 里默认写死了
       // 桌面 UA + B 站 referer，直接用会 403 或者只给到一部分数据（表现为
@@ -721,6 +728,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         autoplay: true,
         isVertical: true,
         isLocalFile: media.isLocal,
+        // 6S 上这些短视频靠 VideoToolbox 才能顺畅；本地缓存同样要解码，
+        // 所以显式打开，不再依赖全局硬解开关。
+        hwdecOverride: _hwdec,
+        enableHardwareAcceleration: true,
         // 本地文件时长已知，直接告诉播放器，省掉一次探测。
         duration: media.isLocal && entry.durationMs > 0
             ? Duration(milliseconds: entry.durationMs)

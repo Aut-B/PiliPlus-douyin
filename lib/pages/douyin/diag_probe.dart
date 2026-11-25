@@ -69,11 +69,27 @@ const int _openSlowPollMs = 500;
 /// 单段同步工作超过这个值就写一条 `ui-block`，供下一份诊断包定位。
 const int _uiBlockMs = 50;
 
-/// 常规模式：播放采样只每 10 秒补一次丢帧计数。
+/// 常规模式：播放采样时按 [_mpvLightKeys] 轮转补读 mpv 指标。
 ///
-/// 其余 mpv 指标只在 open / 异常取证时实时读；整轮 11 次 `getProperty`
-/// 每次要 50~70ms，绝不能跟着 2 秒采样节拍跑。
-const int _mpvLightRefreshMs = 10000;
+/// 之前 10 秒才读一次 drop-frame-count，其余键永远留在空缓存里，真机 playback
+/// 采样里 hwdec-current / video-params/w / video-codec 全是 null。现在每拍只读
+/// 一个键：既让缓存里迟早拿到全部指标，又不会把主 isolate 一次卡住半秒。
+const int _mpvLightRefreshMs = 2500;
+
+/// 轮转顺序：先补黑屏判定/硬解取证最关键的三个，其余靠后。
+const List<String> _mpvLightKeys = <String>[
+  'video-params/w',
+  'hwdec-current',
+  'video-codec',
+  'drop-frame-count',
+  'video-params/h',
+  'video-params/pixfmt',
+  'estimated-vf-fps',
+  'vo-drop-frame-count',
+  'decoder-frame-drop-count',
+  'cache-speed',
+  'demuxer-cache-time',
+];
 
 /// verbose 模式：每次采样都整轮刷新 mpv 指标。
 const int _mpvVerboseRefreshMs = 1000;
@@ -138,6 +154,7 @@ abstract final class DiagProbe {
   /// 上一次完整读取 mpv 属性的时间与结果。
   static int _mpvCacheAt = 0;
   static int _mpvLightRefreshAt = 0;
+  static int _mpvLightCursor = 0;
   static final Map<String, Object?> _mpvCache = <String, Object?>{};
 
   static Future<Directory> _docDir() =>
@@ -199,9 +216,9 @@ abstract final class DiagProbe {
       out['dataStatus'] = player.dataStatus.value.name;
     } catch (_) {}
 
-    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。常规
-    // 路径只每 10 秒补一次丢帧计数，其余指标留给 open / 异常取证；
-    // verbose 模式才整轮刷新。
+    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。常规路径每
+    // 拍只轮转补读一个指标，让 hwdec-current / video-params/w / video-codec
+    // 等键在几秒内落进缓存，采样不再全 null；verbose 模式才整轮刷新。
     final now = DateTime.now().millisecondsSinceEpoch;
     if (full) {
       _refreshMpv(player, now);
@@ -209,9 +226,12 @@ abstract final class DiagProbe {
       if (now - _mpvCacheAt >= _mpvVerboseRefreshMs) {
         _refreshMpv(player, now);
       }
-    } else if (now - _mpvLightRefreshAt >= _mpvLightRefreshMs) {
+    } else if (player.dataStatus.value == DataStatus.loaded &&
+        now - _mpvLightRefreshAt >= _mpvLightRefreshMs) {
       _mpvLightRefreshAt = now;
-      _readMpvKey(player, 'drop-frame-count');
+      final key = _mpvLightKeys[_mpvLightCursor % _mpvLightKeys.length];
+      _mpvLightCursor += 1;
+      _readMpvKey(player, key);
     }
     for (final key in kMpvDiagKeys) {
       out[key] = _mpvCache[key];
@@ -228,12 +248,10 @@ abstract final class DiagProbe {
   }
 
   static void _readMpvKey(PlPlayerController player, String key) {
-    String? value;
-    try {
-      final raw = player.videoPlayerController?.getProperty(key);
-      if (raw != null && raw.isNotEmpty) value = raw;
-    } catch (_) {}
-    _mpvCache[key] = value;
+    final value = _liveStr(player, key);
+    // 单次读取失败（mpv 正忙）别把已拿到的值抹成 null；切条时
+    // [invalidateSnapshotCache] 会整体清空，不会把上一条的视频串过来。
+    if (value != null) _mpvCache[key] = value;
   }
 
   /// 切条前后 mpv 状态会整体换掉，缓存必须作废，否则新视频的宽高/解码
@@ -242,6 +260,7 @@ abstract final class DiagProbe {
     _mpvCache.clear();
     _mpvCacheAt = 0;
     _mpvLightRefreshAt = 0;
+    _mpvLightCursor = 0;
   }
 
   /// App 版本 / 构建号 / 系统 / 机型。
@@ -648,6 +667,20 @@ abstract final class DiagProbe {
         tracker.firstFrameAt = now;
         // 丢帧基线改在首帧时采，避免拿上一条的累计丢帧数算增量。
         tracker.dropBaseline = _liveNum(player, 'drop-frame-count')?.toInt();
+        // 首帧这一刻解码器已初始化、mpv 不忙，顺手读三个关键指标并回填缓存，
+        // 后面的 playback 采样就能直接读到，不用再同步 FFI。
+        final firstWidth = _liveNum(player, 'video-params/w');
+        final firstCodec = _liveStr(player, 'video-codec');
+        final firstHwdec = _liveStr(player, 'hwdec-current');
+        // 缓存里统一存 String：轮转补读走的是 mpv 的字符串属性，两处类型
+        // 不一致会让下游解析（_asNum）之外的读取路径踩类型坑。
+        if (firstWidth != null) {
+          _mpvCache['video-params/w'] = firstWidth.toString();
+        }
+        if (firstCodec != null) _mpvCache['video-codec'] = firstCodec;
+        if (firstHwdec != null) _mpvCache['hwdec-current'] = firstHwdec;
+        // 首帧这一刻已经同步读了几个键，轮转补读往后挪一拍，别在起播瞬间叠加。
+        _mpvLightRefreshAt = now;
         _append('open-first-frame', <String, Object?>{
           'index': tracker.index,
           'textureId': textureId,
@@ -656,29 +689,74 @@ abstract final class DiagProbe {
           'afterLoadedMs': tracker.loadedAt == null
               ? null
               : now - tracker.loadedAt!,
+          'videoParamsW': firstWidth,
+          'videoCodec': firstCodec,
+          'hwdec': firstHwdec,
         });
       }
       final elapsed = now - tracker.startedAt;
-      // 只有确实没拿到首帧（firstFrameAt 仍为空）才记首帧缺失。
-      // video-params/w 必须实时读：3 秒缓存快照在刚切条时可能是 null，
-      // 会把正常播放误判成黑屏，污染证据。
+      // 只有数据源已经 loaded（还在开流是「慢」，交给 open-stuck 留证）且确实
+      // 没拿到首帧时才判缺失；判之前实时复核 video-params/w 和播放状态，
+      // 已经解出画面的正常播放绝不记黑屏。
       if (!tracker.firstFrameMissLogged &&
           tracker.firstFrameAt == null &&
-          elapsed >= _blackScreenCheckMs) {
-        tracker.firstFrameMissLogged = true;
-        _markBlack(tracker);
-        _append('first-frame-miss', <String, Object?>{
-          'seq': tracker.seq,
-          'source': tracker.source,
-          'index': tracker.index,
-          'key': tracker.key,
-          'afterOpenMs': elapsed,
-          'positionMs': position,
-          'videoParamsW': _liveNum(player, 'video-params/w'),
-          'dataStatus': status.name,
-          'textureId': textureId,
-          'audioReady': _audioReady(player),
-        });
+          elapsed >= _blackScreenCheckMs &&
+          status == DataStatus.loaded) {
+        final liveWidth = _liveNum(player, 'video-params/w');
+        final playing = player.playerStatus.isPlaying;
+        // 起播瞬间可能刚好读到「playing 已置位、宽高还没写回」的一拍，
+        // 连续两拍都在播才认定为缺画面，避免把正常起播误判成黑屏。
+        final playingConfirmed = playing && tracker.sawPlaying;
+        tracker.sawPlaying = playing;
+        if (liveWidth != null && liveWidth > 0) {
+          // mpv 已经解出画面，只是 position/texture 判据没抓到首帧时序。
+          tracker.firstFrameMissLogged = true;
+          tracker.firstFrameAt = now;
+          _append('open-first-frame-late', <String, Object?>{
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+            'afterOpenMs': elapsed,
+            'positionMs': position,
+            'videoParamsW': liveWidth,
+            'textureId': textureId,
+          });
+        } else if (playingConfirmed) {
+          // 正在播却读不到画面参数，才是真正的「有声音没画面」。
+          tracker.firstFrameMissLogged = true;
+          _markBlack(tracker);
+          _append('first-frame-miss', <String, Object?>{
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+            'key': tracker.key,
+            'afterOpenMs': elapsed,
+            'positionMs': position,
+            'videoParamsW': liveWidth,
+            'videoCodec': _liveStr(player, 'video-codec'),
+            'hwdec': _liveStr(player, 'hwdec-current'),
+            'dataStatus': status.name,
+            'textureId': textureId,
+            'playing': playing,
+            'buffering': player.isBuffering.value,
+            'audioReady': _audioReady(player),
+          });
+        } else if (!tracker.pendingLogged) {
+          // 暂停 / 未起播时读不到画面参数不能当黑屏，只留一条待定证据。
+          // 只防重复写 pending，不占用 firstFrameMissLogged：这里并没有下
+          // 「缺画面」的结论，后面真的读到宽度或开始播放时还要能补记。
+          tracker.pendingLogged = true;
+          _append('diag_event', <String, Object?>{
+            'event': 'first-frame-pending',
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+            'afterOpenMs': elapsed,
+            'positionMs': position,
+            'playing': playing,
+            'buffering': player.isBuffering.value,
+          });
+        }
       }
       // open 已收尾后计时器还要留到 3 秒黑屏判定，不能把正常完成的一批
       // 误记成「5 秒没结束」。
@@ -699,7 +777,8 @@ abstract final class DiagProbe {
       final checkFrom = tracker.firstFrameAt ?? tracker.startedAt;
       if (!tracker.blackChecked &&
           now - checkFrom >= _blackScreenCheckMs &&
-          position > 0) {
+          position > 0 &&
+          status == DataStatus.loaded) {
         tracker.blackChecked = true;
         _checkBlackScreen(tracker, player, position, elapsed);
       }
@@ -734,9 +813,12 @@ abstract final class DiagProbe {
     final delta = drop != null && tracker.dropBaseline != null
         ? drop - tracker.dropBaseline!
         : null;
+    final playing = player.playerStatus.isPlaying;
+    final buffering = player.isBuffering.value;
     String? reason;
     if (width == null) {
-      reason = 'video-params/w-null';
+      // 暂停 / 仍在缓冲时读不到宽高是正常的，不能算黑屏。
+      if (playing) reason = 'video-params/w-null';
     } else if (delta != null && delta >= _dropFrameJumpThreshold) {
       reason = 'drop-frame-count-jump';
     }
@@ -759,6 +841,8 @@ abstract final class DiagProbe {
       'dropFrameBase': tracker.dropBaseline,
       'dropFrameNow': drop,
       'dropFrameDelta': delta,
+      'playing': playing,
+      'buffering': buffering,
       'textureId': tracker.newTextureId ?? snap['textureId'],
     });
   }
@@ -937,12 +1021,18 @@ abstract final class DiagProbe {
   static int? _asInt(Object? value) => _asNum(value)?.toInt();
 
   /// 实时读取单个 mpv 属性，绕过 [_mpvCache]。
-  static num? _liveNum(PlPlayerController player, String key) {
+  static String? _liveStr(PlPlayerController player, String key) {
     try {
       final raw = player.videoPlayerController?.getProperty(key);
-      if (raw != null && raw.isNotEmpty) return num.tryParse(raw);
+      if (raw != null && raw.isNotEmpty) return raw;
     } catch (_) {}
     return null;
+  }
+
+  /// 实时读取单个数值型 mpv 属性，绕过 [_mpvCache]。
+  static num? _liveNum(PlPlayerController player, String key) {
+    final raw = _liveStr(player, key);
+    return raw == null ? null : num.tryParse(raw);
   }
 
   static String _timestamp() {
@@ -981,6 +1071,8 @@ final class _OpenTracker {
   bool blackChecked = false;
   bool blackCounted = false;
   bool firstFrameMissLogged = false;
+  bool pendingLogged = false;
+  bool sawPlaying = false;
   bool stuckLogged = false;
   bool ended = false;
   String phase = 'resolve';
