@@ -936,10 +936,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
+        toolbarHeight: 48,
         title: Text(
           platform.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
+        ),
+        titleTextStyle: theme.textTheme.titleMedium?.copyWith(
+          fontWeight: FontWeight.w600,
+          color: theme.colorScheme.onSurface,
         ),
         titleSpacing: 16,
         actions: [
@@ -979,7 +984,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         ],
         // 分段控件放在标题栏底部，固定在顶部，避免滚动时平台入口消失。
         bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(56),
+          preferredSize: const Size.fromHeight(44),
           child: _platformSwitcher(theme),
         ),
       ),
@@ -987,29 +992,31 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         children: [
           if (_webLoggedOut)
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              padding: const EdgeInsets.fromLTRB(12, 2, 12, 0),
               child: Container(
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
+                  horizontal: 8,
+                  vertical: 4,
                 ),
                 decoration: BoxDecoration(
                   color: theme.colorScheme.errorContainer,
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(6),
                 ),
                 child: Row(
                   children: [
                     Icon(
                       Icons.info_outline,
-                      size: 18,
+                      size: 14,
                       color: theme.colorScheme.onErrorContainer,
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 6),
                     Expanded(
                       child: Text(
                         '未登录，点右上角登录',
-                        style: theme.textTheme.bodySmall?.copyWith(
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall?.copyWith(
                           color: theme.colorScheme.onErrorContainer,
                         ),
                       ),
@@ -1113,7 +1120,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget _platformSwitcher(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
       child: Center(
         child: SegmentedButton<ShortVideoPlatform>(
           showSelectedIcon: false,
@@ -1131,7 +1138,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           onSelectionChanged: (selection) =>
               widget.onPlatformChanged(selection.first),
           style: SegmentedButton.styleFrom(
-            minimumSize: const Size(104, 36),
+            minimumSize: const Size(96, 32),
             visualDensity: VisualDensity.compact,
             tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             backgroundColor: scheme.surfaceContainerHighest,
@@ -1147,49 +1154,66 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 柔和的状态条：同步、缓存、链接解析都走这里，不再塞进底部按钮区。
+  /// 单行细状态条：同步、缓存、链接解析都走这里，不再塞进底部按钮区。
   Widget _statusBar(ThemeData theme) {
     final scheme = theme.colorScheme;
     final busy = _syncing || _caching || _addingLink;
     final text = _status.trim().isEmpty ? '就绪' : _status.trim();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.fromLTRB(12, 2, 8, 0),
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.fromLTRB(8, 2, 4, 2),
         decoration: BoxDecoration(
           color: scheme.surfaceContainerHighest.withValues(alpha: 0.6),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(6),
         ),
         child: Row(
           children: [
             if (busy)
               SizedBox(
-                width: 14,
-                height: 14,
+                width: 12,
+                height: 12,
                 child: CircularProgressIndicator(
-                  strokeWidth: 2,
+                  strokeWidth: 1.8,
                   color: scheme.primary,
                 ),
               )
             else
               Icon(
                 Icons.info_outline,
-                size: 16,
+                size: 13,
                 color: scheme.onSurfaceVariant,
               ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 6),
             Expanded(
               child: Text(
                 text,
-                maxLines: 2,
+                maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
+                style: theme.textTheme.labelSmall?.copyWith(
                   color: scheme.onSurfaceVariant,
-                  height: 1.35,
+                  height: 1.2,
                 ),
               ),
             ),
+            if (_cacheBytes > 0)
+              TextButton(
+                onPressed: _caching ? null : _clearCache,
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  minimumSize: const Size(0, 22),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                ),
+                child: Text(
+                  '清缓存 ${_fmtBytes(_cacheBytes)}',
+                  maxLines: 1,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: scheme.primary,
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1199,7 +1223,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget _listHeader(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 8, 0),
+      padding: const EdgeInsets.fromLTRB(12, 0, 6, 0),
       child: Row(
         children: [
           Text(
@@ -1222,15 +1246,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             onPressed: _addingLink ? null : _addFromLink,
             style: TextButton.styleFrom(
               visualDensity: VisualDensity.compact,
-              padding: const EdgeInsets.symmetric(horizontal: 8),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              minimumSize: const Size(0, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 6),
             ),
             icon: _addingLink
                 ? const SizedBox(
-                    width: 16,
-                    height: 16,
+                    width: 14,
+                    height: 14,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.link, size: 18),
+                : const Icon(Icons.link, size: 16),
             label: const Text('粘贴链接'),
           ),
         ],
@@ -1420,20 +1446,20 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   Widget _list(ThemeData theme) {
     return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
         final checked = widget.selected.containsKey(video.key);
         return Padding(
-          padding: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.only(bottom: 8),
           child: Material(
             color: _selecting && checked
                 ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
                 : theme.colorScheme.surfaceContainerLow,
             clipBehavior: Clip.antiAlias,
             shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(12),
               side: BorderSide(
                 color: _selecting && checked
                     ? theme.colorScheme.primary.withValues(alpha: 0.7)
@@ -1447,80 +1473,90 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 _toggleSelect(video);
               },
               child: Padding(
-                padding: const EdgeInsets.all(10),
+                padding: const EdgeInsets.all(8),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     _videoCover(theme, video, checked),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 10),
                     Expanded(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            video.title,
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w600,
-                              height: 1.35,
+                      child: SizedBox(
+                        height: 128,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              video.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                                height: 1.25,
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 5),
-                          Text(
-                            video.author.trim().isEmpty
-                                ? '未知作者'
-                                : video.author.trim(),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
+                            const SizedBox(height: 3),
+                            Text(
+                              video.author.trim().isEmpty
+                                  ? '未知作者'
+                                  : video.author.trim(),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                                height: 1.2,
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 7,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: theme.colorScheme.primaryContainer
-                                      .withValues(alpha: 0.75),
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  platform.album,
-                                  style: theme.textTheme.labelSmall?.copyWith(
-                                    color: theme.colorScheme.onPrimaryContainer,
-                                    fontWeight: FontWeight.w600,
+                            const Spacer(),
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: theme.colorScheme.primaryContainer
+                                        .withValues(alpha: 0.75),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    platform.album,
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color:
+                                          theme.colorScheme.onPrimaryContainer,
+                                      fontWeight: FontWeight.w600,
+                                      height: 1.2,
+                                    ),
                                   ),
                                 ),
-                              ),
-                              const SizedBox(width: 6),
-                              Icon(
-                                Icons.schedule_rounded,
-                                size: 13,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                              const SizedBox(width: 3),
-                              Text(
-                                video.durationText,
-                                style: theme.textTheme.labelSmall?.copyWith(
+                                const SizedBox(width: 6),
+                                Icon(
+                                  Icons.schedule_rounded,
+                                  size: 12,
                                   color: theme.colorScheme.onSurfaceVariant,
                                 ),
-                              ),
-                            ],
-                          ),
-                        ],
+                                const SizedBox(width: 2),
+                                Flexible(
+                                  child: Text(
+                                    video.durationText,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.labelSmall?.copyWith(
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                      height: 1.2,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                     const SizedBox(width: 4),
                     SizedBox(
-                      width: 40,
-                      height: 40,
+                      width: 36,
+                      height: 36,
                       child: _selecting
                           ? Icon(
                               checked
@@ -1608,10 +1644,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: BorderRadius.circular(8),
       child: SizedBox(
-        width: 68,
-        height: 92,
+        width: 96,
+        height: 128,
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -1621,7 +1657,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               Image.network(
                 video.cover,
                 fit: BoxFit.cover,
-                cacheWidth: 220,
+                cacheWidth: 260,
                 errorBuilder: (_, _, _) => placeholder(),
               ),
             if (_selecting && checked)
@@ -1669,9 +1705,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final localSelected = _localSelected;
     return Padding(
       padding: EdgeInsets.fromLTRB(
-        16,
-        8,
-        16,
+        12,
+        6,
+        12,
         safeBottom + _mainBottomNavHeight + 4,
       ),
       child: Column(
@@ -1691,36 +1727,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 label: const Text('打开网页登录后再试'),
               ),
             ),
-          if (_cacheBytes > 0 || _selecting)
-            Row(
-              children: [
-                if (_selecting)
-                  Text(
-                    '已选 $_selectedCount 条',
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: theme.colorScheme.primary,
-                    ),
-                  ),
-                const Spacer(),
-                if (_cacheBytes > 0)
-                  TextButton(
-                    onPressed: _caching ? null : _clearCache,
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    child: Text(
-                      '缓存 ${_fmtBytes(_cacheBytes)}',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ),
-              ],
-            ),
-          const SizedBox(height: 8),
           if (_selecting)
             Wrap(
               spacing: 8,
-              runSpacing: 8,
+              runSpacing: 6,
               children: [
                 OutlinedButton.icon(
                   onPressed: _videos.isEmpty ? null : _selectAll,
@@ -1764,25 +1774,42 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 Expanded(
                   child: FilledButton.icon(
                     onPressed: _openWeb,
-                    icon: const Icon(Icons.public),
+                    style: FilledButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      minimumSize: const Size.fromHeight(42),
+                    ),
+                    icon: const Icon(Icons.public, size: 18),
                     label: const Text('打开网页 / 抓取'),
                   ),
                 ),
-                const SizedBox(width: 12),
-                OutlinedButton(
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
                   onPressed: _videos.isEmpty ? null : _playAll,
-                  child: const Text('全部播放'),
+                  style: OutlinedButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    minimumSize: const Size(0, 42),
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                  ),
+                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                  label: const Text('全部播放'),
                 ),
               ],
             ),
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: _openingWeb ? null : _directSync,
-                icon: const Icon(Icons.sync_alt),
-                label: const Text('直接同步（只拉新增）'),
-              ),
+            const SizedBox(height: 2),
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: _openingWeb ? null : _directSync,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    minimumSize: const Size(0, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                  ),
+                  icon: const Icon(Icons.sync_alt, size: 16),
+                  label: const Text('直接同步（只拉新增）'),
+                ),
+              ],
             ),
           ],
         ],
