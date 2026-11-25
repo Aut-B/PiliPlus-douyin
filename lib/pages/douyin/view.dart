@@ -158,6 +158,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 正在把选中的条目下到本地。
   bool _caching = false;
 
+  /// 已缓存条目。卡片角标、按钮状态和批量操作都读这里，避免每帧都查文件。
+  final Set<String> _cachedKeys = <String>{};
+
+  /// 单条下载进度，key 是 [ShortVideo.key]。
+  final Map<String, double> _cacheProgress = <String, double>{};
+  final Map<String, int> _cacheProgressAt = <String, int>{};
+  int _cacheDone = 0;
+  int _cacheTotal = 0;
+  int _cacheScanId = 0;
+
   /// 本地缓存目录占用（字节）。
   int _cacheBytes = 0;
 
@@ -196,6 +206,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         ..addAll(stored);
     });
     unawaited(_backfillMeta());
+    unawaited(_refreshCachedState());
   }
 
   /// 旧版「从链接导入」只写了占位文案，元数据是空的。列表加载后串行、
@@ -638,6 +649,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final positions = List<int>.generate(videos.length, (i) => i);
     setState(() {
       _videos.clear();
+      _cachedKeys.clear();
       _status = '已清空，可重新抓取';
     });
     widget.onSelectingChanged(false);
@@ -669,6 +681,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final position = _videos.indexWhere((e) => e.key == video.key);
     setState(() {
       _videos.removeWhere((e) => e.key == video.key);
+      _cachedKeys.remove(video.key);
       _status = '已删除 1 条，本地 ${_videos.length} 条';
     });
     widget.onRemoveSelected([video]);
@@ -704,6 +717,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     ];
     setState(() {
       _videos.removeWhere((e) => targets.any((t) => t.key == e.key));
+      for (final video in targets) {
+        _cachedKeys.remove(video.key);
+      }
       _status = '已删除 ${targets.length} 条，本地 ${_videos.length} 条';
     });
     widget.onRemoveSelected(targets);
@@ -775,6 +791,31 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     setState(() => _cacheBytes = bytes);
   }
 
+  /// 扫描当前列表哪些条目已经有完整本地文件。
+  ///
+  /// 只做一次目录里的文件存在性检查，不在 build 里逐条 await。
+  Future<void> _refreshCachedState() async {
+    final scanId = ++_cacheScanId;
+    final videos = List<ShortVideo>.of(_videos);
+    final cached = <String>{};
+    for (final video in videos) {
+      if (!mounted || scanId != _cacheScanId) return;
+      if (await ShortVideoMediaCache.localPath(video) != null) {
+        cached.add(video.key);
+      }
+    }
+    if (!mounted || scanId != _cacheScanId) return;
+    if (cached.length == _cachedKeys.length &&
+        cached.containsAll(_cachedKeys)) {
+      return;
+    }
+    setState(() {
+      _cachedKeys
+        ..clear()
+        ..addAll(cached);
+    });
+  }
+
   /// 清空短视频缓存目录。
   Future<void> _clearCache() async {
     final confirmed = await showConfirmDialog(
@@ -787,6 +828,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
     if (!confirmed || !mounted) return;
     await ShortVideoMediaCache.clear();
+    if (mounted) {
+      setState(() {
+        _cachedKeys.clear();
+        _cacheProgress.clear();
+      });
+    }
     await _refreshCacheSize();
     ShortVideoAutoCache.schedule();
     if (mounted) SmartDialog.showToast('缓存已清空，正在自动补回收藏');
@@ -806,10 +853,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       return;
     }
     ShortVideoAutoCache.refreshProtection();
-    setState(() => _caching = true);
+    setState(() {
+      _caching = true;
+      _cacheDone = 0;
+      _cacheTotal = videos.length;
+      _cacheProgress.clear();
+      _cacheProgressAt.clear();
+    });
     var ok = 0;
     var skipped = 0;
-    final failures = <String>[];
     final cookie = await ShortVideoWeb.cookieHeader(
       platform.cookieDomainNeedle,
     );
@@ -819,15 +871,24 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       final existing = await ShortVideoMediaCache.localPath(video);
       if (existing != null) {
         skipped++;
+        if (mounted) {
+          setState(() {
+            _cachedKeys.add(video.key);
+            _cacheDone = i + 1;
+          });
+        }
         continue;
       }
-      setState(
-        () => _status = '缓存中 ${i + 1}/${videos.length}：${video.title}',
-      );
+      if (!mounted) break;
+      setState(() {
+        _cacheProgress[video.key] = 0;
+        _status = '缓存中 ${i + 1}/${videos.length}：${video.title}';
+      });
       final urls = <String>[
         if (video.playUrl.isNotEmpty) video.playUrl,
         ...stableUrls(video),
       ];
+      final total = videos.length;
       final result = await ShortVideoMediaCache.download(
         video,
         urls: urls,
@@ -837,25 +898,67 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         appUserAgent: platform == ShortVideoPlatform.tiktok
             ? tiktokAppUserAgent
             : '',
+        onProgress: (progress) {
+          if (!mounted) return;
+          final now = DateTime.now().millisecondsSinceEpoch;
+          final last = _cacheProgressAt[video.key] ?? 0;
+          if (progress < 1 && now - last < 180) return;
+          _cacheProgressAt[video.key] = now;
+          setState(() {
+            _cacheProgress[video.key] = progress.clamp(0.0, 1.0);
+            _status =
+                '缓存中 ${i + 1}/$total'
+                '（${(progress * 100).clamp(0, 100).round()}%）：'
+                '${video.title}';
+          });
+        },
       );
+      if (!mounted) break;
       if (result.ok) {
         ok++;
+        setState(() {
+          _cacheProgress.remove(video.key);
+          _cacheProgressAt.remove(video.key);
+          _cacheDone = i + 1;
+          _cachedKeys.add(video.key);
+        });
       } else {
-        failures.add('${video.title}（${result.error}）');
+        setState(() {
+          _cacheProgress.remove(video.key);
+          _cacheProgressAt.remove(video.key);
+          _cacheDone = i + 1;
+        });
+        SmartDialog.showToast(
+          '缓存失败：${video.title}（${result.error ?? '未知错误'}）',
+        );
       }
     }
     if (!mounted) return;
     setState(() {
       _caching = false;
+      _cacheProgress.clear();
+      _cacheProgressAt.clear();
+      _cacheTotal = 0;
+      _cacheDone = 0;
       _status =
           '缓存完成：新增 $ok 条'
           '${skipped > 0 ? '，已有 $skipped 条' : ''}'
-          '${failures.isEmpty ? '' : '，失败 ${failures.length} 条'}';
+          '${ok + skipped == videos.length ? '' : '，失败 ${videos.length - ok - skipped} 条'}';
     });
     await _refreshCacheSize();
-    if (failures.isNotEmpty) {
-      SmartDialog.showToast('失败：${failures.first}');
+  }
+
+  /// 单条缓存：已缓存就直接提示，避免重复下载。
+  void _cacheOne(ShortVideo video) {
+    if (_cachedKeys.contains(video.key)) {
+      SmartDialog.showToast('已缓存到本地');
+      return;
     }
+    if (_caching) {
+      SmartDialog.showToast('正在缓存中，请稍候');
+      return;
+    }
+    unawaited(_cacheVideos([video]));
   }
 
   void _cacheSelected() {
@@ -964,9 +1067,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   )
                 : const Icon(Icons.sync, size: 20),
           ),
-          _headIcon(
-            tooltip: _selecting ? '退出多选' : '多选',
-            onTap: _videos.isEmpty && !_selecting ? null : _toggleSelectMode,
+          TextButton.icon(
+            onPressed: _videos.isEmpty && !_selecting
+                ? null
+                : _toggleSelectMode,
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: const Size(0, 36),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
             icon: Badge(
               isLabelVisible: _selecting && _selectedCount > 0,
               label: Text(
@@ -975,9 +1085,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               ),
               child: Icon(
                 _selecting ? Icons.close : Icons.checklist,
-                size: 20,
+                size: 18,
               ),
             ),
+            label: Text(_selecting ? '退出多选' : '多选'),
           ),
           _moreMenu(theme),
           const SizedBox(width: 4),
@@ -1197,6 +1308,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 ),
               ),
             ),
+            if (_caching && _cacheTotal > 0)
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Text(
+                  '$_cacheDone/$_cacheTotal',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: scheme.primary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
             if (_cacheBytes > 0)
               TextButton(
                 onPressed: _caching ? null : _clearCache,
@@ -1554,19 +1676,28 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                       ),
                     ),
                     const SizedBox(width: 4),
-                    SizedBox(
-                      width: 36,
-                      height: 36,
-                      child: _selecting
-                          ? Icon(
-                              checked
-                                  ? Icons.check_circle_rounded
-                                  : Icons.radio_button_unchecked_rounded,
-                              color: checked
-                                  ? theme.colorScheme.primary
-                                  : theme.colorScheme.onSurfaceVariant,
-                            )
-                          : PopupMenuButton<String>(
+                    if (_selecting)
+                      SizedBox(
+                        width: 36,
+                        height: 36,
+                        child: Icon(
+                          checked
+                              ? Icons.check_circle_rounded
+                              : Icons.radio_button_unchecked_rounded,
+                          color: checked
+                              ? theme.colorScheme.primary
+                              : theme.colorScheme.onSurfaceVariant,
+                        ),
+                      )
+                    else
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _cacheButton(theme, video),
+                          SizedBox(
+                            width: 36,
+                            height: 36,
+                            child: PopupMenuButton<String>(
                               tooltip: '更多',
                               padding: EdgeInsets.zero,
                               icon: const Icon(
@@ -1582,35 +1713,42 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                                   case 'playlist':
                                     _addToPlaylist([video]);
                                   case 'cache':
-                                    _cacheVideos([video]);
+                                    _cacheOne(video);
                                   case 'delete':
                                     _deleteOne(video);
                                 }
                               },
-                              itemBuilder: (context) => const [
-                                PopupMenuItem(
+                              itemBuilder: (context) => [
+                                const PopupMenuItem(
                                   value: 'play',
                                   child: Text('播放'),
                                 ),
-                                PopupMenuItem(
+                                const PopupMenuItem(
                                   value: 'next',
                                   child: Text('下一首播放'),
                                 ),
-                                PopupMenuItem(
+                                const PopupMenuItem(
                                   value: 'playlist',
                                   child: Text('加入播放列表'),
                                 ),
                                 PopupMenuItem(
                                   value: 'cache',
-                                  child: Text('缓存到本地'),
+                                  enabled: !_cachedKeys.contains(video.key),
+                                  child: Text(
+                                    _cachedKeys.contains(video.key)
+                                        ? '已缓存'
+                                        : '缓存到本地',
+                                  ),
                                 ),
-                                PopupMenuItem(
+                                const PopupMenuItem(
                                   value: 'delete',
                                   child: Text('删除（含缓存）'),
                                 ),
                               ],
                             ),
-                    ),
+                          ),
+                        ],
+                      ),
                   ],
                 ),
               ),
@@ -1621,8 +1759,50 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
+  /// 卡片右侧的缓存按钮：未缓存是下载图标，下载中显示环形进度，
+  /// 已缓存变成对勾。比藏在「更多」菜单里更容易被发现。
+  Widget _cacheButton(ThemeData theme, ShortVideo video) {
+    final scheme = theme.colorScheme;
+    final progress = _cacheProgress[video.key];
+    final cached = _cachedKeys.contains(video.key);
+    final Widget icon;
+    if (progress != null) {
+      icon = Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 26,
+            height: 26,
+            child: CircularProgressIndicator(
+              value: progress > 0 ? progress : null,
+              strokeWidth: 2.2,
+              color: scheme.primary,
+            ),
+          ),
+          Icon(Icons.download_rounded, size: 12, color: scheme.primary),
+        ],
+      );
+    } else {
+      icon = Icon(
+        cached ? Icons.download_done_rounded : Icons.download_rounded,
+        size: 21,
+        color: cached ? scheme.primary : scheme.onSurfaceVariant,
+      );
+    }
+    return IconButton(
+      tooltip: cached ? '已缓存' : '缓存到本地',
+      onPressed: progress != null ? null : () => _cacheOne(video),
+      icon: icon,
+      iconSize: 21,
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+    );
+  }
+
   Widget _videoCover(ThemeData theme, ShortVideo video, bool checked) {
     final scheme = theme.colorScheme;
+    final progress = _cacheProgress[video.key];
     Widget placeholder() => DecoratedBox(
       decoration: BoxDecoration(
         gradient: LinearGradient(
@@ -1663,6 +1843,52 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             if (_selecting && checked)
               ColoredBox(
                 color: scheme.primary.withValues(alpha: 0.14),
+              ),
+            if (_cachedKeys.contains(video.key))
+              Positioned(
+                left: 5,
+                top: 5,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: scheme.primary.withValues(alpha: 0.92),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.download_done_rounded,
+                        size: 10,
+                        color: scheme.onPrimary,
+                      ),
+                      const SizedBox(width: 2),
+                      Text(
+                        '已缓存',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: scheme.onPrimary,
+                          fontSize: 9,
+                          height: 1.1,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            if (progress != null && progress < 1)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: LinearProgressIndicator(
+                  value: progress,
+                  minHeight: 3,
+                  backgroundColor: Colors.black.withValues(alpha: 0.3),
+                  color: scheme.primary,
+                ),
               ),
             Positioned(
               right: 5,
@@ -1737,10 +1963,35 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   icon: const Icon(Icons.select_all),
                   label: Text(_allLocalSelected ? '取消全选' : '全选'),
                 ),
-                FilledButton.icon(
+                FilledButton.tonalIcon(
                   onPressed: _selectedCount == 0 ? null : _playSelected,
                   icon: const Icon(Icons.playlist_play),
                   label: Text('播放所选 $_selectedCount 条'),
+                ),
+                FilledButton.icon(
+                  onPressed: localSelected.isEmpty || _caching
+                      ? null
+                      : _cacheSelected,
+                  icon: _caching
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.download_for_offline_outlined),
+                  label: Text(
+                    _caching && _cacheTotal > 0
+                        ? '缓存中 $_cacheDone/$_cacheTotal'
+                        : '缓存所选 ${localSelected.length} 条',
+                  ),
+                ),
+                OutlinedButton.icon(
+                  onPressed: localSelected.isEmpty ? null : _deleteSelected,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: theme.colorScheme.error,
+                  ),
+                  icon: const Icon(Icons.delete_outline),
+                  label: Text('删除所选 ${localSelected.length} 条'),
                 ),
                 OutlinedButton.icon(
                   onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
@@ -1753,18 +2004,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                       : _addSelectedToPlaylist,
                   icon: const Icon(Icons.playlist_add),
                   label: Text('加入列表 $_selectedCount 条'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: localSelected.isEmpty || _caching
-                      ? null
-                      : _cacheSelected,
-                  icon: const Icon(Icons.download_for_offline_outlined),
-                  label: Text('缓存 ${localSelected.length} 条'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: localSelected.isEmpty ? null : _deleteSelected,
-                  icon: const Icon(Icons.delete_outline),
-                  label: Text('删除 ${localSelected.length} 条'),
                 ),
               ],
             )
