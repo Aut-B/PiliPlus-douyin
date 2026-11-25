@@ -179,6 +179,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 画面顺时针旋转的 90° 次数（0..3）。只旋转渲染层，不改原生屏幕方向。
   int _quarterTurns = 0;
 
+  /// 画面填充：true = 裁剪铺满（BoxFit.cover），false = 适应（BoxFit.contain）。
+  ///
+  /// 用户反馈竖屏短视频上下黑边太大。默认开启裁剪铺满，让短边贴合屏幕
+  /// 宽度；横屏内容在 [_videoFitFor] 里自动退回完整画面，避免裁掉两侧。
+  /// 偏好落盘，下次进播放页沿用。
+  bool _fillScreen = true;
+
+  /// 「画面填充」偏好落盘键。true = 裁剪铺满，false = 适应。
+  static const String _videoFitStoreKey = 'douyin.player.videoFit';
+
   /// 控件是否显示。和 B 站播放页一致：点一下画面切换沉浸式。
   ///
   /// 沉浸式下顶部条、底部条整块隐藏（不是变透明），同时视频区扩展到全屏。
@@ -331,6 +341,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _restorePlayMode();
+    _restoreVideoFit();
     _attachPlayerListeners();
     _pushProgress(force: true);
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
@@ -1895,6 +1906,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     } catch (_) {}
   }
 
+  /// 还原「画面填充」偏好。没有落盘记录时保持默认的裁剪铺满。
+  void _restoreVideoFit() {
+    try {
+      final saved = GStorage.video.get(_videoFitStoreKey);
+      if (saved is bool) _fillScreen = saved;
+    } catch (_) {}
+  }
+
+  Future<void> _persistVideoFit() async {
+    try {
+      await GStorage.video.put(_videoFitStoreKey, _fillScreen);
+    } catch (_) {}
+  }
+
   @override
   Widget build(BuildContext context) {
     final entry = _current;
@@ -2037,9 +2062,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 顶部控件条高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
   static const double _topBarHeight = 56;
 
-  /// 底部控件条高度：进度条 + 一排按钮。15PM 的底部安全区会再吃掉 34pt，
-  /// 所以这里把进度条和按钮算进去后留出余量，避免 15PM 上溢出。
-  static const double _bottomBarHeight = 96;
+  /// 底部控件条高度：进度行（时间 + 4px 轨道）+ 一排 34pt 按钮。15PM 的
+  /// 底部安全区会再吃掉 34pt，这里留出余量，避免新布局在小屏上溢出。
+  static const double _bottomBarHeight = 104;
 
   /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
@@ -2282,15 +2307,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (controller == null) {
       return const Center(child: CircularProgressIndicator(strokeWidth: 2));
     }
+    // 画面填充：竖屏短视频用 contain 会在上下留出大片黑边。这里按
+    // 「短边贴合屏幕宽度」放大，只裁掉少量边缘；横屏/旋转后的宽画面
+    // 在 [_videoFitFor] 里自动退回 contain，避免把两侧裁掉大半。
+    //
+    // 视频宽高比只有首帧渲染后才拿得到（VideoController.rect 由渲染循环
+    // 回填），用 ValueListenableBuilder 跟着 rect 更新一次，避免首帧前
+    // 按「未知比例」定死填充方式。
     final video = RepaintBoundary(
-      child: FittedBox(
-        fit: BoxFit.contain,
-        alignment: Alignment.center,
-        child: SimpleVideo(
-          controller: controller,
-          fill: Colors.black,
-          aspectRatio: null,
-        ),
+      child: ValueListenableBuilder<Rect?>(
+        valueListenable: controller.rect,
+        builder: (context, rect, _) {
+          return ClipRect(
+            child: FittedBox(
+              fit: _videoFitFor(rect),
+              alignment: Alignment.center,
+              child: SimpleVideo(
+                controller: controller,
+                fill: Colors.black,
+                aspectRatio: null,
+              ),
+            ),
+          );
+        },
       ),
     );
     return GestureDetector(
@@ -2342,6 +2381,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
+  /// 当前视频的填充方式。
+  ///
+  /// 关闭「裁剪铺满」时始终 contain，保留完整画面；开启时竖屏/方形视频
+  /// 用 cover 铺满，横屏视频（宽 > 高）铺满会裁掉两侧大半，退回 contain。
+  /// 画面旋转 90°/270° 时宽高互换，按旋转后的比例判断。
+  BoxFit _videoFitFor(Rect? rect) {
+    if (!_fillScreen) return BoxFit.contain;
+    if (rect == null || rect.width <= 0 || rect.height <= 0) {
+      // 首帧前拿不到尺寸，先按铺满处理；拿到 rect 后会再重建一次。
+      return BoxFit.cover;
+    }
+    final ratio = _quarterTurns.isOdd
+        ? rect.height / rect.width
+        : rect.width / rect.height;
+    return ratio > 1.0 ? BoxFit.contain : BoxFit.cover;
+  }
+
   Widget _gestureOverlay() {
     return Positioned.fill(
       child: IgnorePointer(
@@ -2349,60 +2405,73 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           valueListenable: _gestureHint,
           builder: (context, hint, child) {
             if (hint == null) return const SizedBox.shrink();
-            return Center(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.72),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 14,
+            // 轻量浮层：贴在顶部栏下方居中，不压画面中心，也不会被顶栏
+            // 盖住。只做提示，不接管触摸（外层 IgnorePointer），上下滑
+            // 亮度/音量、横滑 seek 都不受影响。
+            final topInset = MediaQuery.viewPaddingOf(context).top;
+            return SafeArea(
+              minimum: EdgeInsets.only(
+                top: topInset + _topBarHeight + 6,
+                left: 24,
+                right: 24,
+              ),
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.58),
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                  child: SizedBox(
-                    width: 200,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(hint.icon, color: Colors.white, size: 20),
-                            const SizedBox(width: 8),
-                            Text(
-                              hint.title,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 14,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    child: SizedBox(
+                      width: 168,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(hint.icon, color: Colors.white, size: 18),
+                              const SizedBox(width: 6),
+                              Text(
+                                hint.title,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            hint.detail,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                            ),
+                          ),
+                          if (hint.progress case final progress?) ...[
+                            const SizedBox(height: 6),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(2),
+                              child: LinearProgressIndicator(
+                                value: progress,
+                                minHeight: 2,
+                                backgroundColor: Colors.white24,
+                                valueColor:
+                                    const AlwaysStoppedAnimation<Color>(
+                                      Colors.white,
+                                    ),
                               ),
                             ),
                           ],
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          hint.detail,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 12,
-                          ),
-                        ),
-                        if (hint.progress case final progress?) ...[
-                          const SizedBox(height: 10),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(2),
-                            child: LinearProgressIndicator(
-                              value: progress,
-                              minHeight: 3,
-                              backgroundColor: Colors.white24,
-                              valueColor: const AlwaysStoppedAnimation<Color>(
-                                Colors.white,
-                              ),
-                            ),
-                          ),
                         ],
-                      ],
+                      ),
                     ),
                   ),
                 ),
@@ -2432,9 +2501,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   Widget _topBar(QueueEntry entry) {
+    // 左右图标统一 36×36 命中区、22px 图标，视觉等距；标题包一层点击，
+    // 打开页内「完整文案」，避免长标题被省略号吃掉后没法看全。
+    const double buttonSize = 36;
     return _controls(
-      // 和 B站播放页一样用 PlayerBar：返回在左、标题居中、操作在右。
-      // Center 负责在上下控件条里垂直居中；宽度约束仍然是撑满的。
       Center(
         child: PlayerBar(
           left: Row(
@@ -2444,49 +2514,90 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 icon: const Icon(
                   Icons.keyboard_arrow_down,
                   color: Colors.white,
+                  size: 26,
                 ),
                 // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
                 // 关小窗卡住，用户看到的就是「点了没反应」。_leave 是同步的，
                 // 收尾在它内部以 unawaited 方式启动。
                 onTap: _leave,
                 tooltip: '返回',
+                width: buttonSize,
+                height: buttonSize,
               ),
             ],
           ),
-          title: Text(
-            entry.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(color: Colors.white),
+          title: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _openPanel(_PlayerPanel.title),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      entry.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 2),
+                  const Icon(
+                    Icons.expand_more,
+                    size: 16,
+                    color: Colors.white54,
+                  ),
+                ],
+              ),
+            ),
           ),
           right: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               ComBtn(
-                icon: const Icon(Icons.queue_music, color: Colors.white),
+                icon: const Icon(
+                  Icons.queue_music,
+                  color: Colors.white,
+                  size: 22,
+                ),
                 onTap: () => unawaited(_openPlaylist()),
                 tooltip: '播放列表',
+                width: buttonSize,
+                height: buttonSize,
               ),
               ComBtn(
-                icon: Icon(_playModeIcon, color: _playModeColor),
+                icon: Icon(_playModeIcon, color: _playModeColor, size: 22),
                 onTap: _cyclePlayMode,
                 tooltip: _playModeLabel,
+                width: buttonSize,
+                height: buttonSize,
               ),
               ComBtn(
                 icon: const Icon(
                   Icons.picture_in_picture_alt,
                   color: Colors.white,
+                  size: 22,
                 ),
                 onTap: () => unawaited(_enterPip()),
                 tooltip: '画中画',
+                width: buttonSize,
+                height: buttonSize,
               ),
               ComBtn(
                 icon: const Icon(
                   Icons.more_vert_outlined,
                   color: Colors.white,
+                  size: 22,
                 ),
                 onTap: () => _openPanel(_PlayerPanel.more),
                 tooltip: '更多设置',
+                width: buttonSize,
+                height: buttonSize,
               ),
             ],
           ),
@@ -2499,6 +2610,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // playerStatus 是普通字段，不是 Rx；暂停/播放图标由 `_isPlaying` 单独
     // 驱动，只重建这一个按钮。进度/缓冲/时长由 `_progress` 驱动，只重建
     // 进度条和时间文本，不跟着 position 回调刷新整页。
+    //
+    // 布局分两行：
+    // * 进度行：当前时间 + 加粗进度条（带拖动圆点）+ 总时长，三者同一行
+    //   基线对齐，时间不会和进度条错位；
+    // * 操作行：左侧「上一条 / 暂停 / 下一条」播放组，右侧「评论 / 画中画 /
+    //   旋转 / 更多」工具组，中间留白把两组分开。
     return _controls(
       Column(
         mainAxisAlignment: MainAxisAlignment.end,
@@ -2507,33 +2624,45 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           ValueListenableBuilder<_PlaybackProgress>(
             valueListenable: _progress,
             builder: (context, progress, _) {
-              return ProgressBar(
-                progress: progress.position,
-                buffered: progress.buffered,
-                total: progress.duration,
-                baseBarColor: const Color(0x33FFFFFF),
-                progressBarColor: Colors.white,
-                bufferedBarColor: Colors.white24,
-                thumbColor: Colors.white,
-                thumbGlowColor: Colors.white24,
-                barHeight: 3.5,
-                thumbRadius: 7,
-                thumbGlowRadius: 25,
-                // RenderProgressBar 只有 onDragStart/onHover 非空时才参与命中
-                // 测试，否则整条进度条点不动。这里给一个空回调，只为了可拖。
-                onDragStart: (_) {},
-                onSeek: (milliseconds) {
-                  _player.position.value = milliseconds ~/ 1000;
-                  // seek 会短暂抢 mpv 解码锁，采样先让开，完成后再恢复。
-                  DiagProbe.suspendSampling();
-                  unawaited(
-                    _player
-                        .seekTo(Duration(milliseconds: milliseconds))
-                        .whenComplete(DiagProbe.resumeSampling),
-                  );
-                  _pushProgress(force: true);
-                  _publishPipState(milliseconds);
-                },
+              return Row(
+                children: [
+                  _timeText(progress.position, Colors.white),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ProgressBar(
+                      progress: progress.position,
+                      buffered: progress.buffered,
+                      total: progress.duration,
+                      // 已播 / 缓冲 / 未播三段颜色拉开，4px 轨道在深色画面上
+                      // 也能看清；拖动时手柄带一圈柔光。
+                      baseBarColor: const Color(0x3DFFFFFF),
+                      progressBarColor: Colors.white,
+                      bufferedBarColor: const Color(0x8AFFFFFF),
+                      thumbColor: Colors.white,
+                      thumbGlowColor: const Color(0x33FFFFFF),
+                      barHeight: 4,
+                      thumbRadius: 6,
+                      thumbGlowRadius: 14,
+                      // RenderProgressBar 只有 onDragStart/onHover 非空时才参与
+                      // 命中测试，否则整条进度条点不动。空回调只为了可拖。
+                      onDragStart: (_) {},
+                      onSeek: (milliseconds) {
+                        _player.position.value = milliseconds ~/ 1000;
+                        // seek 会短暂抢 mpv 解码锁，采样先让开，完成后再恢复。
+                        DiagProbe.suspendSampling();
+                        unawaited(
+                          _player
+                              .seekTo(Duration(milliseconds: milliseconds))
+                              .whenComplete(DiagProbe.resumeSampling),
+                        );
+                        _pushProgress(force: true);
+                        _publishPipState(milliseconds);
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _timeText(progress.duration, Colors.white70),
+                ],
               );
             },
           ),
@@ -2541,11 +2670,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           Row(
             children: [
               ComBtn(
-                icon: const Icon(Icons.skip_previous, color: Colors.white),
+                icon: const Icon(
+                  Icons.skip_previous,
+                  color: Colors.white,
+                  size: 24,
+                ),
                 onTap: () => unawaited(_previous()),
                 tooltip: '上一条',
-                width: 30,
-                height: 30,
+                width: _bottomButtonSize,
+                height: _bottomButtonSize,
               ),
               ValueListenableBuilder<bool>(
                 valueListenable: _isPlaying,
@@ -2553,37 +2686,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                   icon: Icon(
                     playing ? Icons.pause : Icons.play_arrow,
                     color: Colors.white,
+                    size: 26,
                   ),
                   onTap: () => unawaited(_togglePlay()),
                   tooltip: '暂停/继续',
-                  width: 30,
-                  height: 30,
+                  width: _bottomButtonSize,
+                  height: _bottomButtonSize,
                 ),
               ),
               ComBtn(
-                icon: const Icon(Icons.skip_next, color: Colors.white),
+                icon: const Icon(
+                  Icons.skip_next,
+                  color: Colors.white,
+                  size: 24,
+                ),
                 onTap: () => unawaited(_next(source: 'next')),
                 tooltip: '下一条',
-                width: 30,
-                height: 30,
+                width: _bottomButtonSize,
+                height: _bottomButtonSize,
               ),
-              Padding(
-                padding: const EdgeInsets.only(left: 6),
-                child: ValueListenableBuilder<_PlaybackProgress>(
-                  valueListenable: _progress,
-                  builder: (context, progress, _) => Text(
-                    '${DurationUtils.formatDuration(progress.position)}'
-                    ' / '
-                    '${DurationUtils.formatDuration(progress.duration)}',
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontSize: 11,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 4),
-              // 右侧三个入口在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              // 工具组在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
               Expanded(
                 child: Align(
                   alignment: Alignment.centerRight,
@@ -2600,8 +2722,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                           ),
                           onTap: () => _openPanel(_PlayerPanel.comments),
                           tooltip: '评论',
-                          width: 30,
-                          height: 30,
+                          width: _bottomButtonSize,
+                          height: _bottomButtonSize,
+                        ),
+                        ComBtn(
+                          icon: const Icon(
+                            Icons.picture_in_picture_alt,
+                            color: Colors.white,
+                            size: 20,
+                          ),
+                          onTap: () => unawaited(_enterPip()),
+                          tooltip: '画中画',
+                          width: _bottomButtonSize,
+                          height: _bottomButtonSize,
                         ),
                         ComBtn(
                           icon: const Icon(
@@ -2611,8 +2744,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                           ),
                           onTap: _rotateVideo,
                           tooltip: '画面旋转',
-                          width: 30,
-                          height: 30,
+                          width: _bottomButtonSize,
+                          height: _bottomButtonSize,
                         ),
                         ComBtn(
                           icon: const Icon(
@@ -2622,8 +2755,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                           ),
                           onTap: () => _openPanel(_PlayerPanel.more),
                           tooltip: '更多设置',
-                          width: 30,
-                          height: 30,
+                          width: _bottomButtonSize,
+                          height: _bottomButtonSize,
                         ),
                       ],
                     ),
@@ -2633,6 +2766,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  /// 底部按钮统一命中区，图标大小在按钮内单独控制。
+  static const double _bottomButtonSize = 34;
+
+  /// 进度条两端的时间文字。等宽数字，避免播放时整行左右抖动。
+  Widget _timeText(int seconds, Color color) {
+    return Text(
+      DurationUtils.formatDuration(seconds),
+      style: TextStyle(
+        color: color,
+        fontSize: 11,
+        fontFeatures: const [FontFeature.tabularFigures()],
       ),
     );
   }
@@ -2794,6 +2942,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _PlayerPanel.comments => _commentsPanelBody(),
       _PlayerPanel.more => _morePanelBody(),
       _PlayerPanel.quality => _qualityPanelBody(),
+      _PlayerPanel.title => _titlePanelBody(),
     };
     return Positioned.fill(
       child: Stack(
@@ -3159,6 +3308,31 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             dense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 16),
             secondary: const Icon(
+              Icons.aspect_ratio,
+              size: 20,
+              color: Colors.white70,
+            ),
+            title: const Text(
+              '画面填充',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            subtitle: Text(
+              _fillScreen
+                  ? '裁剪铺满 · 竖屏铺满屏幕，横屏保持完整'
+                  : '适应 · 保留完整画面，可能留黑边',
+              style: const TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+            value: _fillScreen,
+            activeThumbColor: Colors.lightBlueAccent,
+            onChanged: (value) {
+              setState(() => _fillScreen = value);
+              unawaited(_persistVideoFit());
+            },
+          ),
+          SwitchListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            secondary: const Icon(
               Icons.picture_in_picture_alt_outlined,
               size: 20,
               color: Colors.white70,
@@ -3194,12 +3368,49 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       ),
     );
   }
+
+  /// 完整文案面板：顶部标题只显示一行，长标题点开这里看全文。
+  Widget _titlePanelBody() {
+    final entry = _current;
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('完整文案'),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SelectableText(
+                  entry.title,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '作者：${entry.author}',
+                  style: const TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 enum _SwipeTarget { brightness, volume }
 
 /// 播放页内嵌面板的类型。
-enum _PlayerPanel { comments, more, quality }
+enum _PlayerPanel { comments, more, quality, title }
 
 /// 评论加载中的占位行，和真实评论保持同一套间距。
 class _CommentSkeletonTile extends StatelessWidget {
