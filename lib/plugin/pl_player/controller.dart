@@ -478,6 +478,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   late int cacheAudioQa = Pref.defaultAudioQa;
   bool enableHeart = true;
   late final String? hwdec = Pref.enableHA ? Pref.hardwareDecoding : null;
+  // Per-source runtime hwdec override (short videos incl. local cache).
+  String? _hwdecOverride;
+  bool? _enableHAOverride;
 
   late final progressType = Pref.btmProgressBehavior;
   late final enableQuickDouble = Pref.enableQuickDouble;
@@ -752,6 +755,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     Volume? volume,
     bool autoFullScreenFlag = false,
     int? rotate,
+    // Per-source hwdec override; short videos rely on VideoToolbox even when
+    // the global hardware-decoding switch is off.
+    bool? enableHardwareAcceleration,
+    String? hwdecOverride,
   }) async {
     try {
       _processing = true;
@@ -763,6 +770,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 每条都要重置：上一条是抖音本地缓存、这一条是网络地址时必须落回来，
       // 否则会带着「这是本地文件」的标记去开网络流（反过来也一样）。
       _isLocalFile = isLocalFile;
+      _hwdecOverride = hwdecOverride;
+      _enableHAOverride = enableHardwareAcceleration;
       _autoPlay = autoplay;
       // 初始化数据加载状态
       dataStatus.value = DataStatus.loading;
@@ -901,9 +910,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _videoController = await VideoController.create(
       player,
       configuration: VideoControllerConfiguration(
-        enableHardwareAcceleration: hwdec != null,
+        enableHardwareAcceleration: _enableHAOverride ?? (hwdec != null),
         androidAttachSurfaceAfterVideoParameters: false,
-        hwdec: hwdec,
+        hwdec: _hwdecOverride ?? hwdec,
       ),
     );
 

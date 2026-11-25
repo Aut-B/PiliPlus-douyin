@@ -31,6 +31,30 @@ const String _kDiagFirstAfterLongIdle = '_diag_first_after_long_idle';
 const String _kNetRetryTag = 'net-retry';
 const String _kNetRecoveredTag = 'net-recovered';
 
+/// scheme://host/path only: never persist query values (access_key etc).
+String _safeUri(Uri uri) {
+  final path = uri.path.isEmpty ? '/' : uri.path;
+  return '${uri.scheme}://${uri.host}$path';
+}
+
+/// HTTP/2 forbids connection-specific headers, while an explicit keep-alive
+/// keeps the h11 pool warm. Keep the base / in-flight request headers aligned
+/// with whichever transport the retry is about to use.
+void _syncConnectionHeader(Map<String, dynamic> headers, bool http2) {
+  String? key;
+  for (final name in headers.keys) {
+    if (name.toLowerCase() == 'connection') {
+      key = name;
+      break;
+    }
+  }
+  if (http2) {
+    if (key != null) headers.remove(key);
+  } else if (key == null) {
+    headers['connection'] = 'keep-alive';
+  }
+}
+
 /// 只读诊断拦截器：请求失败时写一条 `net-fail`，绝不改变重试/超时/鉴权行为。
 ///
 /// 位置必须排在 `RetryInterceptor` 之前：Dio 的 onError 是逆序执行，
@@ -38,6 +62,10 @@ const String _kNetRecoveredTag = 'net-recovered';
 class _NetFailDiagInterceptor extends Interceptor {
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    // Recorded even when diagnostics are off: the pool owner uses it to tell
+    // a concurrent sibling from a retry that already started on a new pool.
+    options.extra[kNetAttemptStartExtra] =
+        DateTime.now().millisecondsSinceEpoch;
     try {
       if (kDiagEnabled) {
         final (msSinceResume, firstAfterResume, firstAfterLongIdle) =
@@ -84,6 +112,12 @@ class _NetFailDiagInterceptor extends Interceptor {
       'firstAfterLongIdle': options.extra[_kDiagFirstAfterLongIdle] == true,
       'hasToken': _hasToken(options),
       'hasCookie': _hasHeader(options.headers, 'cookie'),
+      'rebuilt': options.extra[kNetRebuiltExtra] == true,
+      'transport': options.extra[kNetTransportExtra] ?? Request.transportPath,
+      'generation':
+          options.extra[kNetGenerationExtra] ?? Request.poolGeneration,
+      'switched': options.extra[kNetSwitchedExtra] == true,
+      'escalated': options.extra[kNetEscalatedExtra] == true,
     });
   }
 
@@ -175,9 +209,30 @@ class Request {
   static final _enableHttp2 = Pref.enableHttp2;
   static late final Dio dio;
   static Dio? _http11Dio;
-  static Dio get http11Dio =>
-      _http11Dio ??= _enableHttp2 ? _cloneHttp11Dio() : dio;
+  static Dio get http11Dio {
+    if (!_transportH2) return _http11Dio ?? dio;
+    return _http11Dio ??= _cloneHttp11Dio();
+  }
   factory Request() => _instance;
+
+  /// Transport currently used by [dio]. Reported in `net-rebuild` / `net-fail`.
+  static String get transportPath => _transportH2 ? 'h2' : 'h11';
+
+  /// Bumped every time the connection pool is replaced. A retry log carrying a
+  /// newer generation proves it did not run on the old dead sockets.
+  static int get poolGeneration => _poolGeneration;
+
+  static bool _transportH2 = _enableHttp2;
+  static int _poolGeneration = 0;
+  static int _lastResetAtMs = 0;
+  static int _lastConnectionFailAtMs = 0;
+  static int _connectionFailStreak = 0;
+
+  /// Parallel requests failing on the same dead pool must share one rebuild.
+  static const int _kResetDebounceMs = 500;
+
+  /// Two failures farther apart than this are separate episodes.
+  static const int _kConsecutiveFailWindowMs = 15000;
 
   /// 设置cookie
   static void setCookie() {
@@ -245,10 +300,11 @@ class Request {
   }
 
   static Dio _cloneHttp11Dio() {
-    final h11 = dio.clone(
-      httpClientAdapter:
-          (dio.httpClientAdapter as Http2Adapter).fallbackAdapter,
-    );
+    final current = dio.httpClientAdapter;
+    final h11Adapter = current is Http2Adapter
+        ? current.fallbackAdapter
+        : current as IOHttpClientAdapter;
+    final h11 = dio.clone(httpClientAdapter: h11Adapter);
     final interceptors = h11.interceptors;
     for (var i = 0; i < interceptors.length; i++) {
       final elem = interceptors[i];
@@ -277,7 +333,9 @@ class Request {
     Connectivity().onConnectivityChanged.skip(1).listen(_onConnectivityChanged);
   }
 
-  static (IOHttpClientAdapter, ConnectionManager?) _createPool() {
+  static (IOHttpClientAdapter, ConnectionManager?) _createPool({
+    required bool http2,
+  }) {
     final bool enableSystemProxy;
     late final String systemProxyHost;
     late final int? systemProxyPort;
@@ -301,7 +359,7 @@ class Request {
               ..autoUncompress = false, // Http2Adapter没有自动解压, 统一行为
     );
 
-    final connectionManager = _enableHttp2
+    final connectionManager = http2
         ? ConnectionManager(
             idleTimeout: const Duration(seconds: 15),
             onClientCreate: enableSystemProxy
@@ -322,9 +380,7 @@ class Request {
 
   @pragma('vm:notify-debugger-on-exception')
   static void _resetAdaptersForNetworkChange() {
-    try {
-      _applyPool(_createPool());
-    } catch (_) {}
+    resetConnectionPool(reason: 'connectivity');
   }
 
   /// Force-close the current connection pool / http client and swap in a
@@ -332,25 +388,226 @@ class Request {
   /// pool left behind after a long background idle, and is called both on
   /// connectivity changes and on a dns-class retry.
   @pragma('vm:notify-debugger-on-exception')
-  static void rebuildConnectionPool() {
-    try {
-      _applyPool(_createPool());
-    } catch (_) {}
+  static void rebuildConnectionPool({String reason = 'manual'}) {
+    resetConnectionPool(reason: reason);
   }
 
-  static void _applyPool((IOHttpClientAdapter, ConnectionManager?) pool) {
-    final (h11, connectionManager) = pool;
-    if (connectionManager != null) {
-      (dio.httpClientAdapter as Http2Adapter)
-        ..connectionManager.close(force: true)
-        ..connectionManager = connectionManager
-        ..fallbackAdapter.close(force: true)
-        ..fallbackAdapter = h11;
-      _http11Dio?.httpClientAdapter = h11;
+  /// Called by [RetryInterceptor] before it schedules a retry.
+  static NetResetOutcome handleConnectionReset(
+    DioException err,
+    String reason,
+    int attempt,
+  ) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final sinceLast = _lastResetAtMs == 0 ? null : now - _lastResetAtMs;
+    final attemptStart = err.requestOptions.extra[kNetAttemptStartExtra];
+    // A request that left for the wire before the latest rebuild is a
+    // concurrent sibling of the failure that triggered it: share that one
+    // rebuild instead of rebuilding again for every parallel call on the page.
+    final sibling = _lastResetAtMs > 0 &&
+        (attemptStart is int
+            ? attemptStart < _lastResetAtMs
+            : sinceLast != null && sinceLast < _kResetDebounceMs);
+    if (sibling) {
+      final outcome = NetResetOutcome(
+        rebuilt: false,
+        debounced: true,
+        transport: transportPath,
+        generation: _poolGeneration,
+        consecutive: _connectionFailStreak,
+      );
+      // This retry still runs on the pool as it is now, not on the snapshot
+      // the request was created with.
+      _syncConnectionHeader(
+        err.requestOptions.headers,
+        outcome.transport == 'h2',
+      );
+      _logRebuild(
+        reason,
+        outcome,
+        err,
+        attempt: attempt,
+        sinceLast: sinceLast,
+      );
+      return outcome;
+    }
+
+    var streak = _connectionFailStreak;
+    var observedStreak = streak;
+    var escalated = false;
+    if (reason == 'connection') {
+      if (_lastConnectionFailAtMs == 0 ||
+          now - _lastConnectionFailAtMs > _kConsecutiveFailWindowMs) {
+        streak = 1;
+      } else {
+        streak += 1;
+      }
+      _lastConnectionFailAtMs = now;
+      observedStreak = streak;
+      // The retry on the freshly rebuilt pool also failed: stop hammering the
+      // same transport path and switch to the other one (h11 <-> h2).
+      if (streak >= 2) {
+        escalated = true;
+      }
+      // Persist the streak even on the first failure. Otherwise every call
+      // starts from 0, reaches at most 1, and escalation never happens.
+      _connectionFailStreak = escalated ? 0 : streak;
     } else {
-      dio
-        ..httpClientAdapter.close(force: true)
-        ..httpClientAdapter = h11;
+      _connectionFailStreak = 0;
+      streak = 0;
+      observedStreak = 0;
+    }
+
+    // Respect the user's HTTP/2 setting: only a user who enabled h2 gets the
+    // h11 <-> h2 fallback. With h2 off, a second failure still rebuilds a
+    // fresh h11 pool instead of silently switching transports.
+    final switchTransport = escalated && _enableHttp2;
+    final targetH2 = switchTransport ? !_transportH2 : _transportH2;
+    _lastResetAtMs = now;
+    final outcome = _rebuildNow(
+      targetH2: targetH2,
+      reason: reason,
+      err: err,
+      attempt: attempt,
+      consecutive: observedStreak,
+      switched: targetH2 != _transportH2,
+      escalated: escalated,
+      sinceLast: sinceLast,
+    );
+    _syncConnectionHeader(
+      err.requestOptions.headers,
+      outcome.transport == 'h2',
+    );
+    return outcome;
+  }
+
+  /// Force a rebuild outside a retry (network change / resume warmup).
+  static NetResetOutcome resetConnectionPool({
+    required String reason,
+    DioException? err,
+  }) {
+    _lastResetAtMs = DateTime.now().millisecondsSinceEpoch;
+    _connectionFailStreak = 0;
+    return _rebuildNow(targetH2: _transportH2, reason: reason, err: err);
+  }
+
+  static NetResetOutcome _rebuildNow({
+    required bool targetH2,
+    required String reason,
+    DioException? err,
+    int? attempt,
+    int consecutive = 0,
+    bool switched = false,
+    bool escalated = false,
+    int? sinceLast,
+  }) {
+    final previousTransport = transportPath;
+    final watch = Stopwatch()..start();
+    var ok = false;
+    Object? failure;
+    try {
+      _applyPool(_createPool(http2: targetH2), http2: targetH2);
+      ok = true;
+    } catch (e) {
+      failure = e;
+    }
+    watch.stop();
+    if (ok) _poolGeneration++;
+
+    final outcome = NetResetOutcome(
+      rebuilt: ok,
+      debounced: false,
+      transport: transportPath,
+      generation: _poolGeneration,
+      rebuildMs: watch.elapsedMilliseconds,
+      consecutive: consecutive,
+      switched: switched,
+      escalated: escalated,
+      freshClient: ok,
+    );
+    _logRebuild(
+      reason,
+      outcome,
+      err,
+      previousTransport: previousTransport,
+      attempt: attempt,
+      sinceLast: sinceLast,
+    );
+    if (failure != null) {
+      DiagProbe.log('net-rebuild-error', <String, Object?>{
+        'reason': reason,
+        'error': failure.toString(),
+      });
+    }
+    return outcome;
+  }
+
+  static void _logRebuild(
+    String reason,
+    NetResetOutcome outcome,
+    DioException? err, {
+    String? previousTransport,
+    int? attempt,
+    int? sinceLast,
+  }) {
+    final uri = err?.requestOptions.uri;
+    DiagProbe.log('net-rebuild', <String, Object?>{
+      'reason': reason,
+      'uri': uri == null ? null : _safeUri(uri),
+      'host': uri?.host,
+      'method': err?.requestOptions.method,
+      'attempt': attempt,
+      'debounced': outcome.debounced,
+      'rebuilt': outcome.rebuilt,
+      'switched': outcome.switched,
+      'escalated': outcome.escalated,
+      'freshClient': outcome.freshClient,
+      'previousTransport': previousTransport,
+      'transport': outcome.transport,
+      'switchBlocked': outcome.escalated && !outcome.switched && !_enableHttp2
+          ? 'http2_disabled'
+          : null,
+      'generation': outcome.generation,
+      'rebuildMs': outcome.rebuildMs,
+      'consecutive': outcome.consecutive,
+      'sinceLastResetMs': sinceLast,
+      'dioType': err?.type.name,
+    });
+  }
+
+  static void _applyPool(
+    (IOHttpClientAdapter, ConnectionManager?) pool, {
+    required bool http2,
+  }) {
+    final (newH11, newConnectionManager) = pool;
+    final oldAdapter = dio.httpClientAdapter;
+    final oldH11 = _http11Dio?.httpClientAdapter;
+    final oldFallback =
+        oldAdapter is Http2Adapter ? oldAdapter.fallbackAdapter : null;
+
+    final newAdapter = http2
+        ? Http2Adapter(newConnectionManager!, fallbackAdapter: newH11)
+        : newH11;
+    // Swap first so a retry that starts now cannot land on the dead pool.
+    dio.httpClientAdapter = newAdapter;
+    _http11Dio?.httpClientAdapter = newH11;
+    _transportH2 = http2;
+    _syncPoolConnectionHeader(http2);
+
+    // Drop the old clients after the swap. force:true closes idle and
+    // in-flight sockets, clearing the stale keep-alive pool with them.
+    final oldAdapters = <HttpClientAdapter>{
+      oldAdapter,
+      if (oldFallback != null) oldFallback,
+      if (oldH11 != null) oldH11,
+    };
+    for (final adapter in oldAdapters) {
+      if (identical(adapter, newAdapter) || identical(adapter, newH11)) {
+        continue;
+      }
+      try {
+        adapter.close(force: true);
+      } catch (_) {}
     }
   }
 
@@ -376,12 +633,13 @@ class Request {
       persistentConnection: true,
     );
 
-    final (h11, connectionManager) = _createPool();
+    final (h11, connectionManager) = _createPool(http2: _enableHttp2);
 
     dio = Dio(options)
       ..httpClientAdapter = _enableHttp2
           ? Http2Adapter(connectionManager, fallbackAdapter: h11)
           : h11;
+    _syncPoolConnectionHeader(_enableHttp2);
 
     // 只读诊断，先于重试拦截器入链：onError 逆序，最终失败才会被记录。
     dio.interceptors.add(_NetFailDiagInterceptor());
@@ -393,7 +651,7 @@ class Request {
           dio,
           Pref.retryCount,
           Pref.retryDelay,
-          onDnsReset: (_) => rebuildConnectionPool(),
+          onNetReset: handleConnectionReset,
           log: (tag, fields) => DiagProbe.log(tag, fields),
           retryTag: _kNetRetryTag,
           recoveredTag: _kNetRecoveredTag,
@@ -598,10 +856,18 @@ class Request {
           'dns': isDnsError(e),
           'dioType': e.type.name,
         });
-        rebuildConnectionPool();
+        rebuildConnectionPool(reason: 'resume-warmup');
       }
     } catch (_) {
       // timeout / cancel / anything non-retryable: ignore, let real requests retry.
+    }
+  }
+
+  static void _syncPoolConnectionHeader(bool http2) {
+    _syncConnectionHeader(dio.options.headers, http2);
+    final h11 = _http11Dio;
+    if (h11 != null && !identical(h11.options.headers, dio.options.headers)) {
+      _syncConnectionHeader(h11.options.headers, http2);
     }
   }
 }
