@@ -323,7 +323,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   IconData get _playModeIcon {
     if (_shuffle) return Icons.shuffle;
-    return switch (_repeat) {
+    return _playModeIconFor(_repeat);
+  }
+
+  static IconData _playModeIconFor(PlayRepeat repeat) {
+    return switch (repeat) {
       PlayRepeat.pause => Icons.pause_circle_outline,
       PlayRepeat.listOrder => Icons.format_list_numbered,
       PlayRepeat.singleCycle => Icons.repeat_one,
@@ -1850,31 +1854,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
-  /// 循环切换播放模式：顺序 → 列表循环 → 单个循环 → 播完暂停 →
-  /// 自动连播 → 随机 → 回到顺序。随机也占一个状态，所以按钮永远只显示
-  /// 当前那一种模式，不需要再单独放一个随机开关。
-  void _cyclePlayMode() {
+  /// 打开播放模式选择面板。六种模式一次列全，点哪项切哪项；
+  /// 随机也作为一个普通选项，不再靠反复点击循环过去。
+  void _openPlayModePanel() {
+    _openPanel(_PlayerPanel.playMode);
+  }
+
+  /// 直接应用选中的播放模式并落盘。`null` 表示随机播放。
+  void _selectPlayMode(PlayRepeat? repeat) {
     _prefetchKey = null;
     _prefetchFuture = null;
     setState(() {
-      if (_shuffle) {
-        _shuffle = false;
-        _repeat = PlayRepeat.listOrder;
-      } else if (_repeat == PlayRepeat.listOrder) {
-        _repeat = PlayRepeat.listCycle;
-      } else if (_repeat == PlayRepeat.listCycle) {
-        _repeat = PlayRepeat.singleCycle;
-      } else if (_repeat == PlayRepeat.singleCycle) {
-        _repeat = PlayRepeat.pause;
-      } else if (_repeat == PlayRepeat.pause) {
-        _repeat = PlayRepeat.autoPlayRelated;
-      } else {
+      if (repeat == null) {
         _shuffle = true;
         _repeat = PlayRepeat.listCycle;
         _deck.clear();
         _refillDeck();
+      } else {
+        _shuffle = false;
+        _repeat = repeat;
       }
     });
+    _closePanel();
     unawaited(_persistPlayMode());
     SmartDialog.showToast('播放模式：$_playModeLabel');
     _prefetchNext();
@@ -2572,7 +2573,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               ),
               ComBtn(
                 icon: Icon(_playModeIcon, color: _playModeColor, size: 22),
-                onTap: _cyclePlayMode,
+                onTap: _openPlayModePanel,
                 tooltip: _playModeLabel,
                 width: buttonSize,
                 height: buttonSize,
@@ -2943,6 +2944,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _PlayerPanel.more => _morePanelBody(),
       _PlayerPanel.quality => _qualityPanelBody(),
       _PlayerPanel.title => _titlePanelBody(),
+      _PlayerPanel.playMode => _playModePanelBody(),
     };
     return Positioned.fill(
       child: Stack(
@@ -3236,6 +3238,55 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
+  /// 播放模式：六项平铺，当前项高亮，点选即生效并收起。
+  Widget _playModePanelBody() {
+    final options = <PlayRepeat?>[...PlayRepeat.values, null];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('播放模式'),
+          for (final repeat in options)
+            _playModeTile(
+              repeat: repeat,
+              selected: repeat == null
+                  ? _shuffle
+                  : !_shuffle && repeat == _repeat,
+              onTap: () => _selectPlayMode(repeat),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _playModeTile({
+    required PlayRepeat? repeat,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return ListTile(
+      dense: true,
+      onTap: onTap,
+      leading: Icon(
+        repeat == null ? Icons.shuffle : _playModeIconFor(repeat),
+        size: 20,
+        color: selected ? Colors.lightBlueAccent : Colors.white70,
+      ),
+      title: Text(
+        repeat?.label ?? '随机播放',
+        style: TextStyle(
+          color: selected ? Colors.lightBlueAccent : Colors.white,
+          fontSize: 14,
+          fontWeight: selected ? FontWeight.w500 : FontWeight.w400,
+        ),
+      ),
+      trailing: selected
+          ? const Icon(Icons.check, size: 18, color: Colors.lightBlueAccent)
+          : null,
+    );
+  }
+
   /// 画质：接口没有档位，只显示当前实际使用的「默认」，点开说明原因。
   Widget _qualityPanelBody() {
     return Padding(
@@ -3293,8 +3344,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           _sheetTile(
             icon: _playModeIcon,
             title: '播放模式',
-            subtitle: '$_playModeLabel · 点击切换',
-            onTap: _cyclePlayMode,
+            subtitle: '当前：$_playModeLabel',
+            onTap: _openPlayModePanel,
           ),
           _sheetTile(
             icon: Icons.picture_in_picture_alt_outlined,
@@ -3410,7 +3461,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 enum _SwipeTarget { brightness, volume }
 
 /// 播放页内嵌面板的类型。
-enum _PlayerPanel { comments, more, quality, title }
+enum _PlayerPanel { comments, more, quality, title, playMode }
 
 /// 评论加载中的占位行，和真实评论保持同一套间距。
 class _CommentSkeletonTile extends StatelessWidget {
