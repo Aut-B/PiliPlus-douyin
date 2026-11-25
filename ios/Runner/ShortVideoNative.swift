@@ -114,11 +114,12 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
     case "resolveComments":
       // 收藏接口只回视频元数据，评论要回视频页里拿。这里开一个离屏 WKWebView，
       // 注入只关心评论列表的 hook，页面自己发出的评论请求会被截下来。
-      // 最多等 12 秒；取不到就回空，Dart 侧给「无评论 / 失败」提示和网页入口。
+      // 最多等约 20 秒；取不到就回空，Dart 侧按 login/blocked/network/empty
+      // 给对应提示和网页入口。
       let commentArgs = call.arguments as? [String: Any] ?? [:]
       let commentVideoId = commentArgs["videoId"] as? String ?? ""
       guard !commentVideoId.isEmpty else {
-        result(["comments": [], "reason": "notfound"])
+        result(["comments": [], "reason": "blocked"])
         return
       }
       let limit = commentArgs["limit"] as? Int ?? 40
@@ -2202,20 +2203,28 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
 
 /// 从视频页里取评论。
 ///
-/// 和 `ShortVideoPlayResolver` 一样开离屏 WKWebView，但只截评论接口：
-/// hook 判断响应体里有没有 `"comments"` / `"comment_list"`，有就回传。
-/// 页面自身的评论懒加载依赖点击评论入口，所以轮询里会先点一次评论图标，
-/// 再从 DOM 里兜底读已渲染的评论节点。12 秒还没结果就返回空。
+/// 和 `ShortVideoPlayResolver` 一样开离屏 WKWebView，并强制复用
+/// `WKWebsiteDataStore.default()`：评论接口要看登录态，必须和网页抓取页、
+/// 登录页共用同一罐 cookie。页面脚本在 document start 注入，包住 fetch/XHR，
+/// 只回传评论类响应。
+///
+/// 评论面板是懒加载的：轮询里会反复尝试多种评论入口选择器，点开后滚动
+/// 评论容器 2-3 次触发分页；页面迟迟不出接口时，再用带 cookie 的
+/// URLSession 直接探一次评论 API，最后才读 DOM 兜底。总窗口约 20 秒。
 final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
   WKNavigationDelegate {
 
   private static let handlerName = "shortvideo_comments"
+  private static let mobileUA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
+    + "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    + "Version/15.0 Mobile/15E148 Safari/604.1"
 
   private let videoId: String
   private let platform: String
   private let userAgent: String
   private let limit: Int
-  /// 评论列表；为空时 reason 区分 empty / login / network / notfound。
+  /// 评论列表；为空时 reason 区分 login / blocked / network / empty。
   private let completion: ([[String: Any]], String) -> Void
 
   private var webView: WKWebView?
@@ -2226,6 +2235,9 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
   private var networkError = false
   private var pageLoaded = false
   private var loginDetected = false
+  private var blockedDetected = false
+  private var emptyConfirmed = false
+  private var probeStarted = false
   private var collected: [[String: Any]] = []
   private var seen: Set<String> = []
 
@@ -2246,8 +2258,11 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
 
   func start() {
     let config = WKWebViewConfiguration()
+    // 必须和网页抓取页共用 Default 数据仓，登录 cookie 才会带进评论页。
+    // 换成 nonPersistent 时页面就是未登录视角，评论区基本都加载不出来。
     config.websiteDataStore = .default()
-    config.defaultWebpagePreferences.preferredContentMode = .desktop
+    config.defaultWebpagePreferences.preferredContentMode =
+      platform == "douyin" ? .mobile : .desktop
     let controller = WKUserContentController()
     controller.add(self, name: ShortVideoCommentResolver.handlerName)
     controller.addUserScript(
@@ -2282,18 +2297,20 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
       ]
     }
     return [
+      "https://www.tiktok.com/embed/v2/\(videoId)",
       "https://www.tiktok.com/@i/video/\(videoId)",
       "https://m.tiktok.com/v/\(videoId).html",
     ]
   }
 
   private func effectiveUserAgent() -> String {
-    if userAgent.contains("Mobile") || userAgent.contains("Android") {
-      return userAgent
+    if platform == "douyin" {
+      if userAgent.contains("Mobile") || userAgent.contains("Android") {
+        return userAgent
+      }
+      return ShortVideoCommentResolver.mobileUA
     }
-    if !userAgent.isEmpty {
-      return userAgent
-    }
+    if !userAgent.isEmpty { return userAgent }
     return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       + "AppleWebKit/605.1.15 (KHTML, like Gecko) "
       + "Version/17.4 Safari/605.1.15"
@@ -2306,6 +2323,7 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     else { return }
     pageLoaded = false
     networkError = false
+    probeStarted = false
     var request = URLRequest(url: url)
     request.setValue(effectiveUserAgent(), forHTTPHeaderField: "User-Agent")
     let referer = platform == "douyin"
@@ -2316,14 +2334,75 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     web.load(request)
   }
 
+  /// 页面自己的评论请求可能因为滚动/点击没触发而完全不来。这里用页面同一罐
+  /// cookie 直接探一次公开评论接口，拿到了就照样交给统一的解析器。
+  private func probeCommentsAPI() {
+    for text in apiProbeURLs() {
+      guard let url = URL(string: text) else { continue }
+      var request = URLRequest(url: url)
+      request.timeoutInterval = 8
+      request.setValue(effectiveUserAgent(), forHTTPHeaderField: "User-Agent")
+      request.setValue(
+        platform == "douyin" ? "https://www.douyin.com/" : "https://www.tiktok.com/",
+        forHTTPHeaderField: "Referer"
+      )
+      request.setValue(
+        "application/json, text/plain, */*",
+        forHTTPHeaderField: "Accept"
+      )
+      WKWebsiteDataStore.default().httpCookieStore.getAllCookies {
+        [weak self] cookies in
+        guard let self = self, !self.finished else { return }
+        let domain = self.platform == "douyin" ? "douyin.com" : "tiktok.com"
+        let picked = cookies.filter { $0.domain.contains(domain) }
+        var req = request
+        if let cookie = HTTPCookie.requestHeaderFields(with: picked)["Cookie"],
+           !cookie.isEmpty {
+          req.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, error in
+          guard let self = self, !self.finished, error == nil,
+                let data = data, data.count > 8, data.count < 4_000_000,
+                let body = String(data: data, encoding: .utf8),
+                ShortVideoCommentResolver.containsCommentList(body) else {
+            return
+          }
+          DispatchQueue.main.async {
+            guard !self.finished else { return }
+            self.consume(body, trustedEmpty: true)
+          }
+        }.resume()
+      }
+    }
+  }
+
+  private func apiProbeURLs() -> [String] {
+    if platform == "douyin" {
+      return [
+        "https://www.iesdouyin.com/web/api/v2/comment/list/"
+          + "?aweme_id=\(videoId)&cursor=0&count=20&aid=1128",
+        "https://www.douyin.com/aweme/v1/web/comment/list/"
+          + "?aweme_id=\(videoId)&cursor=0&count=20&aid=6383"
+          + "&device_platform=webapp&version_code=170400",
+      ]
+    }
+    return [
+      "https://www.tiktok.com/api/comment/list/"
+        + "?aweme_id=\(videoId)&count=20&cursor=0&aid=1988",
+    ]
+  }
+
   private func poll() {
     guard !finished, let web = webView else { return }
     ticks += 1
-    if ticks >= 12 {
+    // 评论面板要等页面渲染、点击、分页，12 秒经常不够；放宽到约 20 秒。
+    if ticks >= 20 {
       finish(reason: collected.isEmpty ? failureReason() : "")
       return
     }
-    if collected.isEmpty, ticks == 5 || ticks == 9 {
+    // 桌面页被登录墙 / 风控挡住时，第 8、15 秒换候选页再试：
+    // 抖音 www → iesdouyin/share → m.douyin/share；TikTok embed → 主页 → 移动版。
+    if collected.isEmpty, ticks == 8 || ticks == 15 {
       let next = candidate + 1
       if next < pages().count {
         candidate = next
@@ -2331,10 +2410,24 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
         return
       }
     }
+    if !probeStarted, pageLoaded, ticks >= 2 {
+      probeStarted = true
+      probeCommentsAPI()
+    }
     // 接口 hook 到第 8 拍仍未收到任何评论：允许 DOM 兜底（只此一次置位，
     // 之后 pollScript 才会读 DOM，且不参与 limit 早退，见 consume）。
-    if collected.isEmpty, ticks == 8 {
+    if collected.isEmpty, ticks == 12 {
       web.evaluateJavaScript("window.__piliCommentDomFallback = true;")
+    }
+    if ticks % 2 == 0 {
+      web.evaluateJavaScript(ShortVideoCommentResolver.statusScript) {
+        [weak self] value, _ in
+        guard let self = self, !self.finished else { return }
+        guard let state = value as? String else { return }
+        if state == "login" { self.loginDetected = true }
+        if state == "blocked" { self.blockedDetected = true }
+        if state == "empty" { self.emptyConfirmed = true }
+      }
     }
     web.evaluateJavaScript(ShortVideoCommentResolver.pollScript) {
       [weak self] value, _ in
@@ -2344,31 +2437,43 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     }
   }
 
-  private func consume(_ text: String) {
+  private func consume(_ text: String, trustedEmpty: Bool = false) {
     // pollScript 的 DOM 兜底结果带 `dom: true` 标记：只允许在接口一条都没
     // 收到时采用，且绝不因凑够 limit 提前结束（避免把 DOM 的兜底行混进
-    // 接口结果、或提前关掉 12 秒窗口）。
+    // 接口结果、或提前关掉 20 秒窗口）。
     let isDom = text.contains("\"dom\":true")
     if isDom, !collected.isEmpty { return }
+    let hasCommentList = ShortVideoCommentResolver.containsCommentList(text)
     let parsed = ShortVideoCommentResolver.parse(text: text, limit: limit)
     if parsed.isEmpty {
       let lower = text.lowercased()
       if lower.contains("captcha") || lower.contains("verify-center")
-        || lower.contains("passport") {
+        || lower.contains("verify_center") || lower.contains("安全验证")
+        || lower.contains("访问过于频繁") || lower.contains("访问频繁") {
+        blockedDetected = true
+      }
+      if lower.contains("passport") || lower.contains("login")
+        || lower.contains("登录") {
         loginDetected = true
       }
+      // 只有主动探到的评论接口空数组才算「确认无评论」；页面详情 JSON 里
+      // 也可能带空的 comments 字段，不能据此误报「暂无评论」。
+      if hasCommentList, trustedEmpty { emptyConfirmed = true }
       return
     }
     for item in parsed {
       guard collected.count < limit else { break }
       let author = item["author"] as? String ?? ""
       let body = item["text"] as? String ?? ""
-      let key = "\(author)|\(body)"
+      let time = item["time"] as? Int ?? 0
+      let id = item["id"] as? String ?? ""
+      let key = id.isEmpty ? "\(author)|\(body)|\(time)" : "cid:\(id)"
       if seen.insert(key).inserted {
         collected.append(item)
       }
     }
-    // DOM 兜底不参与「凑够即结束」，让 12 秒窗口跑满再收尾。
+    if hasCommentList, !isDom { emptyConfirmed = false }
+    // DOM 兜底不参与「凑够即结束」，让 20 秒窗口跑满再收尾。
     if !isDom, collected.count >= limit {
       finish(reason: "")
     }
@@ -2376,8 +2481,12 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
 
   private func failureReason() -> String {
     if loginDetected { return "login" }
-    if !pageLoaded { return networkError ? "network" : "notfound" }
-    return "empty"
+    if blockedDetected { return "blocked" }
+    if !pageLoaded { return networkError ? "network" : "blocked" }
+    if emptyConfirmed { return "empty" }
+    // 页面打开了却始终没等到评论接口，也没有明确的「暂无评论」文案：
+    // 按风控/登录墙处理，比误报「暂无评论」更有用。
+    return "blocked"
   }
 
   private func finish(reason: String) {
@@ -2391,7 +2500,7 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
       .removeScriptMessageHandler(forName: ShortVideoCommentResolver.handlerName)
     webView = nil
     let comments = collected
-    let detail = comments.isEmpty ? (reason.isEmpty ? "empty" : reason) : ""
+    let detail = comments.isEmpty ? (reason.isEmpty ? "blocked" : reason) : ""
     let done = completion
     DispatchQueue.main.async {
       done(comments, detail)
@@ -2405,14 +2514,20 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     pageLoaded = true
     webView.evaluateJavaScript(
       "(function () { return (location.href || '') + '\\n' "
-        + "+ (document.title || ''); })()"
+        + "+ (document.title || '') + '\\n' "
+        + "+ ((document.body && document.body.innerText) || '').slice(0, 3000); })()"
     ) { [weak self] value, _ in
       guard let self = self, !self.finished else { return }
       guard let text = value as? String else { return }
       let lower = text.lowercased()
       if lower.contains("login") || lower.contains("passport")
-        || lower.contains("signin") {
+        || lower.contains("signin") || lower.contains("登录后")
+        || lower.contains("请先登录") {
         self.loginDetected = true
+      }
+      if lower.contains("captcha") || lower.contains("verify-center")
+        || lower.contains("访问过于频繁") || lower.contains("安全验证") {
+        self.blockedDetected = true
       }
     }
   }
@@ -2436,7 +2551,7 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
   private func handleNavigationFailure() {
     guard !finished else { return }
     networkError = true
-    if candidate + 1 < pages().count, ticks < 9 {
+    if candidate + 1 < pages().count, ticks < 15 {
       candidate += 1
       load(candidate: candidate)
     }
@@ -2467,15 +2582,24 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     if (window.__piliCommentHook) { return; }
     window.__piliCommentHook = true;
     var HANDLER = 'shortvideo_comments';
-    function interesting(text) {
-      if (!text || text.length < 40) { return false; }
-      return text.indexOf('"comments"') >= 0
+    function interesting(url, text) {
+      if (!text || text.length < 12) { return false; }
+      var marker = text.indexOf('"comments"') >= 0
         || text.indexOf('"comment_list"') >= 0
         || text.indexOf('"commentList"') >= 0;
+      if (!marker) { return false; }
+      var u = String(url || '').toLowerCase();
+      if (u && u.indexOf('comment') < 0 && u.indexOf('reply') < 0) {
+        // 收藏/详情 JSON 里也可能夹着空的 comments 字段，只认评论接口，
+        // 或至少带有评论条目特征字段的响应体。
+        return text.indexOf('"digg_count"') >= 0
+          || text.indexOf('"create_time"') >= 0;
+      }
+      return true;
     }
     function post(url, text) {
       try {
-        if (!interesting(text)) { return; }
+        if (!interesting(url, text)) { return; }
         window.webkit.messageHandlers[HANDLER].postMessage({
           url: String(url || ''),
           body: text
@@ -2531,28 +2655,108 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
   })();
   """#
 
-  /// 点开评论入口，然后优先读接口已抓到的内容；接口没触发时读 DOM 兜底。
-  private static let pollScript = #"""
+  /// 登录墙 / 风控 / 明确空态的信号，供 Swift 区分失败原因。
+  private static let statusScript = #"""
   (function () {
     try {
+      var body = document.body ? (document.body.innerText || '') : '';
+      var text = ((location.href || '') + ' '
+        + (document.title || '') + ' ' + body).toLowerCase();
+      if (/登录后|请先登录|扫码登录|立即登录|log ?in to|sign ?in to/
+        .test(text)) { return 'login'; }
+      if (/captcha|verify-center|verify_center|安全验证|访问过于频繁|访问频繁|机器人验证/
+        .test(text)) { return 'blocked'; }
+      if (/暂无评论|还没有评论|还没有人评论|暂时没有评论|快来评论|抢首评|be the first to comment|no comments yet/
+        .test(text)) { return 'empty'; }
+    } catch (e) {}
+    return '';
+  })()
+  """#
+
+  /// 点开评论入口、滚动评论容器触发分页，然后优先读接口已抓到的内容；
+  /// 接口始终没触发时才读 DOM 兜底。
+  private static let pollScript = #"""
+  (function () {
+    function visible(el) {
+      try {
+        if (!el || !el.getBoundingClientRect) { return false; }
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      } catch (e) { return false; }
+    }
+    try {
       if (!window.__piliCommentClicked) {
-        var trigger = document.querySelector(
-          '[data-e2e="comment-icon"], [data-e2e="feed-comment-icon"], '
-          + '[data-e2e="comment-count"]'
+        var selectors = [
+          '[data-e2e="comment-icon"]',
+          '[data-e2e="comment-count"]',
+          '[data-e2e="feed-comment-icon"]',
+          '[data-e2e="video-comment-icon"]',
+          '[data-e2e="comment"]',
+          '[aria-label*="评论"]',
+          '[aria-label*="Comment"]',
+          '[class*="comment-icon"]'
+        ];
+        for (var s = 0; s < selectors.length; s++) {
+          var trigger = document.querySelector(selectors[s]);
+          if (trigger && visible(trigger)) {
+            trigger.click();
+            window.__piliCommentClicked = true;
+            return '';
+          }
+        }
+        var nodes = document.querySelectorAll(
+          'button, [role="button"], a, span, div'
         );
-        if (trigger) {
-          window.__piliCommentClicked = true;
-          trigger.click();
+        var checked = 0;
+        for (var i = 0; i < nodes.length && checked < 800; i++) {
+          var raw = (nodes[i].innerText || '').trim();
+          if (!raw || raw.length > 12) { continue; }
+          checked++;
+          if (raw === '评论' || raw === '查看评论' || raw === '全部评论'
+            || raw === '评论 '
+            || (raw.indexOf('评论') === 0 && raw.length <= 6)) {
+            if (visible(nodes[i])) {
+              nodes[i].click();
+              window.__piliCommentClicked = true;
+              return '';
+            }
+          }
         }
       }
     } catch (e) {}
     try {
-      var height = document.body ? document.body.scrollHeight : 0;
-      if (height > window.innerHeight) {
-        window.scrollTo(0, Math.min(height, window.scrollY + 800));
+      if (window.__piliCommentClicked) {
+        var step = window.__piliCommentScrollStep || 0;
+        var now = Date.now();
+        if (step < 3 && now - (window.__piliCommentScrollAt || 0) > 1100) {
+          var target = null;
+          var list = document.querySelectorAll(
+            '[class*="comment"] , [data-e2e*="comment"], div, section'
+          );
+          for (var j = 0; j < list.length && j < 1200; j++) {
+            var el = list[j];
+            if (el.scrollHeight > el.clientHeight + 100
+              && el.clientHeight > 120) {
+              target = el;
+              break;
+            }
+          }
+          if (!target) {
+            target = document.scrollingElement || document.body;
+          }
+          if (target) {
+            target.scrollTop = target.scrollTop
+              + Math.max(260, target.clientHeight * 0.85);
+            try {
+              window.scrollBy(0, Math.max(220, window.innerHeight * 0.6));
+            } catch (e) {}
+            window.__piliCommentScrollStep = step + 1;
+            window.__piliCommentScrollAt = now;
+          }
+        }
       }
     } catch (e) {}
-    // DOM 兜底只在接口 hook 一条都没收到时启用（Swift 在 ticks>=8 且
+    // DOM 兜底只在接口 hook 一条都没收到时启用（Swift 在 12 秒时且
     // collected 为空时置 __piliCommentDomFallback）。否则会和接口结果
     // 混在一起，产生「匿名用户」重复行并提前触发 limit。
     try {
@@ -2568,12 +2772,15 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
             var nick = '';
             var likes = 0;
             var body = '';
+            var avatar = '';
             try {
               var n = node.querySelector(
                 '[data-e2e*="username"], [class*="username"], '
                 + '[class*="nickname"], [class*="user-name"]'
               );
               if (n) { nick = (n.innerText || '').trim(); }
+              var img = node.querySelector('img');
+              if (img) { avatar = img.currentSrc || img.src || ''; }
               var l = node.querySelector(
                 '[data-e2e*="like"],[class*="like-count"],[class*="likeCount"]'
               );
@@ -2593,7 +2800,13 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
               body = (node.innerText || '').trim();
             }
             if (body) {
-              out.push({ author: nick, text: body, likes: likes, time: 0 });
+              out.push({
+                author: nick,
+                text: body,
+                likes: likes,
+                time: 0,
+                avatar: avatar
+              });
             }
           }
           if (out.length) {
@@ -2604,10 +2817,15 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
     } catch (e) {}
     try {
       if (!window.__piliCommentRehydrationChecked) {
-        var el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
-        if (el && el.textContent) {
-          window.__piliCommentRehydrationChecked = true;
-          var data = el.textContent;
+        window.__piliCommentRehydrationChecked = true;
+        var ids = [
+          '__UNIVERSAL_DATA_FOR_REHYDRATION__',
+          '__NEXT_DATA__',
+          '__INITIAL_STATE__'
+        ];
+        for (var k = 0; k < ids.length; k++) {
+          var el = document.getElementById(ids[k]);
+          var data = el && el.textContent ? el.textContent : '';
           if (data.length > 100 && data.length < 8000000
             && (data.indexOf('"comments"') >= 0
               || data.indexOf('"comment_list"') >= 0
@@ -2652,7 +2870,10 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
                 let comment = makeComment(item) else { continue }
           let author = comment["author"] as? String ?? ""
           let body = comment["text"] as? String ?? ""
-          if seen.insert("\(author)|\(body)").inserted {
+          let time = comment["time"] as? Int ?? 0
+          let id = comment["id"] as? String ?? ""
+          let key = id.isEmpty ? "\(author)|\(body)|\(time)" : "cid:\(id)"
+          if seen.insert(key).inserted {
             out.append(comment)
           }
         }
@@ -2682,19 +2903,60 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
       ?? stringValue(user?["name"])
       ?? stringValue(item["author"])
       ?? ""
+    let avatar = avatarURL(user) ?? ""
     let likes = intValue(item["digg_count"])
       ?? intValue(item["like_count"])
       ?? intValue(item["likes"])
       ?? 0
-    let time = intValue(item["create_time"])
+    var time = intValue(item["create_time"])
       ?? intValue(item["createTime"])
       ?? 0
+    if time > 10_000_000_000 { time /= 1000 }
+    let id = stringValue(item["cid"])
+      ?? stringValue(item["comment_id"])
+      ?? stringValue(item["id"])
+      ?? ""
     return [
+      "id": id,
       "author": author,
       "text": text,
       "likes": likes,
       "time": time,
+      "avatar": avatar,
     ]
+  }
+
+  /// `avatar_thumb.url_list[0]` 是抖音/TikTok 评论接口的通用结构；
+  /// 有些版本直接给字符串或 `url`，这里一起兼容。
+  private static func avatarURL(_ user: [String: Any]?) -> String? {
+    guard let user = user else { return nil }
+    let keys = [
+      "avatar_thumb", "avatar_medium", "avatar_larger",
+      "avatarThumb", "avatarMedium", "avatarLarger",
+    ]
+    for key in keys {
+      if let dict = user[key] as? [String: Any] {
+        for listKey in ["url_list", "urlList"] {
+          if let list = dict[listKey] as? [String],
+             let first = list.first(where: { !$0.isEmpty }) {
+            return first
+          }
+        }
+        if let url = stringValue(dict["url"]), url.hasPrefix("http") {
+          return url
+        }
+      }
+      if let text = stringValue(user[key]), text.hasPrefix("http") {
+        return text
+      }
+    }
+    return nil
+  }
+
+  private static func containsCommentList(_ text: String) -> Bool {
+    text.contains("\"comments\"")
+      || text.contains("\"comment_list\"")
+      || text.contains("\"commentList\"")
   }
 
   private static func stringValue(_ value: Any?) -> String? {

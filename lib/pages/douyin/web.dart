@@ -228,14 +228,14 @@ abstract final class ShortVideoWeb {
   static final Map<String, String> _commentErrorCache = {};
 
   /// 最近一次评论抓取失败的原因：
-  /// `network`（网络）/ `login`（需要登录）/ `empty`（页面没有评论）/
-  /// `notfound`（页面没打开或接口没触发）。
+  /// `network`（网络）/ `login`（需要登录）/ `blocked`（风控或接口没响应）/
+  /// `empty`（确认没有评论）。
   static String lastCommentError = '';
 
   /// 让原生开一个离屏视频页，截取评论接口的响应并解析成评论列表。
   ///
   /// 收藏接口本身只有视频元数据，评论必须回到 `www.douyin.com/video/<id>`
-  /// （或 TikTok 的视频页）里拿。原生侧最多等 12 秒；这里只负责通道和缓存。
+  /// （或 TikTok 的视频页）里拿。原生侧最多等约 20 秒；这里只负责通道和缓存。
   static Future<List<ShortVideoComment>> resolveComments({
     required String platformId,
     required String videoId,
@@ -245,16 +245,19 @@ abstract final class ShortVideoWeb {
   }) async {
     lastCommentError = '';
     if (videoId.isEmpty) {
-      lastCommentError = 'notfound';
+      lastCommentError = 'blocked';
       return const [];
     }
     final cacheKey = '$platformId:$videoId';
     final at = _commentAt[cacheKey];
-    if (!force &&
-        at != null &&
-        DateTime.now().difference(at) < const Duration(minutes: 10)) {
+    if (!force && at != null) {
       final cached = _commentCache[cacheKey];
-      if (cached != null) {
+      final age = DateTime.now().difference(at);
+      // 失败结果只缓存 45 秒，避免风控/接口抖动后十分钟都翻不了身。
+      final ttl = cached != null && cached.isEmpty
+          ? const Duration(seconds: 45)
+          : const Duration(minutes: 10);
+      if (cached != null && age < ttl) {
         lastCommentError = _commentErrorCache[cacheKey] ?? '';
         return cached;
       }
@@ -268,7 +271,7 @@ abstract final class ShortVideoWeb {
             'userAgent': userAgent,
             'limit': limit,
           })
-          .timeout(const Duration(seconds: 16));
+          .timeout(const Duration(seconds: 26));
       final list = <ShortVideoComment>[];
       var reason = '';
       if (raw is Map) {
@@ -285,7 +288,7 @@ abstract final class ShortVideoWeb {
       _commentCache[cacheKey] = list;
       _commentAt[cacheKey] = DateTime.now();
       if (list.isEmpty) {
-        lastCommentError = reason.isEmpty ? 'notfound' : reason;
+        lastCommentError = _commentReason(reason);
         _commentErrorCache[cacheKey] = lastCommentError;
         return const [];
       }
@@ -294,6 +297,18 @@ abstract final class ShortVideoWeb {
     } catch (_) {
       lastCommentError = 'network';
       return const [];
+    }
+  }
+
+  static String _commentReason(String reason) {
+    switch (reason) {
+      case 'login':
+      case 'blocked':
+      case 'network':
+      case 'empty':
+        return reason;
+      default:
+        return 'blocked';
     }
   }
 
@@ -426,11 +441,13 @@ class ShortVideoComment {
     required this.text,
     this.likes = 0,
     this.time = 0,
+    this.avatar = '',
   });
 
   final String author;
   final String text;
   final int likes;
+  final String avatar;
 
   /// 平台返回的 `create_time`，单位是秒；0 表示未知。
   final int time;
@@ -444,10 +461,11 @@ class ShortVideoComment {
     final likes = raw['likes'];
     final time = raw['time'];
     return ShortVideoComment(
-      author: '${raw['author'] ?? ''}',
+      author: '${raw['author'] ?? ''}'.trim(),
       text: text,
       likes: likes is num ? likes.toInt() : 0,
       time: time is num ? time.toInt() : 0,
+      avatar: '${raw['avatar'] ?? ''}'.trim(),
     );
   }
 }

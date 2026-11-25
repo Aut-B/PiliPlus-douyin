@@ -209,6 +209,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   String _commentsKey = '';
   int _commentsSession = 0;
 
+  /// 评论面板顶部的视频文案默认展开，点一下折叠。
+  bool _commentCaptionExpanded = true;
+
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
       ValueNotifier<_GestureHint?>(null);
@@ -2879,6 +2882,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _commentsLoading = false;
     _commentsError = '';
     _commentsKey = '';
+    _commentCaptionExpanded = true;
   }
 
   /// 打开评论面板时抓一次评论。同一条视频的加载中/成功结果直接复用，
@@ -2925,7 +2929,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _comments = list;
       _commentsError = list.isEmpty
           ? (ShortVideoWeb.lastCommentError.isEmpty
-                ? 'notfound'
+                ? 'blocked'
                 : ShortVideoWeb.lastCommentError)
           : '';
     });
@@ -2988,26 +2992,82 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final shareUrl = bvid.isNotEmpty
         ? 'https://www.bilibili.com/video/$bvid'
         : (videoId.isEmpty ? '' : platform.shareUrl(videoId));
+    final header = _comments.isNotEmpty ? '评论 · ${_comments.length}' : '评论';
     return SizedBox(
       height: MediaQuery.sizeOf(context).height * 0.62,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
         child: Column(
           children: [
-            _sheetHeader('评论'),
-            const SizedBox(height: 4),
-            Text(
-              entry.title,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            const SizedBox(height: 10),
+            _sheetHeader(header),
+            _commentCaption(entry.title),
+            const SizedBox(height: 8),
             Expanded(
               child: _commentsBody(platform: platform, shareUrl: shareUrl),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// 视频文案放在评论列表上方，明确标注，可点击折叠。
+  Widget _commentCaption(String title) {
+    final text = title.trim();
+    if (text.isEmpty) return const SizedBox.shrink();
+    return Material(
+      color: const Color(0xFF232323),
+      borderRadius: BorderRadius.circular(8),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () =>
+            setState(() => _commentCaptionExpanded = !_commentCaptionExpanded),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 8, 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: const Color(0x332F9BFF),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Text(
+                  '视频文案',
+                  style: TextStyle(
+                    color: Color(0xFF7FC4FF),
+                    fontSize: 9,
+                    height: 1.5,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  text,
+                  maxLines: _commentCaptionExpanded ? 3 : 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              Padding(
+                padding: const EdgeInsets.only(top: 1),
+                child: Icon(
+                  _commentCaptionExpanded
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
+                  size: 16,
+                  color: Colors.white38,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -3025,22 +3085,30 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         separatorBuilder: (context, index) => const Divider(
           height: 1,
           thickness: 0.5,
-          color: Color(0x1FFFFFFF),
+          color: Color(0x14FFFFFF),
         ),
         itemBuilder: (context, index) => _commentTile(_comments[index]),
       );
     }
+    return _commentsStatusBody(platform: platform, shareUrl: shareUrl);
+  }
+
+  Widget _commentsStatusBody({
+    required ShortVideoPlatform platform,
+    required String shareUrl,
+  }) {
+    final reason = _commentsError;
+    final login = reason == 'login';
     return Center(
       child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(vertical: 12),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              _commentsError == 'unsupported'
-                  ? Icons.block
-                  : Icons.chat_bubble_outline,
+              _commentsStatusIcon(reason),
               size: 32,
-              color: Colors.white24,
+              color: login ? const Color(0xFF7FC4FF) : Colors.white24,
             ),
             const SizedBox(height: 8),
             Text(
@@ -3048,23 +3116,30 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               style: const TextStyle(color: Colors.white70, fontSize: 14),
             ),
             const SizedBox(height: 6),
-            Text(
-              _commentsHint(platform.album),
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white38, fontSize: 11),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                _commentsHint(platform.album),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white38,
+                  fontSize: 11,
+                  height: 1.5,
+                ),
+              ),
             ),
             const SizedBox(height: 16),
             if (shareUrl.isNotEmpty)
               OutlinedButton.icon(
                 onPressed: () => unawaited(_openCommentPage(shareUrl)),
                 icon: const Icon(Icons.open_in_browser, size: 16),
-                label: const Text('在浏览器中打开该视频'),
+                label: Text(login ? '去网页登录 / 打开视频页' : '在浏览器中打开该视频'),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: Colors.white70,
                   side: const BorderSide(color: Color(0x33FFFFFF)),
                 ),
               ),
-            if (_commentsError != 'unsupported')
+            if (reason != 'unsupported')
               TextButton(
                 onPressed: () => unawaited(_ensureComments(force: true)),
                 child: const Text('重新加载'),
@@ -3073,6 +3148,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       ),
     );
+  }
+
+  IconData _commentsStatusIcon(String reason) {
+    return switch (reason) {
+      'login' => Icons.lock_outline,
+      'blocked' => Icons.shield_outlined,
+      'network' => Icons.wifi_off,
+      'unsupported' => Icons.block,
+      _ => Icons.chat_bubble_outline,
+    };
   }
 
   Widget _commentsLoadingBody() {
@@ -3085,7 +3170,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
         const SizedBox(height: 8),
         const Text(
-          '正在从视频页读取评论…',
+          '正在从视频页读取评论，通常需要 5–20 秒…',
           style: TextStyle(color: Colors.white38, fontSize: 11),
         ),
         const SizedBox(height: 10),
@@ -3109,14 +3194,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          CircleAvatar(
-            radius: 15,
-            backgroundColor: const Color(0xFF2A2A2A),
-            child: Text(
-              _avatarText(comment.authorText),
-              style: const TextStyle(color: Colors.white70, fontSize: 13),
-            ),
-          ),
+          _commentAvatar(comment),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -3124,18 +3202,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               children: [
                 Row(
                   children: [
-                    Expanded(
+                    Flexible(
                       child: Text(
                         comment.authorText,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 12,
+                          color: Colors.white,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w500,
+                          height: 1.4,
                         ),
                       ),
                     ),
-                    if (time.isNotEmpty)
+                    if (time.isNotEmpty) ...[
+                      const SizedBox(width: 8),
                       Text(
                         time,
                         style: const TextStyle(
@@ -3143,38 +3224,77 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                           fontSize: 10,
                         ),
                       ),
+                    ],
                   ],
                 ),
-                const SizedBox(height: 4),
+                const SizedBox(height: 5),
                 Text(
                   comment.text,
                   style: const TextStyle(
-                    color: Colors.white,
+                    color: Color(0xFFE6E6E6),
                     fontSize: 13,
-                    height: 1.4,
+                    height: 1.45,
                   ),
                 ),
               ],
             ),
           ),
           if (likes.isNotEmpty) ...[
-            const SizedBox(width: 8),
-            Column(
-              children: [
-                const Icon(
-                  Icons.favorite_border,
-                  size: 14,
-                  color: Colors.white38,
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  likes,
-                  style: const TextStyle(color: Colors.white38, fontSize: 10),
-                ),
-              ],
+            const SizedBox(width: 10),
+            Padding(
+              padding: const EdgeInsets.only(top: 1),
+              child: Column(
+                children: [
+                  const Icon(
+                    Icons.favorite_border,
+                    size: 13,
+                    color: Colors.white38,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    likes,
+                    style: const TextStyle(
+                      color: Colors.white38,
+                      fontSize: 10,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  Widget _commentAvatar(ShortVideoComment comment) {
+    final fallback = CircleAvatar(
+      radius: 16,
+      backgroundColor: const Color(0xFF2F2F2F),
+      child: Text(
+        _avatarText(comment.authorText),
+        style: const TextStyle(color: Colors.white70, fontSize: 13),
+      ),
+    );
+    final uri = Uri.tryParse(comment.avatar);
+    if (uri == null || !(uri.isScheme('http') || uri.isScheme('https'))) {
+      return fallback;
+    }
+    return ClipOval(
+      child: Image.network(
+        uri.toString(),
+        width: 32,
+        height: 32,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => fallback,
+        loadingBuilder: (context, child, progress) {
+          if (progress == null) return child;
+          return Container(
+            width: 32,
+            height: 32,
+            color: const Color(0xFF2A2A2A),
+          );
+        },
       ),
     );
   }
@@ -3207,21 +3327,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   String _commentsEmptyTitle() {
-    if (_commentsError == 'unsupported') return '无法读取评论';
-    if (_commentsError == 'login' ||
-        _commentsError == 'network' ||
-        _commentsError == 'notfound') {
-      return '评论加载失败';
-    }
-    return '该视频暂无评论';
+    return switch (_commentsError) {
+      'unsupported' => '无法读取评论',
+      'login' => '需要先登录',
+      'blocked' => '评论被平台拦截',
+      'network' => '评论加载失败',
+      'empty' => '暂无评论',
+      _ => '暂无评论',
+    };
   }
 
   String _commentsHint(String album) {
     return switch (_commentsError) {
-      'login' => '需要先在网页抓取里登录$album，才能读到评论。',
-      'network' => '网络不稳定，评论加载失败，可稍后重试。',
+      'login' => '请在网页里登录$album，登录态会共享给评论抓取；登录后再点重新加载。',
+      'blocked' => '评论接口没有返回数据，可能触发了平台风控；可以稍后重试，或直接去网页里看。',
+      'network' => '网络不稳定，或视频页没能打开，请检查网络后重试。',
       'unsupported' => '当前只抓抖音 / TikTok 的评论，可先去网页查看。',
-      'notfound' => '没等到评论接口，可能被平台风控拦截，可去网页里看。',
+      'empty' => '这条视频还没有人评论，去抢个沙发吧。',
       _ => '平台没有公开评论，或这条视频还没有人评论。',
     };
   }
