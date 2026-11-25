@@ -287,18 +287,25 @@ class ShortVideo {
     return '${total ~/ 60}:${(total % 60).toString().padLeft(2, '0')}';
   }
 
-  ShortVideo copyWith({String? playUrl, String? videoId, double? updatedAt}) =>
-      ShortVideo(
-        id: id,
-        platform: platform,
-        desc: desc,
-        author: author,
-        cover: cover,
-        durationMs: durationMs,
-        playUrl: playUrl ?? this.playUrl,
-        videoId: videoId ?? this.videoId,
-        updatedAt: updatedAt ?? this.updatedAt,
-      );
+  ShortVideo copyWith({
+    String? desc,
+    String? author,
+    String? cover,
+    int? durationMs,
+    String? playUrl,
+    String? videoId,
+    double? updatedAt,
+  }) => ShortVideo(
+    id: id,
+    platform: platform,
+    desc: desc ?? this.desc,
+    author: author ?? this.author,
+    cover: cover ?? this.cover,
+    durationMs: durationMs ?? this.durationMs,
+    playUrl: playUrl ?? this.playUrl,
+    videoId: videoId ?? this.videoId,
+    updatedAt: updatedAt ?? this.updatedAt,
+  );
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -340,6 +347,25 @@ class ShortVideo {
     if (playUrl.toLowerCase().contains('tiktok')) return 'tiktok';
     return 'douyin';
   }
+}
+
+/// 原生重新解析直链时顺手带回来的视频元数据。
+///
+/// 只用来补标题 / 作者 / 封面 / 时长；`url` 仍是可播直链。
+class ShortVideoResolved {
+  const ShortVideoResolved({
+    required this.url,
+    this.title = '',
+    this.author = '',
+    this.cover = '',
+    this.durationMs = 0,
+  });
+
+  final String url;
+  final String title;
+  final String author;
+  final String cover;
+  final int durationMs;
 }
 
 /// 一次增量解析的结果。

@@ -251,7 +251,7 @@ Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
     if (resolved != null) {
       ShortVideoPlayStats.noteNetwork(video.key, tiktok: true);
       return QueueMedia(
-        url: resolved,
+        url: resolved.url,
         userAgent: platform.userAgent,
         referer: platform.referer,
         cookie: cookie,

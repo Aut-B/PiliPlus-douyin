@@ -202,7 +202,7 @@ abstract final class ShortVideoMediaCache {
         );
         if (fresh != null) {
           final retried = await ShortVideoWeb.nativeDownload(
-            urls: [fresh],
+            urls: [fresh.url],
             destPath: target.path,
             userAgent: userAgent,
             referer: referer,

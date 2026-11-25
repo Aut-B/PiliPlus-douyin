@@ -99,16 +99,16 @@ final class ShortVideoWebViewPlugin: NSObject, FlutterPlugin {
       let args = call.arguments as? [String: Any] ?? [:]
       let videoId = args["videoId"] as? String ?? ""
       guard !videoId.isEmpty else {
-        result(["url": "", "reason": "notfound"])
+        result(ShortVideoPlayMeta.emptyPayload(reason: "notfound"))
         return
       }
       ShortVideoPlayResolver(
         videoId: videoId,
         platform: args["platform"] as? String ?? "tiktok",
         userAgent: args["userAgent"] as? String ?? ""
-      ) { url, reason in
+      ) { url, reason, meta in
         DispatchQueue.main.async {
-          result(["url": url ?? "", "reason": reason])
+          result(meta.payload(url: url ?? "", reason: reason))
         }
       }.start()
     case "resolveComments":
@@ -1448,6 +1448,36 @@ final class ShortVideoNativeDownloader: NSObject, URLSessionDownloadDelegate {
 /// 做双保险。
 ///
 /// TikTok 的 embed 页仍是服务端直出的，继续走原来的轻量 HTTP 预取。
+struct ShortVideoPlayMeta {
+  var title = ""
+  var author = ""
+  var cover = ""
+  var durationMs = 0
+
+  /// 后拿到的非空字段覆盖先拿到的：详情接口通常比首屏 HTML 更完整。
+  mutating func merge(_ other: ShortVideoPlayMeta) {
+    if !other.title.isEmpty { title = other.title }
+    if !other.author.isEmpty { author = other.author }
+    if !other.cover.isEmpty { cover = other.cover }
+    if other.durationMs > 0 { durationMs = other.durationMs }
+  }
+
+  func payload(url: String, reason: String) -> [String: Any] {
+    [
+      "url": url,
+      "title": title,
+      "author": author,
+      "cover": cover,
+      "durationMs": durationMs,
+      "reason": reason,
+    ]
+  }
+
+  static func emptyPayload(reason: String) -> [String: Any] {
+    ShortVideoPlayMeta().payload(url: "", reason: reason)
+  }
+}
+
 final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
   private static let handlerName = "shortvideo_resolve"
   private static let mobileUA =
@@ -1459,7 +1489,8 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
   private let platform: String
   private let userAgent: String
   /// url 为空时 reason 会区分 network / login / notfound，Dart 侧据此给不同提示。
-  private let completion: (String?, String) -> Void
+  private let completion: (String?, String, ShortVideoPlayMeta) -> Void
+  private var meta = ShortVideoPlayMeta()
   private var webView: WKWebView?
   private var timer: Timer?
   private var ticks = 0
@@ -1478,7 +1509,7 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
     videoId: String,
     platform: String,
     userAgent: String,
-    completion: @escaping (String?, String) -> Void
+    completion: @escaping (String?, String, ShortVideoPlayMeta) -> Void
   ) {
     self.videoId = videoId
     self.platform = platform
@@ -1546,13 +1577,19 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
     // 弱引用会让对象在请求返回前就释放掉。
     let task = URLSession.shared.dataTask(with: request) { [self] data, _, _ in
       var found: String?
+      var foundMeta = ShortVideoPlayMeta()
       if let data = data, data.count > 1024, data.count < 4_000_000,
          let text = String(data: data, encoding: .utf8) {
         found = ShortVideoPlayResolver.pick(text)
+        foundMeta = ShortVideoPlayResolver.parseMeta(
+          text,
+          platform: self.platform
+        )
       }
       DispatchQueue.main.async {
         guard !self.finished else { return }
         if let found = found {
+          self.meta.merge(foundMeta)
           self.finish(found)
         } else {
           self.startWebView()
@@ -1671,6 +1708,7 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
   }
 
   private func consume(_ text: String) {
+    meta.merge(ShortVideoPlayResolver.parseMeta(text, platform: platform))
     if let url = ShortVideoPlayResolver.pick(text) {
       finish(url)
       return
@@ -1706,8 +1744,9 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
     let result = url ?? ""
     let detail = result.isEmpty ? reason : ""
     let done = completion
+    let resolvedMeta = meta
     DispatchQueue.main.async {
-      done(result, detail)
+      done(result, detail, resolvedMeta)
     }
   }
 
@@ -1843,6 +1882,187 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
     };
   })();
   """#
+
+  // MARK: - 元数据（标题 / 作者 / 封面 / 时长）
+
+  /// 从抓到的响应体里抠元数据：抖音详情是 `{"aweme_detail": {...}}`，
+  /// 网页首屏是内嵌 JSON；TikTok 是 `itemInfo` / `itemStruct`。
+  /// 只认带 `video` 的对象，避免把评论里的 `desc` 当成标题。
+  static func parseMeta(_ text: String, platform: String) -> ShortVideoPlayMeta {
+    var meta = ShortVideoPlayMeta()
+    // 只有视频 src 的轮询结果没必要进 JSON 解析，省点老机器的 CPU。
+    if !text.contains("\"nickname\"") && !text.contains("\"desc\"") {
+      return meta
+    }
+    for item in candidateItems(in: text) {
+      meta.merge(metaItem(item, platform: platform))
+    }
+    return meta
+  }
+
+  private static func candidateItems(in text: String) -> [[String: Any]] {
+    var results: [[String: Any]] = []
+    if let data = text.data(using: .utf8),
+       let root = try? JSONSerialization.jsonObject(with: data) {
+      collect(root, into: &results, depth: 0)
+    }
+    if !results.isEmpty { return results }
+    // 首屏 HTML / 内嵌脚本不是纯 JSON：按 key 找到值，再做括号配对。
+    for key in ["aweme_detail", "itemInfo", "itemStruct", "aweme_list"] {
+      var searchStart = text.startIndex
+      while searchStart < text.endIndex, results.count < 8 {
+        guard let marker = text.range(
+          of: "\"\(key)\"",
+          range: searchStart..<text.endIndex
+        ) else { break }
+        searchStart = marker.upperBound
+        guard let colon = text.range(
+          of: ":",
+          range: marker.upperBound..<text.endIndex
+        ) else { break }
+        var index = colon.upperBound
+        while index < text.endIndex, text[index] == " " {
+          index = text.index(after: index)
+        }
+        guard index < text.endIndex else { break }
+        let open = text[index]
+        guard open == "{" || open == "[" else { continue }
+        guard let raw = balanced(
+          text,
+          from: index,
+          open: open,
+          close: open == "{" ? "}" : "]"
+        ) else { continue }
+        guard let data = raw.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data)
+        else { continue }
+        collect(parsed, into: &results, depth: 0)
+      }
+    }
+    return results
+  }
+
+  private static func collect(
+    _ node: Any,
+    into results: inout [[String: Any]],
+    depth: Int
+  ) {
+    if depth > 8 || results.count >= 8 { return }
+    if let dict = node as? [String: Any] {
+      if dict["video"] is [String: Any],
+         dict["desc"] != nil || dict["author"] != nil
+           || dict["authorInfo"] != nil {
+        results.append(dict)
+      }
+      for key in [
+        "aweme_detail", "itemInfo", "itemStruct", "aweme_list",
+        "item_list", "itemList", "videoData", "data", "aweme",
+      ] {
+        if let child = dict[key] {
+          collect(child, into: &results, depth: depth + 1)
+        }
+      }
+    } else if let list = node as? [Any] {
+      for child in list.prefix(3) {
+        collect(child, into: &results, depth: depth + 1)
+      }
+    }
+  }
+
+  private static func metaItem(
+    _ item: [String: Any],
+    platform: String
+  ) -> ShortVideoPlayMeta {
+    var meta = ShortVideoPlayMeta()
+    meta.title = string(item["desc"]) ?? string(item["title"]) ?? ""
+    if let author = item["author"] as? [String: Any] {
+      meta.author = string(author["nickname"])
+        ?? string(author["uniqueId"])
+        ?? string(author["unique_id"])
+        ?? ""
+    } else {
+      meta.author = string(item["author"]) ?? string(item["authorName"]) ?? ""
+    }
+    guard let video = item["video"] as? [String: Any] else { return meta }
+    meta.cover = firstURL(video["cover"])
+      ?? firstURL(video["origin_cover"])
+      ?? firstURL(video["originCover"])
+      ?? firstURL(video["dynamic_cover"])
+      ?? firstURL(video["dynamicCover"])
+      ?? ""
+    let duration = int(video["duration"]) ?? int(video["durationMs"]) ?? 0
+    // 抖音的 duration 是毫秒，TikTok 是秒。
+    meta.durationMs = platform == "tiktok" ? duration * 1000 : duration
+    return meta
+  }
+
+  private static func firstURL(_ value: Any?) -> String? {
+    if let text = string(value), text.hasPrefix("http") {
+      return unescape(text)
+    }
+    guard let dict = value as? [String: Any] else { return nil }
+    for key in ["url_list", "UrlList", "urlList", "urls"] {
+      if let list = dict[key] as? [Any] {
+        for entry in list {
+          if let text = string(entry), text.hasPrefix("http") {
+            return unescape(text)
+          }
+        }
+      }
+    }
+    if let text = string(dict["url"]), text.hasPrefix("http") {
+      return unescape(text)
+    }
+    return nil
+  }
+
+  private static func string(_ value: Any?) -> String? {
+    if let text = value as? String, !text.isEmpty { return text }
+    if let number = value as? NSNumber { return number.stringValue }
+    return nil
+  }
+
+  private static func int(_ value: Any?) -> Int? {
+    if let number = value as? Int { return number }
+    if let number = value as? NSNumber { return number.intValue }
+    if let number = value as? Double { return Int(number) }
+    if let text = value as? String { return Int(text) }
+    return nil
+  }
+
+  /// 从 `open` 位置起做括号配对（跳过字符串里的括号）。
+  private static func balanced(
+    _ text: String,
+    from start: String.Index,
+    open: Character,
+    close: Character
+  ) -> String? {
+    var depth = 0
+    var inString = false
+    var escaped = false
+    var index = start
+    while index < text.endIndex {
+      let char = text[index]
+      if inString {
+        if escaped {
+          escaped = false
+        } else if char == "\\" {
+          escaped = true
+        } else if char == "\"" {
+          inString = false
+        }
+      } else if char == "\"" {
+        inString = true
+      } else if char == open {
+        depth += 1
+      } else if char == close {
+        depth -= 1
+        if depth == 0 { return String(text[start...index]) }
+      }
+      index = text.index(after: index)
+    }
+    return nil
+  }
 
   /// 在页面 JSON 里挑一条能直接下的地址：优先 play_addr.url_list。
   static func pick(_ text: String) -> String? {

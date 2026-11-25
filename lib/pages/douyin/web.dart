@@ -143,7 +143,7 @@ abstract final class ShortVideoWeb {
   }
 
   /// 重新解析出来的直链，20 分钟内复用。
-  static final Map<String, String> _playUrlCache = {};
+  static final Map<String, ShortVideoResolved> _playUrlCache = {};
   static final Map<String, DateTime> _playUrlAt = {};
 
   /// 最近一次直链解析失败的原因：
@@ -154,10 +154,14 @@ abstract final class ShortVideoWeb {
   ///
   /// 收藏里存的是签名直链，过几个小时就 403；TikTok 官方的「长期地址」
   /// （tiktokv.com）实测全返回 HTTP 400，只能回页面里重新拿。
-  static Future<String?> resolvePlayUrl({
+  ///
+  /// 原生会顺手把详情里的标题 / 作者 / 封面 / 时长一起带回来，
+  /// 导入链接和占位条目都靠它补元数据。
+  static Future<ShortVideoResolved?> resolvePlayUrl({
     required String platformId,
     required String videoId,
     required String userAgent,
+    bool force = false,
   }) async {
     lastPlayUrlError = '';
     if (videoId.isEmpty) {
@@ -166,10 +170,11 @@ abstract final class ShortVideoWeb {
     }
     final cacheKey = '$platformId:$videoId';
     final at = _playUrlAt[cacheKey];
-    if (at != null &&
+    if (!force &&
+        at != null &&
         DateTime.now().difference(at) < const Duration(minutes: 20)) {
       final cached = _playUrlCache[cacheKey];
-      if (cached != null && cached.isNotEmpty) return cached;
+      if (cached != null && cached.url.isNotEmpty) return cached;
     }
     _ensureHandler();
     try {
@@ -178,29 +183,44 @@ abstract final class ShortVideoWeb {
         'videoId': videoId,
         'userAgent': userAgent,
       });
-      String? url;
+      ShortVideoResolved? resolved;
       var reason = '';
       if (raw is Map) {
         final value = raw['url'];
-        if (value is String && value.isNotEmpty) url = value;
+        if (value is String && value.isNotEmpty) {
+          resolved = ShortVideoResolved(
+            url: value,
+            title: _metaText(raw['title']),
+            author: _metaText(raw['author']),
+            cover: _metaText(raw['cover']),
+            durationMs: _metaInt(raw['durationMs']),
+          );
+        }
         final detail = raw['reason'];
         if (detail is String) reason = detail;
       } else if (raw is String && raw.isNotEmpty) {
         // 兼容旧原生只返回 URL 的情况。
-        url = raw;
+        resolved = ShortVideoResolved(url: raw);
       }
-      if (url == null || url.isEmpty) {
+      if (resolved == null || resolved.url.isEmpty) {
         lastPlayUrlError = reason.isEmpty ? 'notfound' : reason;
         return null;
       }
-      _playUrlCache[cacheKey] = url;
+      _playUrlCache[cacheKey] = resolved;
       _playUrlAt[cacheKey] = DateTime.now();
-      return url;
+      return resolved;
     } catch (_) {
       lastPlayUrlError = 'network';
       return null;
     }
   }
+
+  static String _metaText(dynamic value) =>
+      value is String ? value.trim() : '';
+
+  static int _metaInt(dynamic value) => value is num
+      ? value.toInt()
+      : int.tryParse('${value ?? ''}') ?? 0;
 
   /// 评论列表，同一条视频 10 分钟内复用，避免每次打开面板都开一次网页。
   static final Map<String, List<ShortVideoComment>> _commentCache = {};

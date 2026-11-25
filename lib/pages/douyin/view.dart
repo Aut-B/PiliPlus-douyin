@@ -195,6 +195,68 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         ..clear()
         ..addAll(stored);
     });
+    unawaited(_backfillMeta());
+  }
+
+  /// 旧版「从链接导入」只写了占位文案，元数据是空的。列表加载后串行、
+  /// 限量地回视频页补一次标题 / 作者 / 封面 / 时长，失败就跳过。
+  /// 不阻塞 UI，也不和播放抢同一条视频的解析。
+  static const int _metaBackfillLimit = 8;
+  bool _metaBackfilling = false;
+
+  static bool _needsMeta(ShortVideo video) =>
+      video.videoId.isNotEmpty &&
+      (video.desc.trim().isEmpty ||
+          video.desc.trim() == '分享链接添加的视频' ||
+          video.author.trim().isEmpty);
+
+  Future<void> _backfillMeta() async {
+    if (_metaBackfilling) return;
+    final targets = _videos
+        .where(_needsMeta)
+        .take(_metaBackfillLimit)
+        .toList(growable: false);
+    if (targets.isEmpty) return;
+    _metaBackfilling = true;
+    try {
+      for (final target in targets) {
+        if (!mounted) return;
+        final key = target.key;
+        if (!_videos.any((e) => e.key == key && _needsMeta(e))) continue;
+        final resolved = await ShortVideoWeb.resolvePlayUrl(
+          platformId: target.platform,
+          videoId: target.videoId,
+          userAgent: platform.mobileUserAgent,
+          force: true,
+        );
+        if (!mounted) return;
+        if (resolved == null) continue;
+        final index = _videos.indexWhere((e) => e.key == key);
+        if (index < 0) continue;
+        final current = _videos[index];
+        final title = resolved.title.trim();
+        final author = resolved.author.trim();
+        final cover = resolved.cover.trim();
+        final durationMs = resolved.durationMs;
+        // 一个字段都没补到就别写回，省得反复解析。
+        if (title.isEmpty &&
+            author.isEmpty &&
+            cover.isEmpty &&
+            durationMs <= 0) {
+          continue;
+        }
+        final updated = current.copyWith(
+          desc: title.isEmpty || title == current.desc ? null : title,
+          author: author.isEmpty ? null : author,
+          cover: cover.isEmpty ? null : cover,
+          durationMs: durationMs > 0 ? durationMs : null,
+        );
+        setState(() => _videos[index] = updated);
+        ShortVideoRepo.save(platform, _videos);
+      }
+    } finally {
+      _metaBackfilling = false;
+    }
   }
 
   Future<void> _autoSync() async {
@@ -463,13 +525,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         return;
       }
       if (mounted) setState(() => _status = '正在解析可播放直链…');
-      final playUrl = await ShortVideoWeb.resolvePlayUrl(
+      final resolved = await ShortVideoWeb.resolvePlayUrl(
         platformId: target.id,
         videoId: link.videoId,
         userAgent: target.mobileUserAgent,
+        force: true,
       );
       if (!mounted) return;
-      if (playUrl == null || playUrl.isEmpty) {
+      if (resolved == null || resolved.url.isEmpty) {
         switch (ShortVideoWeb.lastPlayUrlError) {
           case 'network':
             _linkFailed('网络请求失败，请检查网络后重试', login: true);
@@ -485,14 +548,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         }
         return;
       }
+      final title = resolved.title.trim();
       final video = ShortVideo(
         id: link.videoId,
         platform: target.id,
-        desc: '分享链接添加的视频',
-        author: '',
-        cover: '',
-        durationMs: 0,
-        playUrl: playUrl,
+        desc: title,
+        author: resolved.author.trim(),
+        cover: resolved.cover.trim(),
+        durationMs: resolved.durationMs,
+        playUrl: resolved.url,
         videoId: link.videoId,
         updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
       );
