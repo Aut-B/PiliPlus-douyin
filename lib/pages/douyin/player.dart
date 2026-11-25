@@ -21,6 +21,7 @@ import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/storage.dart';
+import 'package:audio_service/audio_service.dart' show MediaControl;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -143,6 +144,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'douyin-short:${DateTime.now().microsecondsSinceEpoch}';
   bool _bgKeepAliveApplied = false;
   bool? _savedEnableBackgroundPlay;
+  /// 本页是否已把 audio_service 的远程控制回调指向抖音播放器。
+  /// 只在第一次进页时保存原值，切条复用，避免把「自己的包装」当成原值。
+  bool _bgRemoteControlsBound = false;
+  bool Function()? _savedBgIsPlaying;
+  Future<void>? Function()? _savedBgOnPlay;
+  Future<void>? Function()? _savedBgOnPause;
+  Future<void>? Function(Duration position)? _savedBgOnSeek;
+  void Function()? _savedBgOnSkipToNext;
+  void Function()? _savedBgOnSkipToPrevious;
   int? _bgTextureId;
 
   /// 页面已经在退，避免重复触发。
@@ -1337,6 +1347,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _pushProgress(force: true);
     _publishPipState();
+    _publishBackgroundState(status: status);
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
       if (_player.dataStatus.value != DataStatus.loaded) return;
@@ -1588,6 +1599,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _pushProgress(force: true);
     _publishPipState();
+    _publishBackgroundState();
     if (_player.playerStatus.isPlaying) {
       _armPipAutoEnter('toggle-play');
     } else {
@@ -1760,6 +1772,123 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     });
   }
 
+  /// 锁屏/控制中心事件是否还能安全地驱动本页播放器。
+  bool _canDriveBackground() =>
+      mounted &&
+      !_disposed &&
+      !_leaving &&
+      videoPlayerServiceHandler != null;
+
+  Future<void> _bgRemotePlay() {
+    if (!_canDriveBackground()) return Future<void>.value();
+    if (_player.playerStatus.isPlaying) {
+      _publishBackgroundState();
+      return Future<void>.value();
+    }
+    return _togglePlay();
+  }
+
+  Future<void> _bgRemotePause() {
+    if (!_canDriveBackground()) return Future<void>.value();
+    if (!_player.playerStatus.isPlaying) {
+      _publishBackgroundState();
+      return Future<void>.value();
+    }
+    return _togglePlay();
+  }
+
+  Future<void> _bgRemoteSeek(Duration position) async {
+    if (!_canDriveBackground()) return;
+    DiagProbe.suspendSampling();
+    try {
+      await _player.seekTo(position);
+    } catch (_) {
+      // 切条/退出时播放器可能已被释放，seek 失败不影响后续状态刷新。
+    } finally {
+      DiagProbe.resumeSampling();
+    }
+    if (!_canDriveBackground()) return;
+    _pushProgress(force: true);
+    _publishPipState(position.inMilliseconds);
+    _publishBackgroundState(positionMs: position.inMilliseconds);
+  }
+
+  void _bgRemoteNext() {
+    if (!_canDriveBackground()) return;
+    unawaited(_next(source: 'next'));
+  }
+
+  void _bgRemotePrevious() {
+    if (!_canDriveBackground()) return;
+    unawaited(_previous());
+  }
+
+  bool _bgRemoteIsPlaying() =>
+      _canDriveBackground() && _player.playerStatus.isPlaying;
+
+  /// 把锁屏/控制中心的远程控制指向本页播放器。
+  ///
+  /// 此前只写入了 mediaItem，卡片能出现，但 play()/pause() 仍回落到
+  /// PlPlayerController（B站控制器），按钮点了没反应。这里只绑定一次并
+  /// 保存原值，退出时原样恢复，避免污染 B站播放页。
+  void _bindBackgroundRemoteControls() {
+    final handler = videoPlayerServiceHandler;
+    if (handler == null || _bgRemoteControlsBound) return;
+    _savedBgIsPlaying = handler.isPlaying;
+    _savedBgOnPlay = handler.onPlay;
+    _savedBgOnPause = handler.onPause;
+    _savedBgOnSeek = handler.onSeek;
+    _savedBgOnSkipToNext = handler.onSkipToNext;
+    _savedBgOnSkipToPrevious = handler.onSkipToPrevious;
+    handler
+      ..isPlaying = _bgRemoteIsPlaying
+      ..onPlay = _bgRemotePlay
+      ..onPause = _bgRemotePause
+      ..onSeek = _bgRemoteSeek
+      ..onSkipToNext = _bgRemoteNext
+      ..onSkipToPrevious = _bgRemotePrevious;
+    _bgRemoteControlsBound = true;
+  }
+
+  /// 刷新锁屏/控制中心卡片的状态与可用控件。
+  ///
+  /// 不传 debugLabel：`onVideoPaused` 那一支会让 onUpdateState 直接返回，
+  /// 等于这次刷新白做。
+  void _publishBackgroundState({PlayerStatus? status, int? positionMs}) {
+    if (!_canDriveBackground()) return;
+    final handler = videoPlayerServiceHandler;
+    if (handler == null || !_bgKeepAliveApplied) return;
+    handler.onUpdateState(
+      status ?? _player.playerStatus,
+      _player.isBuffering.value,
+      false,
+      position: Duration(
+        milliseconds: positionMs ?? _player.positionInMilliseconds,
+      ),
+      speed: 1.0,
+    );
+    _syncBackgroundControls();
+  }
+
+  /// 锁屏/控制中心只会点亮 `PlaybackState.controls` 里列出的动作。
+  /// handler 默认给的是快退/播放/快进，iOS 的上一首/下一首因此不会出现；
+  /// 抖音是上下切条，这里补成「上一条 / 播放暂停 / 下一条」。
+  /// 退出页面时 `clearIfNeeded()` 会把控件清空，不影响 B站。
+  void _syncBackgroundControls() {
+    final handler = videoPlayerServiceHandler;
+    if (handler == null) return;
+    final playing = handler.playbackState.value.playing;
+    handler.playbackState.add(
+      handler.playbackState.value.copyWith(
+        controls: [
+          MediaControl.skipToPrevious,
+          playing ? MediaControl.pause : MediaControl.play,
+          MediaControl.skipToNext,
+        ],
+      ),
+    );
+  }
+
   /// 对齐 B站：临时打开 enableBackgroundPlay，并用现有的
   /// `onVideoDetailChange` 写入 mediaItem（内部 `_item` 非空后，
   /// `onUpdateState` 才会驱动音频会话）。退出页面时恢复原值。
@@ -1781,6 +1910,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       artist: entry.author,
       cover: entry.cover,
     );
+    _bindBackgroundRemoteControls();
+    // mediaItem 写入后 onUpdateState 才生效，这里立刻推一次，
+    // 让卡片从「无回调」切换到真实的暂停/播放状态。
+    _publishBackgroundState();
     DiagProbe.event('bg-keepalive', <String, Object?>{
       'enabled': handler.enableBackgroundPlay,
       'hasMediaItem': handler.mediaItem.value != null,
@@ -1791,6 +1924,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   void _releaseBackgroundKeepAlive() {
     final handler = videoPlayerServiceHandler;
+    // 先把回调恢复成进入前的值（通常是 null），再摘 mediaItem。
+    if (handler != null && _bgRemoteControlsBound) {
+      handler
+        ..isPlaying = _savedBgIsPlaying
+        ..onPlay = _savedBgOnPlay
+        ..onPause = _savedBgOnPause
+        ..onSeek = _savedBgOnSeek
+        ..onSkipToNext = _savedBgOnSkipToNext
+        ..onSkipToPrevious = _savedBgOnSkipToPrevious;
+      _bgRemoteControlsBound = false;
+      _savedBgIsPlaying = null;
+      _savedBgOnPlay = null;
+      _savedBgOnPause = null;
+      _savedBgOnSeek = null;
+      _savedBgOnSkipToNext = null;
+      _savedBgOnSkipToPrevious = null;
+    }
     if (handler == null || !_bgKeepAliveApplied) return;
     handler.onVideoDetailDispose(_bgTag);
     // 本页 item 已摘除；顺手清掉它留下的 Now Playing / 播放状态，
@@ -2223,6 +2373,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
     _pushProgress(force: true);
     _publishPipState(_seekTargetMs);
+    _publishBackgroundState(positionMs: _seekTargetMs);
     _hideHintSoon();
     sw.stop();
     _diagUiBlock('gesture', 'horizontal-end', sw, throttleMs: 1000);
@@ -2661,6 +2812,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                         );
                         _pushProgress(force: true);
                         _publishPipState(milliseconds);
+                        _publishBackgroundState(positionMs: milliseconds);
                       },
                     ),
                   ),
