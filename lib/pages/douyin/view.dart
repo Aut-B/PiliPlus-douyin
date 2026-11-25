@@ -16,6 +16,9 @@ import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
+/// 用户点「删除」时的两种真实意图：只清本地文件，或把收藏一起删掉。
+enum _DeleteMode { cacheOnly, removeFavorite }
+
 /// 抖音 / TikTok 收藏的入口页：顶部一排平台切换，下面是选中平台的收藏。
 ///
 /// 导航栏的枚举项必须是编译期常量，所以那里只能放这个无参页面；
@@ -666,18 +669,68 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     if (ShortVideoSync.configured) await _sync(silent: true);
   }
 
-  /// 删一条：本地列表 + 删除墓碑 + 本地缓存文件。
-  Future<void> _deleteOne(ShortVideo video) async {
-    final confirmed = await showConfirmDialog(
+  /// 删除前先问清楚：只清本地文件，还是连收藏条目一起删。
+  Future<_DeleteMode?> _askDeleteMode({
+    required String title,
+    required String detail,
+  }) {
+    return showDialog<_DeleteMode>(
       context: context,
-      title: const Text('删除这条收藏？'),
-      content: Text(
-        '${video.title}\n\n'
-        '只删本机这一条；如果它还在播放列表里，本地视频文件会保留；'
-        '下次同步时远端那份也会被排除。',
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: Text(detail),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(_DeleteMode.cacheOnly),
+            child: const Text('只删本地缓存'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(_DeleteMode.removeFavorite),
+            child: const Text('删除收藏（含缓存）'),
+          ),
+        ],
       ),
     );
-    if (!confirmed || !mounted) return;
+  }
+
+  /// 只删本地视频文件：收藏条目、删除墓碑和播放列表都不动。
+  Future<void> _removeCacheOnly(List<ShortVideo> videos) async {
+    for (final video in videos) {
+      await ShortVideoMediaCache.remove(video);
+    }
+    if (!mounted) return;
+    setState(() {
+      for (final video in videos) {
+        _cachedKeys.remove(video.key);
+      }
+      _status = '已清理 ${videos.length} 条的本地缓存，收藏保留';
+    });
+    await _refreshCacheSize();
+    if (mounted) {
+      SmartDialog.showToast('已清理 ${videos.length} 条的本地缓存，收藏仍在');
+    }
+  }
+
+  /// 删一条：本地列表 + 删除墓碑 + 本地缓存文件。
+  Future<void> _deleteOne(ShortVideo video) async {
+    final mode = await _askDeleteMode(
+      title: '删除这条收藏？',
+      detail:
+          '${video.title}\n\n'
+          '只删本地缓存：收藏条目保留，之后可自动补回；\n'
+          '删除收藏：本机移除这一条并写删除墓碑，下次同步时远端那份也会被排除（6 秒内可撤销）。',
+    );
+    if (mode == null || !mounted) return;
+    if (mode == _DeleteMode.cacheOnly) {
+      await _removeCacheOnly([video]);
+      return;
+    }
     final position = _videos.indexWhere((e) => e.key == video.key);
     setState(() {
       _videos.removeWhere((e) => e.key == video.key);
@@ -702,15 +755,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('先选几条');
       return;
     }
-    final confirmed = await showConfirmDialog(
-      context: context,
-      title: Text('删除所选的 ${targets.length} 条？'),
-      content: const Text(
-        '播放列表里还留着的条目会保留本地视频文件，'
-        '下次同步时远端那份也会被排除。',
-      ),
+    final mode = await _askDeleteMode(
+      title: '处理所选的 ${targets.length} 条？',
+      detail:
+          '只删本地缓存：清掉本机的视频文件，收藏条目全部保留，之后可自动补回；\n'
+          '删除收藏：从本机列表移除并写删除墓碑，下次同步时远端那份也会被排除（6 秒内可撤销）。',
     );
-    if (!confirmed || !mounted) return;
+    if (mode == null || !mounted) return;
+    if (mode == _DeleteMode.cacheOnly) {
+      await _removeCacheOnly(targets);
+      return;
+    }
     final positions = <int>[
       for (final video in targets)
         _videos.indexWhere((e) => e.key == video.key),
@@ -1742,7 +1797,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                                 ),
                                 const PopupMenuItem(
                                   value: 'delete',
-                                  child: Text('删除（含缓存）'),
+                                  child: Text('删除…'),
                                 ),
                               ],
                             ),
