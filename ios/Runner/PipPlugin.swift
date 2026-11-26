@@ -427,7 +427,17 @@ private final class PipSession: NSObject {
         object: nil,
         queue: .main
       ) { [weak self] _ in
-        guard let self, self.enteredBackground else { return }
+        guard let self else { return }
+        // 用户已经回到前台，上次后台请求还没落定就作废；否则稍后
+        // isPictureInPicturePossible 回调会把小窗补弹出来。
+        if UIApplication.shared.applicationState == .active,
+          self.pendingStart, !self.isActive
+        {
+          self.pendingStart = false
+          self.backgroundOnStart = false
+          PipTrace.log("didActivate: dropped pending start")
+        }
+        guard self.enteredBackground else { return }
         self.enteredBackground = false
         if self.controller.isPictureInPictureActive {
           self.stopRequested = true
@@ -597,6 +607,7 @@ private final class PipSession: NSObject {
     pendingStart = false
     pipStartRequested = false
     pendingFrameRequested = false
+    backgroundOnStart = false
     possibleObservation?.invalidate()
     observers.forEach(NotificationCenter.default.removeObserver)
     controller.delegate = nil
