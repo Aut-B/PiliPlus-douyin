@@ -283,9 +283,12 @@ abstract final class VideoHttp {
     });
 
     try {
-      final res = await Request().get(
-        fallback ? videoType.fallbackApi : videoType.api,
-        queryParameters: params,
+      final res = await WbiSign.sendSigned(
+        params,
+        (signed) => Request().get(
+          fallback ? videoType.fallbackApi : videoType.api,
+          queryParameters: signed,
+        ),
       );
 
       if (res.data['code'] == 0) {
@@ -375,9 +378,9 @@ abstract final class VideoHttp {
   static Future<LoadingState<VideoDetailData>> videoIntro({
     required String bvid,
   }) async {
-    final res = await Request().get(
-      Api.videoIntro,
-      queryParameters: await WbiSign.makSign({'bvid': bvid}),
+    final res = await WbiSign.sendSigned(
+      await WbiSign.makSign({'bvid': bvid}),
+      (signed) => Request().get(Api.videoIntro, queryParameters: signed),
     );
     if (res.data['code'] == 0) {
       return Success(VideoDetailData.fromJson(res.data['data']));
@@ -386,6 +389,7 @@ abstract final class VideoHttp {
     }
   }
 
+  // 实测 /x/web-interface/archive/relation 不需要 wbi 签名，不要给它加 w_rid。
   static Future<LoadingState<VideoRelation>> videoRelation({
     required String bvid,
   }) async {
