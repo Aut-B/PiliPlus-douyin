@@ -1,5 +1,6 @@
 import 'dart:async' show unawaited;
 
+import 'package:PiliPlus/common/style.dart' show Style;
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
@@ -11,6 +12,8 @@ import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/rootscan_view.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
+import 'package:PiliPlus/pages/main/controller.dart';
+import 'package:flutter/foundation.dart' show clampDouble;
 import 'package:flutter/services.dart' show Clipboard;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
@@ -147,6 +150,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 56 只够旧的 BottomNavigationBar，默认的 M3 导航栏比它高 24。
   static const double _mainBottomNavHeight = 88;
 
+  /// 上滑收起底栏时累计位移的封顶值，约等于 M3 导航栏高度。
+  static const double _bottomBarHideOffset = 80;
+
+  /// 底栏收起进度：0 为完全展开，[_bottomBarHideOffset] 为完全收起。
+  final ValueNotifier<double> _barOffset = ValueNotifier<double>(0);
+
+  /// 主界面悬浮四 tab 导航栏的位移，与 B站首页 `CommonPageState` 共用
+  /// 同一个 Rx（量纲是 `Style.topBarHeight`）。用户在设置里关掉「隐藏底栏」
+  /// 时该值为 null，此时只收起本页自己的操作条。
+  RxDouble? _mainBarOffset;
+
   final List<ShortVideo> _videos = [];
   bool _syncing = false;
   String _status = '';
@@ -192,6 +206,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   @override
   void initState() {
     super.initState();
+    _mainBarOffset = Get.isRegistered<MainController>()
+        ? Get.find<MainController>().barOffset
+        : null;
     _reload();
     _refreshCacheSize();
     _status = _videos.isEmpty
@@ -200,9 +217,69 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _autoSync());
   }
 
+  /// 上滑累计正位移收起底栏，下滑再退回来；只跟随手指拖动，
+  /// 松手后的惯性滚动不改位移，避免回弹闪动。
+  bool _onScrollNotification(ScrollNotification notification) {
+    if (_videos.isEmpty || notification.metrics.axis == Axis.horizontal) {
+      return false;
+    }
+    final double delta;
+    if (notification is ScrollUpdateNotification) {
+      if (notification.dragDetails == null) return false;
+      delta = notification.scrollDelta ?? 0;
+    } else if (notification is OverscrollNotification) {
+      delta = notification.overscroll;
+    } else {
+      return false;
+    }
+    if (delta == 0) return false;
+    // 列表在顶部继续下拉时不要收起底栏（与 CommonPageState 一致）。
+    if (notification.metrics.pixels < 0 && delta > 0) return false;
+    _barOffset.value = clampDouble(
+      _barOffset.value + delta,
+      0.0,
+      _bottomBarHideOffset,
+    );
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null) {
+      mainBarOffset.value = clampDouble(
+        mainBarOffset.value + delta,
+        0.0,
+        Style.topBarHeight,
+      );
+    }
+    return false;
+  }
+
+  /// 本页操作条与主界面悬浮导航栏一起回到展开状态。
+  void _resetBarOffset() {
+    _barOffset.value = 0;
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null && mainBarOffset.value != 0) {
+      mainBarOffset.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    // 切到别的 tab 时本页可能带着主界面底栏的位移一起消失：延到下一帧
+    // 复位，避免在销毁过程中触发主界面重建。主界面控制器若已关闭，
+    // 写入会被 Rx 自己忽略。
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        mainBarOffset.value = 0;
+      });
+    }
+    _barOffset.dispose();
+    super.dispose();
+  }
+
   void _reload() {
     final stored = ShortVideoRepo.load(platform);
     if (!mounted) return;
+    // 切换平台/重新拉取后列表回到顶部，底栏也跟着展开。
+    _resetBarOffset();
     setState(() {
       _videos
         ..clear()
@@ -358,6 +435,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('打开网页失败: $e');
     } finally {
       _openingWeb = false;
+      // 网页是独立路由，回来时把底栏展开，别停在上次滚动的收起态。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -384,6 +463,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('直连同步失败: $e');
     } finally {
       _openingWeb = false;
+      // 与打开网页一致：独立路由返回后把底栏展开。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -617,6 +698,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       await openShortVideoQueue(queue, index);
     } finally {
       _openingPlayer = false;
+      // 播放页是独立路由，本页底栏不参与其竖滑；退出回来时重新展开。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -1093,6 +1176,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
+      extendBody: true,
       appBar: AppBar(
         // 外层 MainLayout 已按状态栏高度给 body 补过 padding，
         // AppBar 若再 primary:true 会重复加一次安全区，顶部出现大片空白。
@@ -1183,24 +1267,40 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ),
           _statusBar(theme),
           Expanded(
-            child: _videos.isEmpty
-                ? _empty(theme)
-                : Column(
-                    children: [
-                      _listHeader(theme),
-                      Expanded(child: _list(theme)),
-                    ],
-                  ),
+            child: Builder(
+              builder: (bodyContext) {
+                // extendBody 下 Scaffold 会把底栏高度注入 body 的
+                // MediaQuery.padding.bottom，列表尾部按它留白，
+                // 否则最后一张卡片会被悬浮底栏盖住。
+                final bottomInset = MediaQuery.paddingOf(bodyContext).bottom;
+                return NotificationListener<ScrollNotification>(
+                  onNotification: _onScrollNotification,
+                  child: _videos.isEmpty
+                      ? _empty(theme)
+                      : Column(
+                          children: [
+                            _listHeader(theme),
+                            Expanded(child: _list(theme, bottomInset)),
+                          ],
+                        ),
+                );
+              },
+            ),
           ),
         ],
       ),
-      // 底栏原来放在 Column 里。问题在于主界面用 MainLayout 布局：body 按
-      // 整屏高度布局（bodyConstraints = 全高），底部导航栏是**叠画在 body
-      // 之上**的，不是挤压。所以 body 里最后那排按钮正好被底栏盖住，点不到。
-      // 放进 bottomNavigationBar 由 Scaffold 自己避让；同时因为 body 被
-      // 撑满整屏，Scaffold 算出来的 bottom padding 不可靠，_bottomBar 里
-      // 再按 MediaQuery.viewPadding 显式补一份。
-      bottomNavigationBar: _videos.isEmpty ? null : _bottomBar(theme),
+      // 底栏叠在 body 之上：上滑只把它向下平移，body 不跟着变形；
+      // 底栏自己补系统安全区与主界面导航栏高度，按钮不会被底部导航栏盖住。
+      bottomNavigationBar: _videos.isEmpty
+          ? null
+          : ValueListenableBuilder<double>(
+              valueListenable: _barOffset,
+              child: _bottomBar(theme),
+              builder: (context, offset, child) => FractionalTranslation(
+                translation: Offset(0, offset / _bottomBarHideOffset),
+                child: child,
+              ),
+            ),
     );
   }
 
@@ -1619,9 +1719,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  Widget _list(ThemeData theme) {
+  Widget _list(ThemeData theme, double bottomInset) {
     return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
+      padding: EdgeInsets.fromLTRB(10, 0, 10, bottomInset + 6),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
