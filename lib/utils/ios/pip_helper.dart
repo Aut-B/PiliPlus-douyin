@@ -145,6 +145,14 @@ abstract final class IOSPipHelper {
   }
 
   static void disableAutoEnter() {
+    // 按 Home 后播放器会自动暂停并触发一次 disarm；此时原生可能还在等
+    // isPictureInPicturePossible，这次调用不能把刚发出的启动拆掉，否则
+    // 慢机型（6S）会在小窗显示前丢弃请求。真正的前台暂停、离页与回到
+    // 前台都由 resumed 状态下的调用负责取消。
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (lifecycle != null && lifecycle != AppLifecycleState.resumed) {
+      return;
+    }
     if (_autoEnter) {
       _autoEnter = false;
       _channel.invokeMethod('disableAutoEnter');
