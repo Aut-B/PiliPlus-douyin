@@ -85,7 +85,7 @@ class _ShortVideoPageState extends State<ShortVideoPage> {
 
   @override
   Widget build(BuildContext context) {
-    // 只保留收藏页自己的 Scaffold：平台切换放进它的 AppBar 底部，
+    // 只保留收藏页自己的 Scaffold：平台切换直接放进 AppBar 标题行，
     // 避免外面再套一层 AppBar 出现两条标题栏。
     return ShortVideoFavoritesPage(
       key: ValueKey(_platform.id),
@@ -1094,16 +1094,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        toolbarHeight: 48,
-        title: Text(
-          platform.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        titleTextStyle: theme.textTheme.titleMedium?.copyWith(
-          fontWeight: FontWeight.w600,
-          color: theme.colorScheme.onSurface,
-        ),
+        // 外层 MainLayout 已按状态栏高度给 body 补过 padding，
+        // AppBar 若再 primary:true 会重复加一次安全区，顶部出现大片空白。
+        primary: false,
+        toolbarHeight: 44,
+        title: _platformSwitcher(theme),
         titleSpacing: 16,
         actions: [
           _headIcon(
@@ -1148,11 +1143,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           _moreMenu(theme),
           const SizedBox(width: 4),
         ],
-        // 分段控件放在标题栏底部，固定在顶部，避免滚动时平台入口消失。
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(44),
-          child: _platformSwitcher(theme),
-        ),
       ),
       body: Column(
         children: [
@@ -1282,37 +1272,45 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 平台切换：居中的胶囊分段控件，当前平台用主题色高亮。
+  /// 平台切换：标题行左侧的胶囊分段控件，当前平台用主题色高亮。
   Widget _platformSwitcher(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-      child: Center(
-        child: SegmentedButton<ShortVideoPlatform>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(
-              value: ShortVideoPlatform.douyin,
-              label: Text('抖音'),
-            ),
-            ButtonSegment(
-              value: ShortVideoPlatform.tiktok,
-              label: Text('TikTok'),
-            ),
-          ],
-          selected: {platform},
-          onSelectionChanged: (selection) =>
-              widget.onPlatformChanged(selection.first),
-          style: SegmentedButton.styleFrom(
-            minimumSize: const Size(96, 32),
-            visualDensity: VisualDensity.compact,
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            backgroundColor: scheme.surfaceContainerHighest,
-            foregroundColor: scheme.onSurfaceVariant,
-            selectedBackgroundColor: scheme.primaryContainer,
-            selectedForegroundColor: scheme.onPrimaryContainer,
-            side: BorderSide(
-              color: scheme.outlineVariant.withValues(alpha: 0.7),
+      padding: const EdgeInsets.fromLTRB(0, 0, 8, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        // 右侧 actions 较多，窄屏或大字号时允许整体等比缩小，避免横向溢出。
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: SegmentedButton<ShortVideoPlatform>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment(
+                value: ShortVideoPlatform.douyin,
+                label: Text('抖音'),
+              ),
+              ButtonSegment(
+                value: ShortVideoPlatform.tiktok,
+                label: Text('TikTok'),
+              ),
+            ],
+            selected: {platform},
+            onSelectionChanged: (selection) =>
+                widget.onPlatformChanged(selection.first),
+            style: SegmentedButton.styleFrom(
+              minimumSize: const Size(72, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              textStyle: theme.textTheme.labelMedium,
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor: scheme.surfaceContainerHighest,
+              foregroundColor: scheme.onSurfaceVariant,
+              selectedBackgroundColor: scheme.primaryContainer,
+              selectedForegroundColor: scheme.onPrimaryContainer,
+              side: BorderSide(
+                color: scheme.outlineVariant.withValues(alpha: 0.7),
+              ),
             ),
           ),
         ),
@@ -1400,7 +1398,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget _listHeader(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 6, 0),
+      padding: const EdgeInsets.fromLTRB(10, 0, 4, 0),
       child: Row(
         children: [
           Text(
@@ -1425,15 +1423,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               visualDensity: VisualDensity.compact,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               minimumSize: const Size(0, 32),
-              padding: const EdgeInsets.symmetric(horizontal: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
             ),
             icon: _addingLink
                 ? const SizedBox(
-                    width: 14,
-                    height: 14,
+                    width: 12,
+                    height: 12,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.link, size: 16),
+                : const Icon(Icons.link, size: 14),
             label: const Text('粘贴链接'),
           ),
         ],
@@ -1623,13 +1621,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
 
   Widget _list(ThemeData theme) {
     return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
+      padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
         final checked = widget.selected.containsKey(video.key);
         return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: 6),
           child: Material(
             color: _selecting && checked
                 ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
@@ -1671,7 +1669,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                                 height: 1.25,
                               ),
                             ),
-                            const SizedBox(height: 3),
+                            const SizedBox(height: 2),
                             Text(
                               video.author.trim().isEmpty
                                   ? '未知作者'
@@ -1730,7 +1728,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 2),
                     if (_selecting)
                       SizedBox(
                         width: 36,
@@ -1987,9 +1985,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     return Padding(
       padding: EdgeInsets.fromLTRB(
         12,
-        6,
+        4,
         12,
-        safeBottom + _mainBottomNavHeight + 4,
+        safeBottom + _mainBottomNavHeight + 2,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2070,7 +2068,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                     onPressed: _openWeb,
                     style: FilledButton.styleFrom(
                       visualDensity: VisualDensity.compact,
-                      minimumSize: const Size.fromHeight(42),
+                      minimumSize: const Size.fromHeight(38),
                     ),
                     icon: const Icon(Icons.public, size: 18),
                     label: const Text('打开网页 / 抓取'),
@@ -2081,7 +2079,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   onPressed: _videos.isEmpty ? null : _playAll,
                   style: OutlinedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    minimumSize: const Size(0, 42),
+                    minimumSize: const Size(0, 38),
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                   ),
                   icon: const Icon(Icons.play_arrow_rounded, size: 18),
@@ -2089,7 +2087,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 ),
               ],
             ),
-            const SizedBox(height: 2),
             Row(
               children: [
                 TextButton.icon(
