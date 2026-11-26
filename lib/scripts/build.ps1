@@ -7,6 +7,10 @@ try {
 
     $versionCode = [int](git rev-list --count HEAD).Trim()
 
+    # Android installs compare versionCode only. This fork has only ~90 commits while
+    # upstream 2.2.1 is ~5655, so we use a high base for android to allow overwrite install.
+    if ($Arg -eq 'android') { $versionCode = 100000 + $versionCode }
+
     $commitHash = (git rev-parse HEAD).Trim()
 
     $updatedContent = foreach ($line in (Get-Content -Path 'pubspec.yaml' -Encoding UTF8)) {
