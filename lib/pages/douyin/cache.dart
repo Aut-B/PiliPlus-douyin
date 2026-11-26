@@ -32,8 +32,52 @@ abstract final class ShortVideoMediaCache {
   /// 正在下载的条目，避免同一条被并发拉两遍。
   static final Set<String> _inFlight = {};
 
-  /// 收藏夹 / 播放列表里这些 key 对应的文件不参与容量淘汰。
+  /// 播放列表 / 最近起播的 key。先淘汰不在这个集合里的文件，再淘汰这里的。
   static Set<String> _protectedKeys = const <String>{};
+
+  /// 保底不能让容量上限删掉的 key（正在播 + 最近一条）。
+  static Set<String> _keepKeys = const <String>{};
+
+  /// 手动缓存批次临时纳入的 key。
+  ///
+  /// 用户选中的条目多数不在播放列表里；批次期间把它们也算作受保护，
+  /// 下载触发的 prune 才不会把刚存下的文件当普通缓存删掉。
+  static Set<String> _manualKeys = const <String>{};
+
+  /// 最近被播放路径访问的 key（新 → 旧）。
+  ///
+  /// `ShortVideoPlayStats` 里的两个 Set 重复 add 不会重排，从尾部推断不出
+  /// 真正的「正在播」。播放解析一定会先经过 [localPath]，这里用
+  /// move-to-front 记录真实访问顺序；批量扫描传 `track: false`，不会污染。
+  static final List<String> _playbackKeys = <String>[];
+  static const int _playbackHistory = 6;
+
+  /// 最近起播的 key，新的在前（默认「正在播 + 上一条」）。
+  static List<String> recentPlaybackKeys([int limit = 2]) {
+    if (limit <= 0 || _playbackKeys.isEmpty) return const <String>[];
+    final count = limit > _playbackKeys.length ? _playbackKeys.length : limit;
+    return _playbackKeys.take(count).toList(growable: false);
+  }
+
+  static void _notePlayback(String key) {
+    if (key.isEmpty) return;
+    _playbackKeys.remove(key);
+    _playbackKeys.insert(0, key);
+    if (_playbackKeys.length > _playbackHistory) {
+      _playbackKeys.removeRange(_playbackHistory, _playbackKeys.length);
+    }
+  }
+
+  /// 当前硬保底的 key：正在播的那条和最近一条。
+  ///
+  /// 每次 prune 都从 [_playbackKeys] 现取，而不是用 [protect] 时的快照；
+  /// 否则扫盘期间用户换了正在播的视频，旧快照会漏掉新条目，误把它删掉。
+  static Set<String> _activeKeepKeys() {
+    final recent = recentPlaybackKeys(2).where((key) => key.isNotEmpty);
+    if (recent.isNotEmpty) return recent.toSet();
+    // 还没记录到播放路径时沿用 protect 传入的保底（通常是空集）。
+    return _keepKeys;
+  }
 
   /// 目录只解析一次。
   ///
@@ -85,10 +129,33 @@ abstract final class ShortVideoMediaCache {
     }
   }
 
-  /// 刷新受保护 key；后台自动下载完成后调用，避免刚抓到的收藏被 _prune 删掉。
-  static void protect(Iterable<String> keys) {
+  /// 刷新受保护 key。
+  ///
+  /// [keys] 只是「优先保留」：超过容量上限时它们也会被淘汰；[keep] 是调用时的
+  /// 硬保底，prune 时仍会以当时的 [recentPlaybackKeys] 为准。
+  static void protect(
+    Iterable<String> keys, {
+    Iterable<String> keep = const <String>[],
+  }) {
     _protectedKeys = keys.toSet();
+    _keepKeys = keep.toSet();
   }
+
+  /// 手动缓存一批条目时调用；批次结束务必 [endManualCache]。
+  static void beginManualCache(Iterable<String> keys) {
+    _manualKeys = keys.toSet();
+  }
+
+  static void endManualCache() {
+    _manualKeys = const <String>{};
+  }
+
+  static Set<String> _protectNow() => _manualKeys.isEmpty
+      ? _protectedKeys
+      : <String>{..._protectedKeys, ..._manualKeys};
+
+  /// 当前机型的缓存硬上限（字节）。
+  static int get limitBytes => ShortVideoPerf.cacheLimitBytes;
 
   static String _fileKeyOf(String fileName) {
     if (!fileName.endsWith('.mp4')) return '';
@@ -107,7 +174,19 @@ abstract final class ShortVideoMediaCache {
   }
 
   /// 已经有完整文件就返回路径，否则 null。
-  static Future<String?> localPath(ShortVideo video) async {
+  ///
+  /// 只有真正的播放解析入口才传 `track: true`（move-to-front）；批量扫描、
+  /// 缓存写入后的复核一律用默认的 `false`，否则整个收藏列表都会被当成
+  /// 正在播，把真实播放条目挤出保底集合。
+  static Future<String?> localPath(
+    ShortVideo video, {
+    bool track = false,
+  }) async {
+    if (track) _notePlayback(video.key);
+    return _existingPath(video);
+  }
+
+  static Future<String?> _existingPath(ShortVideo video) async {
     try {
       final file = await _fileFor(video);
       if (!await file.exists()) return null;
@@ -158,7 +237,7 @@ abstract final class ShortVideoMediaCache {
     await ShortVideoPerf.ensureProbed();
     final key = '${video.platform}:${video.id}';
     if (_inFlight.contains(key)) {
-      final existing = await localPath(video);
+      final existing = await _existingPath(video);
       return ShortVideoDownload(
         path: existing,
         error: existing == null ? '这条正在下载' : null,
@@ -166,7 +245,7 @@ abstract final class ShortVideoMediaCache {
     }
     _inFlight.add(key);
     try {
-      final existing = await localPath(video);
+      final existing = await _existingPath(video);
       if (existing != null) return ShortVideoDownload(path: existing);
       final target = await _fileFor(video);
       final errors = <String>[];
@@ -185,8 +264,7 @@ abstract final class ShortVideoMediaCache {
         onProgress: onProgress,
       );
       if (nativePath != null) {
-        unawaited(_prune());
-        return ShortVideoDownload(path: nativePath);
+        return await _settle(video);
       }
       if (ShortVideoWeb.lastDownloadError.isNotEmpty) {
         errors.add('native: ${ShortVideoWeb.lastDownloadError}');
@@ -210,8 +288,7 @@ abstract final class ShortVideoMediaCache {
             onProgress: onProgress,
           );
           if (retried != null) {
-            unawaited(_prune());
-            return ShortVideoDownload(path: retried);
+            return await _settle(video);
           }
           errors.add('fresh: ${ShortVideoWeb.lastDownloadError}');
         } else {
@@ -231,8 +308,7 @@ abstract final class ShortVideoMediaCache {
           onProgress: onProgress,
         );
         if (error == null) {
-          unawaited(_prune());
-          return ShortVideoDownload(path: target.path);
+          return await _settle(video);
         }
         errors.add('${_hostOf(url)}: $error');
       }
@@ -242,6 +318,20 @@ abstract final class ShortVideoMediaCache {
     } finally {
       _inFlight.remove(key);
     }
+  }
+
+  /// 下载成功后先等一次容量淘汰落定，再以磁盘为准返回结果。
+  ///
+  /// 以前 `unawaited(_prune())` 就直接返回 path，prune 可能紧接着把刚写下的
+  /// 文件淘汰掉，调用方却把这条记成「已缓存」。这里串行等 prune 完成并复核
+  /// [localPath]，文件不在了就明确返回失败。
+  static Future<ShortVideoDownload> _settle(ShortVideo video) async {
+    await _prune();
+    final path = await _existingPath(video);
+    if (path == null) {
+      return const ShortVideoDownload(error: '本地缓存已满，这条未能保留');
+    }
+    return ShortVideoDownload(path: path);
   }
 
   /// 长期地址（tiktokv.com）只认 App 的 UA，签名直链则要用网页 UA。
@@ -353,38 +443,150 @@ abstract final class ShortVideoMediaCache {
     }
   }
 
-  /// 超过上限就把最旧的删掉（低内存机型上限更小）。
-  static Future<void> _prune() async {
+  /// 立即按当前容量上限压一次目录（后台下载前后都能调）。
+  static Future<void> enforceLimit() => _prune();
+
+  static Future<void>? _pruneTask;
+  static bool _pruneQueued = false;
+
+  /// 串行执行 prune：下载成功后会连发多次，并发删同一批文件会重复计数。
+  static Future<void> _prune() {
+    final running = _pruneTask;
+    if (running != null) {
+      _pruneQueued = true;
+      return running;
+    }
+    final task = _pruneLoop();
+    _pruneTask = task;
+    return task;
+  }
+
+  static Future<void> _pruneLoop() async {
     try {
-      final limit = ShortVideoPerf.cacheLimitBytes;
-      final dir = await _ensureDir();
-      if (!await dir.exists()) return;
-      final entries = <({File file, DateTime at, int size})>[];
-      var total = 0;
-      await for (final entity in dir.list()) {
-        if (entity is! File) continue;
-        if (entity.path.endsWith('.part')) continue;
+      do {
+        _pruneQueued = false;
         try {
-          final size = await entity.length();
-          final at = await entity.lastModified();
-          total += size;
-          final key = _fileKeyOf(entity.uri.pathSegments.last);
-          if (!_protectedKeys.contains(key)) {
-            entries.add((file: entity, at: at, size: size));
-          }
+          await _pruneOnce();
         } catch (_) {}
+      } while (_pruneQueued);
+    } finally {
+      _pruneTask = null;
+    }
+  }
+
+  /// 超过上限就把最旧的删掉（低内存机型上限更小）。
+  ///
+  /// 受保护文件也计入 total，超限时同样按最旧淘汰；只是排在普通文件之后，
+  /// 尽量晚删。硬保底是删除时现取的「正在播 + 最近一条」。
+  static Future<void> _pruneOnce() async {
+    // 上限取决于机型内存，先探测一次；否则 6S 在首次下载前会误用 3GB。
+    await ShortVideoPerf.ensureProbed();
+    final limit = ShortVideoPerf.cacheLimitBytes;
+    final dir = await _ensureDir();
+    if (!await dir.exists()) return;
+    final entries = <({File file, DateTime at, int size, String key})>[];
+    var total = 0;
+    // 崩溃留下的 .part 既占盘又永远不会被淘汰；一小时以上的视为陈旧，
+    // 计入总量并参与淘汰。进行中的下载会持续刷新 mtime，不会被误删。
+    final stalePartBefore = DateTime.now().subtract(const Duration(hours: 1));
+    await for (final entity in dir.list()) {
+      if (entity is! File) continue;
+      final isPart = entity.path.endsWith('.part');
+      try {
+        final at = await entity.lastModified();
+        if (isPart && at.isAfter(stalePartBefore)) continue;
+        final size = await entity.length();
+        total += size;
+        entries.add((
+          file: entity,
+          at: at,
+          size: size,
+          key: isPart ? '' : _fileKeyOf(entity.uri.pathSegments.last),
+        ));
+      } catch (_) {}
+    }
+    if (total <= limit || entries.isEmpty) return;
+
+    final entryKeys = entries
+        .map((entry) => entry.key)
+        .where((key) => key.isNotEmpty)
+        .toSet();
+    final remaining = [...entries];
+    while (total > limit && remaining.isNotEmpty) {
+      // 每一步都重读当前播放顺序，prune 期间刚起播的条目不按旧快照删。
+      final keepNow = _activeKeepKeys();
+      final protectNow = _protectNow();
+      final diskKeep = keepNow.any(
+        (key) => key.isNotEmpty && entryKeys.contains(key),
+      );
+      // keep 里的条目可能还没落盘（比如正在播的这条只有网络直链）；
+      // 这种情况下仍然保底留一条最新的视频，别把缓存目录清空。
+      final fallbackKey = diskKeep ? '' : _fallbackKeyOf(remaining, protectNow);
+
+      bool protectedKeep(
+        ({File file, DateTime at, int size, String key}) entry,
+      ) => entry.key.isNotEmpty && keepNow.contains(entry.key);
+      final ordinary =
+          remaining
+              .where(
+                (entry) =>
+                    !protectNow.contains(entry.key) &&
+                    !protectedKeep(entry) &&
+                    !(fallbackKey.isNotEmpty && entry.key == fallbackKey),
+              )
+              .toList()
+            ..sort((a, b) => a.at.compareTo(b.at));
+      final protected =
+          remaining
+              .where(
+                (entry) =>
+                    protectNow.contains(entry.key) &&
+                    !protectedKeep(entry) &&
+                    !(fallbackKey.isNotEmpty && entry.key == fallbackKey),
+              )
+              .toList()
+            ..sort((a, b) => a.at.compareTo(b.at));
+      final candidate = ordinary.isNotEmpty
+          ? ordinary.first
+          : (protected.isNotEmpty ? protected.first : null);
+      // 剩下的全是 keep / 兜底条目：硬保底，不能再删。
+      if (candidate == null) break;
+
+      // 删除前再同步确认一次，绝不删当时正在播的那条。
+      final guardKeep = _activeKeepKeys();
+      if (candidate.key.isNotEmpty && guardKeep.contains(candidate.key)) {
+        continue;
       }
-      if (total <= limit) return;
-      if (entries.isEmpty) return;
-      entries.sort((a, b) => a.at.compareTo(b.at));
-      for (final entry in entries) {
-        if (total <= limit) break;
-        try {
-          await entry.file.delete();
-          total -= entry.size;
-        } catch (_) {}
-      }
-    } catch (_) {}
+      remaining.remove(candidate);
+      try {
+        await candidate.file.delete();
+        total -= candidate.size;
+        entryKeys.remove(candidate.key);
+      } catch (_) {}
+    }
+  }
+
+  /// 没有硬保底条目落盘时，至少再留一条最新的视频（优先受保护条目）。
+  ///
+  /// key 为空的非视频残留不享受保底，否则它们会一直占着上限。
+  static String _fallbackKeyOf(
+    List<({File file, DateTime at, int size, String key})> entries,
+    Set<String> protectKeys,
+  ) {
+    final protectedEntries = entries
+        .where((entry) => protectKeys.contains(entry.key))
+        .toList(growable: false);
+    final pool = protectedEntries.isEmpty ? entries : protectedEntries;
+    final videoEntries = pool
+        .where((entry) => entry.key.isNotEmpty)
+        .toList(growable: false);
+    final candidates = videoEntries.isEmpty ? pool : videoEntries;
+    if (candidates.isEmpty) return '';
+    var newest = candidates.first;
+    for (final entry in candidates) {
+      if (entry.at.isAfter(newest.at)) newest = entry;
+    }
+    return newest.key;
   }
 
   /// 删掉这一条的缓存（收藏里删条目时一并调）。

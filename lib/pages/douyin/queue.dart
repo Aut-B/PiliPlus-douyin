@@ -164,7 +164,7 @@ abstract final class QueueBus {
 Future<QueueMedia?> fastOfflineMedia(QueueEntry entry) async {
   final video = entry.short;
   if (video == null) return null;
-  final local = await ShortVideoMediaCache.localPath(video);
+  final local = await ShortVideoMediaCache.localPath(video, track: true);
   if (local == null) return null;
   ShortVideoPlayStats.noteLocal(video.key, tiktok: video.platform == 'tiktok');
   return QueueMedia(url: local, userAgent: '', referer: '', isLocal: true);
@@ -201,7 +201,7 @@ Future<QueueMedia?> resolveQueueEntry(
 /// TikTok 的长期地址只认 App UA（见 [tiktokAppUserAgent]），所以探成功之后
 /// 播放也必须带同一个 UA，否则「探通了、播不了」。
 Future<QueueMedia?> _resolveShortVideo(ShortVideo video, String cookie) async {
-  final local = await ShortVideoMediaCache.localPath(video);
+  final local = await ShortVideoMediaCache.localPath(video, track: true);
   if (local != null) {
     ShortVideoPlayStats.noteLocal(
       video.key,

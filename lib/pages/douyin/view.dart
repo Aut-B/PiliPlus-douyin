@@ -949,7 +949,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final cached = <String>{};
     for (final video in videos) {
       if (!mounted || scanId != _cacheScanId) return;
-      if (await ShortVideoMediaCache.localPath(video) != null) {
+      if (await ShortVideoMediaCache.localPath(video, track: false) != null) {
         cached.add(video.key);
       }
     }
@@ -1005,6 +1005,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       return;
     }
     ShortVideoAutoCache.refreshProtection();
+    // 手动选的条目多数不在播放列表里；批次期间临时纳入保护，
+    // 下载触发的淘汰才不会把刚存下的文件当普通缓存删掉。
+    ShortVideoMediaCache.beginManualCache(videos.map((video) => video.key));
     setState(() {
       _caching = true;
       _cacheDone = 0;
@@ -1014,76 +1017,124 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     });
     var ok = 0;
     var skipped = 0;
-    final cookie = await ShortVideoWeb.cookieHeader(
-      platform.cookieDomainNeedle,
-    );
-    for (var i = 0; i < videos.length; i++) {
-      if (!mounted) break;
-      final video = videos[i];
-      final existing = await ShortVideoMediaCache.localPath(video);
-      if (existing != null) {
-        skipped++;
-        if (mounted) {
+    var stopped = 0;
+    final limit = ShortVideoMediaCache.limitBytes;
+    try {
+      final cookie = await ShortVideoWeb.cookieHeader(
+        platform.cookieDomainNeedle,
+      );
+      for (var i = 0; i < videos.length; i++) {
+        if (!mounted) break;
+        final video = videos[i];
+        final existing = await ShortVideoMediaCache.localPath(
+          video,
+          track: false,
+        );
+        if (existing != null) {
+          skipped++;
+          if (mounted) {
+            setState(() {
+              _cachedKeys.add(video.key);
+              _cacheDone = i + 1;
+            });
+          }
+          continue;
+        }
+        if (!mounted) break;
+        // 到硬上限就先停手：再下只会触发淘汰，白耗流量。
+        if (await ShortVideoMediaCache.size() >= limit) {
+          stopped = videos.length - i;
+          break;
+        }
+        setState(() {
+          _cacheProgress[video.key] = 0;
+          _status = '缓存中 ${i + 1}/${videos.length}：${video.title}';
+        });
+        final urls = <String>[
+          if (video.playUrl.isNotEmpty) video.playUrl,
+          ...stableUrls(video),
+        ];
+        final total = videos.length;
+        final result = await ShortVideoMediaCache.download(
+          video,
+          urls: urls,
+          userAgent: platform.userAgent,
+          referer: platform.referer,
+          cookie: cookie,
+          appUserAgent: platform == ShortVideoPlatform.tiktok
+              ? tiktokAppUserAgent
+              : '',
+          onProgress: (progress) {
+            if (!mounted) return;
+            final now = DateTime.now().millisecondsSinceEpoch;
+            final last = _cacheProgressAt[video.key] ?? 0;
+            if (progress < 1 && now - last < 180) return;
+            _cacheProgressAt[video.key] = now;
+            setState(() {
+              _cacheProgress[video.key] = progress.clamp(0.0, 1.0);
+              _status =
+                  '缓存中 ${i + 1}/$total'
+                  '（${(progress * 100).clamp(0, 100).round()}%）：'
+                  '${video.title}';
+            });
+          },
+        );
+        if (!mounted) break;
+        if (result.ok) {
+          // 下载返回 path 不代表盘上还留着：淘汰可能紧接着把它删掉。
+          // 以磁盘为准复核，_cachedKeys 才不会出现「显示已缓存但播不了」。
+          final saved = await ShortVideoMediaCache.localPath(
+            video,
+            track: false,
+          );
+          if (saved != null) {
+            ok++;
+            setState(() {
+              _cacheProgress.remove(video.key);
+              _cacheProgressAt.remove(video.key);
+              _cacheDone = i + 1;
+              _cachedKeys.add(video.key);
+            });
+          } else {
+            setState(() {
+              _cacheProgress.remove(video.key);
+              _cacheProgressAt.remove(video.key);
+              _cacheDone = i + 1;
+              _cachedKeys.remove(video.key);
+            });
+            SmartDialog.showToast('缓存已满，这条未能保留：${video.title}');
+          }
+        } else {
           setState(() {
-            _cachedKeys.add(video.key);
+            _cacheProgress.remove(video.key);
+            _cacheProgressAt.remove(video.key);
             _cacheDone = i + 1;
           });
+          SmartDialog.showToast(
+            '缓存失败：${video.title}（${result.error ?? '未知错误'}）',
+          );
         }
-        continue;
       }
-      if (!mounted) break;
+      if (!mounted) return;
+      await ShortVideoMediaCache.enforceLimit();
+      final cachedNow = <String>{};
+      for (final video in videos) {
+        if (await ShortVideoMediaCache.localPath(video, track: false) != null) {
+          cachedNow.add(video.key);
+        }
+      }
+      if (!mounted) return;
       setState(() {
-        _cacheProgress[video.key] = 0;
-        _status = '缓存中 ${i + 1}/${videos.length}：${video.title}';
+        for (final video in videos) {
+          if (cachedNow.contains(video.key)) {
+            _cachedKeys.add(video.key);
+          } else {
+            _cachedKeys.remove(video.key);
+          }
+        }
       });
-      final urls = <String>[
-        if (video.playUrl.isNotEmpty) video.playUrl,
-        ...stableUrls(video),
-      ];
-      final total = videos.length;
-      final result = await ShortVideoMediaCache.download(
-        video,
-        urls: urls,
-        userAgent: platform.userAgent,
-        referer: platform.referer,
-        cookie: cookie,
-        appUserAgent: platform == ShortVideoPlatform.tiktok
-            ? tiktokAppUserAgent
-            : '',
-        onProgress: (progress) {
-          if (!mounted) return;
-          final now = DateTime.now().millisecondsSinceEpoch;
-          final last = _cacheProgressAt[video.key] ?? 0;
-          if (progress < 1 && now - last < 180) return;
-          _cacheProgressAt[video.key] = now;
-          setState(() {
-            _cacheProgress[video.key] = progress.clamp(0.0, 1.0);
-            _status =
-                '缓存中 ${i + 1}/$total'
-                '（${(progress * 100).clamp(0, 100).round()}%）：'
-                '${video.title}';
-          });
-        },
-      );
-      if (!mounted) break;
-      if (result.ok) {
-        ok++;
-        setState(() {
-          _cacheProgress.remove(video.key);
-          _cacheProgressAt.remove(video.key);
-          _cacheDone = i + 1;
-          _cachedKeys.add(video.key);
-        });
-      } else {
-        setState(() {
-          _cacheProgress.remove(video.key);
-          _cacheProgressAt.remove(video.key);
-          _cacheDone = i + 1;
-        });
-        SmartDialog.showToast(
-          '缓存失败：${video.title}（${result.error ?? '未知错误'}）',
-        );
-      }
+    } finally {
+      ShortVideoMediaCache.endManualCache();
     }
     if (!mounted) return;
     setState(() {
@@ -1092,11 +1143,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _cacheProgressAt.clear();
       _cacheTotal = 0;
       _cacheDone = 0;
-      _status =
-          '缓存完成：新增 $ok 条'
-          '${skipped > 0 ? '，已有 $skipped 条' : ''}'
-          '${ok + skipped == videos.length ? '' : '，失败 ${videos.length - ok - skipped} 条'}';
+      _status = stopped > 0
+          ? '缓存已达上限：新增 $ok 条'
+                '${skipped > 0 ? '，已有 $skipped 条' : ''}'
+                '，剩余 $stopped 条未缓存'
+          : '缓存完成：新增 $ok 条'
+                '${skipped > 0 ? '，已有 $skipped 条' : ''}'
+                '${ok + skipped == videos.length ? '' : '，失败 ${videos.length - ok - skipped} 条'}';
     });
+    if (stopped > 0) {
+      SmartDialog.showToast('缓存已达上限，剩余 $stopped 条未缓存');
+    }
     await _refreshCacheSize();
   }
 
