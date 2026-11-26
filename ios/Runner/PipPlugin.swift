@@ -60,6 +60,30 @@ final class PipPlugin: NSObject, FlutterPlugin {
       else { return }
       session.frameAvailable()
     }
+    TextureTracker.onTextureUnregistered = { [weak self] textureId in
+      // The engine calls this on the platform thread, but keep the hop so
+      // session state is only touched on main.
+      DispatchQueue.main.async {
+        guard #available(iOS 15.0, *), let session = self?.session,
+          session.textureId == textureId
+        else { return }
+        session.surfaceSourceUnregistered()
+      }
+    }
+    TextureTracker.onTextureRegistered = { [weak self] textureId in
+      // 播放器重建会注册一个新 texture；PiP 窗口还在（或正 hold 最后一帧）时
+      // 自动把源切到新纹理，否则会一直冻在旧 id 的最后一帧。
+      DispatchQueue.main.async {
+        guard #available(iOS 15.0, *), let session = self?.session else { return }
+        guard session.textureId != textureId, session.pipActiveOrHolding else {
+          return
+        }
+        PipTrace.log(
+          "pip-surface: auto-retarget on texture-registered \(session.textureId) -> \(textureId)"
+        )
+        session.retarget(to: textureId, reason: "texture-registered")
+      }
+    }
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -78,17 +102,26 @@ final class PipPlugin: NSObject, FlutterPlugin {
         return
       }
       let session: PipSession
-      if let current = self.session, current.textureId == textureId {
+      if let current = self.session {
+        if current.textureId != textureId {
+          // A player rebuild changes the Flutter texture id while PiP is on
+          // screen. Tearing the controller down here drops the PiP window and
+          // leaves only the audio track alive. Keep the controller/layer and
+          // retarget the frame source; the last frame stays visible until the
+          // new texture produces its first frame.
+          current.retarget(to: textureId, reason: "enter")
+        } else {
+          current.releaseSurfaceHold(reason: "enter-same-texture")
+        }
         session = current
       } else {
-        tearDown()
         session = PipSession(textureId: textureId) { [weak self] method, arguments in
           self?.channel.invokeMethod(method, arguments: arguments)
         }
         session.onStop = { [weak self, weak session] in
           // Keep the session alive while armed for auto-enter.
           guard let self, let session, self.session === session,
-            !session.autoEnter
+            session.shouldTeardownOnStop
           else { return }
           self.tearDown()
         }
@@ -115,14 +148,19 @@ final class PipPlugin: NSObject, FlutterPlugin {
       result(nil)
     case "disableAutoEnter":
       if let session {
+        session.noteAutoEnterDisabled()
         session.autoEnter = false
-        if !session.isActive {
+        if !session.isActive && !session.shouldKeepOnDisarm {
           tearDown()
         }
       }
       result(nil)
     case "dispose":
-      tearDown()
+      if let session, session.deferTeardownForDispose() {
+        PipTrace.log("dispose: deferred while PiP surface is active")
+      } else {
+        tearDown()
+      }
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -268,12 +306,60 @@ private final class PipSession: NSObject {
   /// 一旦进入 PiP 就完全不节流，只保留 latest-wins 的在途帧合并。
   private static let idleFrameInterval = 0.5
 
-  let textureId: Int64
+  /// How long a held surface may wait for the new texture's first frame before
+  /// the presentation is paused. The PiP window is never torn down here.
+  private static let holdTimeout: TimeInterval = 8
+  /// Retry cadence for a hold that still has no frame after a timeout.
+  private static let holdRetryInterval: TimeInterval = 4
+  /// Bounded retries before the terminal stalled state is logged.
+  private static let maxHoldRetries = 4
+
+  /// Retargetable: a player rebuild registers a new Flutter texture while the
+  /// PiP window must stay alive on the old one until the new source shows.
+  private(set) var textureId: Int64
   var onStop: (() -> Void)?
   private(set) var isActive = false
+  /// dispose() arrived while the PiP surface was still visible. The controller
+  /// is kept until DidStop, otherwise the window disappears and only audio
+  /// keeps playing.
+  private(set) var pendingTeardown = false
+  /// The surface is being held on the last frame while a new texture is
+  /// expected. While this is set the layer/controller must never be torn down.
+  private var surfaceHoldStorage = false
+  private let surfaceLock = NSLock()
+  private var surfaceEpoch = 0
+  private var holdAutoPaused = false
+  private var holdRetryCount = 0
+  /// Main thread: whether the last successfully enqueued frame is still on
+  /// screen (diagnostics + hold bookkeeping).
+  private var hasRetainedSurfaceFrame = false
 
   var autoEnter = false {
     didSet { updateAutoEnter() }
+  }
+
+  /// Keep the session alive while armed for auto-enter; a deferred dispose
+  /// additionally needs the session to survive until PiP actually stops.
+  var shouldTeardownOnStop: Bool { !autoEnter || pendingTeardown }
+
+  /// Do not tear the session down while a PiP window is actually visible.
+  /// An in-flight start has no surface to lose; keeping it alive is exactly
+  /// the C57 regression (window pops up after returning to the foreground).
+  var shouldKeepOnDisarm: Bool {
+    controller.isPictureInPictureActive
+  }
+
+  private var surfaceHeld: Bool {
+    get {
+      surfaceLock.lock()
+      defer { surfaceLock.unlock() }
+      return surfaceHoldStorage
+    }
+    set {
+      surfaceLock.lock()
+      surfaceHoldStorage = newValue
+      surfaceLock.unlock()
+    }
   }
 
   private let sendEvent: (String, Any?) -> Void
@@ -346,6 +432,12 @@ private final class PipSession: NSObject {
   private var directPoolSize = CGSize.zero
   private var directPoolFormat: OSType = 0
   private var formatDescription: CMVideoFormatDescription?
+  /// Last frame that made it into the layer. Its pixel buffer belongs to our
+  /// own pool, so it can be re-enqueued while a retarget is waiting for the
+  /// new texture's first frame.
+  private var lastSurfacePixelBuffer: CVPixelBuffer?
+  /// Set once any frame has been enqueued since the current hold started.
+  private var replayBlocked = false
   /// Size of the PiP window in pixels, zero until known.
   private var renderSize = CGSize.zero
 
@@ -452,6 +544,7 @@ private final class PipSession: NSObject {
   func configure(width: Double, height: Double) {
     guard let window = Self.hostWindow() else {
       PipTrace.log("configure: hostWindow nil -> give up")
+      logSurface("attach-miss", reason: "no-window")
       return
     }
     if sourceView.superview !== window {
@@ -478,6 +571,7 @@ private final class PipSession: NSObject {
         + "possible=\(controller.isPictureInPicturePossible) hasFrame=\(hasFrame) "
         + "windowCount=\(Self.windowCount()) superview=\(String(describing: sourceView.superview))"
     )
+    logSurface("attach", reason: "configure")
     frameAvailable(force: true)
   }
 
@@ -499,7 +593,17 @@ private final class PipSession: NSObject {
     let position = (args["position"] as? NSNumber)?.int64Value
     let buffering = args["isBuffering"] as? Bool ?? isBuffering
     let durationMs = (args["duration"] as? NSNumber)?.int64Value
-    if let value = args["isPlaying"] as? Bool { isPlaying = value }
+    if let value = args["isPlaying"] as? Bool {
+      // While a hold timed out the presentation is paused on purpose; a Dart
+      // position tick must not silently unpause it. A real pause clears the
+      // auto-pause so the hold end will not resume playback later.
+      if !(surfaceHeld && holdAutoPaused) {
+        isPlaying = value
+      }
+      if !value {
+        holdAutoPaused = false
+      }
+    }
     if let value = args["isBuffering"] as? Bool { isBuffering = value }
     if let value = args["isLive"] as? Bool { isLive = value }
     if let value = durationMs {
@@ -603,11 +707,294 @@ private final class PipSession: NSObject {
     controller.canStartPictureInPictureAutomaticallyFromInline = autoEnter && hasFrame
   }
 
+  // MARK: Surface continuity
+
+  /// A texture switch must never destroy the PiP surface. Retarget reuses the
+  /// exact same controller/layer/view, keeps the last frame visible and only
+  /// swaps the id that frames are pulled from.
+  func retarget(to newTextureId: Int64, reason: String) {
+    let previous = textureId
+    guard previous != newTextureId else { return }
+    if needsSurfaceHold {
+      beginSurfaceHold(reason: "retarget")
+    }
+    textureId = newTextureId
+    // The new texture has not delivered a frame yet. Without this reset both
+    // startIfPending() and the background auto-enter path would keep acting on
+    // the old texture's "has a frame" state and start PiP on an empty surface.
+    // The sameTexture completion branch flips it back once the new source
+    // enqueues its first frame.
+    hasFrame = false
+    updateAutoEnter()
+    pendingTeardown = false
+    pendingFrameRequested = false
+    // New source => new decoder/pixel format. Drop the cached format and
+    // pools on the frame queue; makeSampleBuffer recreates them.
+    frameQueue.async { [weak self] in
+      guard let self else { return }
+      self.formatDescription = nil
+      self.pool = nil
+      self.poolSize = .zero
+      self.directPool = nil
+      self.directPoolSize = .zero
+      self.directPoolFormat = 0
+      self.replayBlocked = false
+    }
+    PipTrace.log(
+      "retarget: \(previous) -> \(newTextureId) reason=\(reason) "
+        + "pipActive=\(controller.isPictureInPictureActive) hold=\(surfaceHeld)"
+    )
+    logSurface("retarget", reason: reason)
+    frameAvailable(force: true)
+  }
+
+  /// Called when the engine unregisters a texture. If it was the current PiP
+  /// source, hold the last frame instead of letting the surface go empty.
+  func surfaceSourceUnregistered() {
+    guard needsSurfaceHold else { return }
+    beginSurfaceHold(reason: "texture-unregistered")
+  }
+
+  /// PiP 窗口正在显示，或 surface 正 hold 着最后一帧：此时源纹理一旦换新，
+  /// 必须跟着 retarget，否则 session 会一直停在已 unregister 的旧 id 上，
+  /// 窗口只剩 hold 的最后一帧（有声无画）。
+  var pipActiveOrHolding: Bool {
+    controller.isPictureInPictureActive || surfaceHeld
+  }
+
+  private var needsSurfaceHold: Bool {
+    isActive || controller.isPictureInPictureActive || pipStartRequested
+      || (autoEnter && UIApplication.shared.applicationState != .active)
+  }
+
+  /// Entered again with the same texture: frames should already flow; release
+  /// any hold and auto-resume playback if the hold had paused it.
+  func releaseSurfaceHold(reason: String) {
+    // An explicit enter for the current texture means the surface is wanted,
+    // but only if the engine still owns that id. A dead id must not clear the
+    // deferred teardown: there would be no source left behind the window.
+    guard TextureTracker.texture(for: textureId) != nil else {
+      surfaceSourceUnregistered()
+      return
+    }
+    pendingTeardown = false
+    endSurfaceHold(reason: reason)
+  }
+
+  /// Dispose of the controller only when no PiP surface would disappear.
+  func deferTeardownForDispose() -> Bool {
+    // A rebuild that replaces the player (auto-recover / proactive) tears the
+    // controller down and leaves PiP with audio but no pixels. Leaving the
+    // video page also disposes the player, but Dart calls disableAutoEnter
+    // first on that path, so the two are distinguishable: no surface means
+    // nothing to lose, and an already-disarmed session in the foreground is a
+    // deliberate page exit that must still close the window.
+    guard isActive || controller.isPictureInPictureActive else { return false }
+    let background = UIApplication.shared.applicationState != .active
+    guard background || autoEnter else { return false }
+    pendingTeardown = true
+    PipTrace.log(
+      "dispose: deferred pendingTeardown=YES "
+        + "pipActive=\(controller.isPictureInPictureActive) hold=\(surfaceHeld) "
+        + "background=\(background) autoEnter=\(autoEnter)"
+    )
+    logSurface("dispose-deferred", reason: "pip-active")
+    return true
+  }
+
+  /// C57 regression guard: disarm may arrive while a start is still pending.
+  /// Drop that pending start, but never touch an already visible window.
+  func noteAutoEnterDisabled() {
+    guard !isActive, !controller.isPictureInPictureActive else { return }
+    if pendingStart {
+      PipTrace.log("disableAutoEnter: dropped pending start")
+    }
+    if pipStartRequested {
+      // startPictureInPicture() is in flight but there is no visible surface
+      // yet. Cancel it, otherwise AVKit can still pop the window after the app
+      // is back in the foreground (C57).
+      PipTrace.log("disableAutoEnter: cancelling in-flight start")
+      stopRequested = true
+      controller.stopPictureInPicture()
+      pipStartRequested = false
+    }
+    pendingStart = false
+    backgroundOnStart = false
+  }
+
+  private func beginSurfaceHold(reason: String) {
+    guard !surfaceHeld else { return }
+    surfaceHeld = true
+    holdRetryCount = 0
+    surfaceEpoch &+= 1
+    let token = surfaceEpoch
+    // Allow the retained frame to be replayed until the new source lands one.
+    frameQueue.async { [weak self] in
+      self?.replayBlocked = false
+    }
+    PipTrace.log(
+      "pip-surface: hold start texture=\(textureId) reason=\(reason) "
+        + "pipActive=\(controller.isPictureInPictureActive)"
+    )
+    logSurface("hold-start", reason: reason)
+    scheduleHoldTick(token: token)
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.holdTimeout) { [weak self] in
+      guard let self, self.surfaceEpoch == token, self.surfaceHeld else { return }
+      self.pauseForHoldTimeout(reason: reason)
+    }
+  }
+
+  /// Ends a hold and resumes playback when the hold auto-paused it.
+  private func endSurfaceHold(reason: String) {
+    guard surfaceHeld else { return }
+    let wasAutoPaused = holdAutoPaused
+    surfaceHeld = false
+    surfaceEpoch &+= 1
+    logSurface("hold-end", reason: reason)
+    if wasAutoPaused {
+      holdAutoPaused = false
+      resumePlaybackAfterHold(reason: reason)
+    }
+  }
+
+  /// Ends a hold without resuming (PiP stopped / session is going away).
+  private func cancelSurfaceHold(reason: String) {
+    guard surfaceHeld else { return }
+    surfaceHeld = false
+    holdAutoPaused = false
+    surfaceEpoch &+= 1
+    logSurface("hold-cancel", reason: reason)
+  }
+
+  /// Re-enqueue the retained frame every second while holding so the display
+  /// layer never runs dry during a slow rebuild. Skips once any frame landed
+  /// after the hold began (replayBlocked is frame-queue confined).
+  private func scheduleHoldTick(token: Int) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      guard let self, self.surfaceEpoch == token, self.surfaceHeld else { return }
+      // Capture on main; textureId may be retargeted while this runs.
+      let sourceTextureId = self.textureId
+      self.frameQueue.async { [weak self] in
+        guard let self, !self.replayBlocked else { return }
+        self.replayHeldFrame(textureId: sourceTextureId)
+      }
+      self.scheduleHoldTick(token: token)
+    }
+  }
+
+  /// Must run on frameQueue.
+  private func replayHeldFrame(textureId: Int64) {
+    guard let pixelBuffer = lastSurfacePixelBuffer else { return }
+    var stage = "hold-replay"
+    guard
+      let sampleBuffer = makeSampleBuffer(
+        pixelBuffer,
+        stage: &stage,
+        verbose: false
+      ),
+      enqueue(sampleBuffer, stage: &stage, verbose: false)
+    else { return }
+    PipTrace.log(
+      "pip-surface: replayed held frame texture=\(textureId) size="
+        + "\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))"
+    )
+  }
+
+  /// Fallback B: if a rebuild really is needed and takes too long, pause the
+  /// PiP presentation instead of leaving a live window with no fresh pixels.
+  /// The media keeps decoding so the new texture can still deliver its first
+  /// frame; the window resumes as soon as that frame lands.
+  private func pauseForHoldTimeout(reason: String) {
+    guard surfaceHeld else { return }
+    holdRetryCount += 1
+    let hasSource = TextureTracker.texture(for: textureId) != nil
+    logSurface(
+      "hold-timeout",
+      reason: "\(reason) attempt=\(holdRetryCount) source=\(hasSource ? "YES" : "NO")"
+    )
+    if hasSource {
+      // The new texture may have registered without ever delivering a frame
+      // callback. Pull from it again before parking the presentation.
+      seekGeneration &+= 1
+      requestFramesAfterReset(generation: seekGeneration)
+    } else {
+      // The engine already dropped this id; there is nothing to pull until a
+      // new texture registers, so keep the last frame visible and retry.
+      logSurface("source-gone", reason: "hold-timeout")
+    }
+    if isPlaying {
+      holdAutoPaused = true
+      isPlaying = false
+      let status = CMTimebaseSetRate(timebase, rate: 0)
+      controller.invalidatePlaybackState()
+      PipTrace.log(
+        "pip-surface: paused presentation after hold timeout reason=\(reason) "
+          + "status=\(status)"
+      )
+    }
+    guard holdRetryCount < Self.maxHoldRetries else {
+      // Terminal, bounded state: keep the last frame in the layer instead of
+      // invalidating the controller. Audio is untouched, and the user can
+      // resume manually if the source comes back.
+      surfaceHeld = false
+      holdAutoPaused = false
+      surfaceEpoch &+= 1
+      logSurface("hold-stalled", reason: "no-frame-after-\(holdRetryCount)-attempts")
+      return
+    }
+    let token = surfaceEpoch
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.holdRetryInterval) { [weak self] in
+      guard let self, self.surfaceEpoch == token, self.surfaceHeld else { return }
+      self.pauseForHoldTimeout(reason: reason)
+    }
+  }
+
+  private func resumePlaybackAfterHold(reason: String) {
+    guard !surfaceHeld else { return }
+    isPlaying = true
+    resetTimebase(targetMs: max(0, positionMs), reason: "hold-resume")
+    controller.invalidatePlaybackState()
+    sendEvent("setPlaying", true)
+    seekGeneration &+= 1
+    requestFramesAfterReset(generation: seekGeneration)
+    logSurface("hold-resume", reason: reason)
+  }
+
+  /// Diagnostics for the 15PM "PiP window has no pixels" case. Must run on
+  /// the main thread because it reads the layer/view geometry.
+  private func logSurface(_ event: String, reason: String) {
+    let layerSize = displayLayer.bounds.size
+    var ready = displayLayer.isReadyForMoreMediaData
+    var rendererStatus = "n/a"
+    if #available(iOS 17.0, *) {
+      ready = displayLayer.sampleBufferRenderer.isReadyForMoreMediaData
+      rendererStatus = "\(displayLayer.sampleBufferRenderer.status.rawValue)"
+    }
+    let layerError = displayLayer.error.map { "\($0)" } ?? "nil"
+    PipTrace.log(
+      "pip-surface: event=\(event) texture=\(textureId) "
+        + "layer=\(Int(layerSize.width))x\(Int(layerSize.height)) "
+        + "view=\(Int(sourceView.bounds.width))x\(Int(sourceView.bounds.height)) "
+        + "attached=\(displayLayer.superlayer != nil ? "YES" : "NO") "
+        + "inWindow=\(sourceView.superview != nil ? "YES" : "NO") "
+        + "hasPixelBuffer=\(hasRetainedSurfaceFrame ? "YES" : "NO") "
+        + "hasPixelBufferSemantics=last-enqueued "
+        + "layerStatus=\(displayLayer.status.rawValue) rendererStatus=\(rendererStatus) "
+        + "ready=\(ready) layerError=\(layerError) "
+        + "ios=\(UIDevice.current.systemVersion) "
+        + "pipActive=\(controller.isPictureInPictureActive ? "YES" : "NO") "
+        + "hold=\(surfaceHeld ? "YES" : "NO") reason=\(reason)"
+    )
+  }
+
   func invalidate() {
+    logSurface("detach", reason: "invalidate")
+    cancelSurfaceHold(reason: "invalidate")
     pendingStart = false
     pipStartRequested = false
     pendingFrameRequested = false
     backgroundOnStart = false
+    pendingTeardown = false
     possibleObservation?.invalidate()
     observers.forEach(NotificationCenter.default.removeObserver)
     controller.delegate = nil
@@ -618,6 +1005,7 @@ private final class PipSession: NSObject {
       isActive = false
       sendEvent("onStateChanged", ["active": false])
     }
+    hasRetainedSurfaceFrame = false
     // The content source retains its playback delegate (`self`).
     controller.contentSource = nil
     sourceView.removeFromSuperview()
@@ -713,6 +1101,9 @@ private final class PipSession: NSObject {
     frameInFlightSince = CACurrentMediaTime()
     frameGeneration &+= 1
     let generation = frameGeneration
+    // Captured on main: if a retarget happens while this frame is in flight,
+    // its content belongs to the previous texture and must not end the hold.
+    let sourceTextureId = textureId
     // didTransitionToRenderSize 在部分机型上一直给 0；轻量模式退化为
     // 按 sourceView 的视频区域尺寸渲染，避免每帧按源分辨率做 NV12→BGRA。
     // bounds 为 0 时依次退到父视图 / 宿主窗口，全部取不到才放弃缩放。
@@ -770,6 +1161,11 @@ private final class PipSession: NSObject {
         )
       {
         enqueued = self.enqueue(sampleBuffer, stage: &stage, verbose: verbose)
+        if enqueued {
+          // Own pool buffer, safe to keep and replay while retargeting.
+          self.lastSurfacePixelBuffer = pixelBuffer
+          self.replayBlocked = true
+        }
       }
       let layerStatus = self.displayLayer.status.rawValue
       let ready = self.displayLayer.isReadyForMoreMediaData
@@ -782,21 +1178,31 @@ private final class PipSession: NSObject {
         )
       }
       DispatchQueue.main.async {
-        guard self.frameGeneration == generation else { return }
+        guard self.frameGeneration == generation else {
+          // A newer generation already owns frameInFlight (watchdog or a new
+          // texture). Touching it here would let two frames render at once,
+          // so just drop this stale completion.
+          return
+        }
+        let sameTexture = self.textureId == sourceTextureId
         self.frameInFlight = false
         if enqueued {
           self.enqueuedFrameCount += 1
           self.shownFrameCount += 1
+          self.hasRetainedSurfaceFrame = true
         }
         if direct {
           self.directFrameCount += 1
         } else {
           self.renderFrameCount += 1
         }
-        if enqueued && !self.hasFrame {
+        if enqueued && sameTexture && !self.hasFrame {
           self.hasFrame = true
           self.updateAutoEnter()
           self.startIfPending()
+        }
+        if enqueued && sameTexture {
+          self.endSurfaceHold(reason: "first-frame")
         }
         self.startPendingFrame()
       }
@@ -1504,8 +1910,20 @@ extension PipSession: AVPictureInPictureControllerDelegate {
       "DID start: isActive=\(isActive) layerInTree=\(displayLayer.superlayer != nil) "
         + "hasFrame=\(hasFrame) idleMs=\(Int(Self.idleFrameInterval * 1000))"
     )
+    logSurface("pip-did-start", reason: "delegate")
     sendEvent("onStateChanged", ["active": true])
     frameAvailable(force: true)
+    if !autoEnter && !backgroundOnStart
+      && UIApplication.shared.applicationState == .active
+      && !stopRequested
+    {
+      // The start was requested from Home but landed after returning to the
+      // foreground with auto-enter already disarmed (C57). Close it instead of
+      // popping a PiP window over the app.
+      PipTrace.log("DID start: autoEnter=NO foreground -> stop")
+      stopRequested = true
+      controller.stopPictureInPicture()
+    }
     if backgroundOnStart {
       backgroundOnStart = false
       Self.moveToBackground()
@@ -1542,6 +1960,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     let throttledDuringPip = throttleDropCount - throttleDropsAtEnter
     isActive = false
     pipStartRequested = false
+    cancelSurfaceHold(reason: "pip-stopped")
     // Neither restored nor stopped by the app: closed from the PiP window.
     let closed = !restoring && !stopRequested
     PipTrace.log(
@@ -1564,6 +1983,10 @@ extension PipSession: AVPictureInPictureSampleBufferPlaybackDelegate {
     setPlaying playing: Bool
   ) {
     isPlaying = playing
+    if !playing {
+      // A user pause must not be undone by a hold auto-resume.
+      holdAutoPaused = false
+    }
     let rate = playing && !isBuffering ? speed : 0
     if playing {
       // 从暂停恢复时把时基重新锚到当前播放位置，不能只 SetRate：
@@ -1696,6 +2119,9 @@ private enum TextureTracker {
   private static var installed = false
 
   static var onFrameAvailable: ((Int64) -> Void)?
+  static var onTextureUnregistered: ((Int64) -> Void)?
+  /// 新纹理注册回调。播放器重建拿到新 textureId 后靠它把 PiP 源接过去。
+  static var onTextureRegistered: ((Int64) -> Void)?
 
   static func texture(for textureId: Int64) -> FlutterTexture? {
     textures[textureId]?.value
@@ -1706,7 +2132,7 @@ private enum TextureTracker {
     installed = true
 
     let registerSelector = NSSelectorFromString("registerTexture:")
-    hook(cls, registerSelector) { original in
+    let registerHooked = hook(cls, registerSelector) { original in
       typealias Function = @convention(c) (AnyObject, Selector, AnyObject) -> Int64
       let function = unsafeBitCast(original, to: Function.self)
       let block: @convention(block) (AnyObject, AnyObject) -> Int64 = { this, texture in
@@ -1715,13 +2141,15 @@ private enum TextureTracker {
           Self.textures = Self.textures.filter { $0.value.value != nil }
           Self.textures[textureId] = WeakTexture(texture)
         }
+        // 通知 PiP：重建后的新纹理已注册，可以把源接过去。
+        Self.onTextureRegistered?(textureId)
         return textureId
       }
       return unsafeBitCast(block, to: AnyObject.self)
     }
 
     let frameAvailableSelector = NSSelectorFromString("textureFrameAvailable:")
-    hook(cls, frameAvailableSelector) { original in
+    let frameHooked = hook(cls, frameAvailableSelector) { original in
       typealias Function = @convention(c) (AnyObject, Selector, Int64) -> Void
       let function = unsafeBitCast(original, to: Function.self)
       let block: @convention(block) (AnyObject, Int64) -> Void = { this, textureId in
@@ -1730,21 +2158,43 @@ private enum TextureTracker {
       }
       return unsafeBitCast(block, to: AnyObject.self)
     }
+
+    let unregisterSelector = NSSelectorFromString("unregisterTexture:")
+    let unregisterHooked = hook(cls, unregisterSelector) { original in
+      typealias Function = @convention(c) (AnyObject, Selector, Int64) -> Void
+      let function = unsafeBitCast(original, to: Function.self)
+      let block: @convention(block) (AnyObject, Int64) -> Void = { this, textureId in
+        // Notify before the texture goes away so the PiP layer can hold its
+        // last frame instead of losing the surface.
+        Self.onTextureUnregistered?(textureId)
+        function(this, unregisterSelector, textureId)
+        Self.textures[textureId] = nil
+      }
+      return unsafeBitCast(block, to: AnyObject.self)
+    }
+
+    PipTrace.log(
+      "pip-surface: hooks register=\(registerHooked ? "OK" : "NO") "
+        + "frame=\(frameHooked ? "OK" : "NO") "
+        + "unregister=\(unregisterHooked ? "OK" : "NO")"
+    )
   }
 
+  @discardableResult
   private static func hook(
     _ cls: AnyClass,
     _ selector: Selector,
     _ makeBlock: (IMP) -> AnyObject
-  ) {
+  ) -> Bool {
     guard let method = class_getInstanceMethod(cls, selector) else {
       NSLog("PipPlugin: \(cls) does not respond to \(selector)")
-      return
+      return false
     }
     let imp = imp_implementationWithBlock(makeBlock(method_getImplementation(method)))
     // Add an override if the method is inherited, so the superclass is untouched.
     if !class_addMethod(cls, selector, imp, method_getTypeEncoding(method)) {
       method_setImplementation(method, imp)
     }
+    return true
   }
 }
