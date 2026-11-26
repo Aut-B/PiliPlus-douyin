@@ -61,6 +61,7 @@ import 'package:PiliPlus/utils/android/bindings.g.dart';
 import 'package:PiliPlus/utils/extension/scroll_controller_ext.dart';
 import 'package:PiliPlus/utils/extension/theme_ext.dart';
 import 'package:PiliPlus/utils/image_utils.dart';
+import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/max_screen_size.dart';
 import 'package:PiliPlus/utils/mobile_observer.dart';
 import 'package:PiliPlus/utils/num_utils.dart';
@@ -123,6 +124,15 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       videoDetailController.plPlayerController.pipNoDanmaku;
 
   bool isShowing = true;
+
+  /// 播放中是否已武装 iOS 自动画中画（按 Home 自动起小窗）。
+  bool _pipAutoArmed = false;
+
+  /// 本次武装是否已显式请求原生启动，inactive/paused/hidden 连续回调只认第一次。
+  bool _pipStartRequested = false;
+
+  /// 退后台导致的自动暂停不能当作手动暂停，否则会拆掉刚发起的画中画请求。
+  bool _pipInBackground = false;
 
   bool get isFullScreen =>
       videoDetailController.plPlayerController.isFullScreen.value;
@@ -187,16 +197,82 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final isResume = state == .resumed;
+    _pipInBackground = !isResume;
     final ctr = videoDetailController.plPlayerController..visible = isResume;
     if (isResume) {
+      // 回前台时启动还没落定：先取消排队请求，避免用户回到 App 后
+      // 又因为 possible/帧回调把画中画弹出来。
+      final cancelPendingPip = _pipStartRequested && !IOSPipHelper.isActive;
+      _pipStartRequested = false;
+      if (cancelPendingPip && _pipAutoArmed) {
+        _pipAutoArmed = false;
+        IOSPipHelper.disableAutoEnter();
+      }
       if (!ctr.showDanmaku) {
         introController.startTimer();
         ctr.showDanmaku = true;
       }
-    } else if (state == .paused) {
-      introController.cancelTimer();
-      ctr.showDanmaku = false;
+      if (plPlayerController?.playerStatus.isPlaying == true) {
+        _armPipAutoEnter();
+      } else {
+        _disarmPipAutoEnter();
+      }
+    } else {
+      if (state == .paused) {
+        introController.cancelTimer();
+        ctr.showDanmaku = false;
+      }
+      if (state == .inactive || state == .paused || state == .hidden) {
+        // 兜底：若播放已开始但页面没赶上 playing 回调，这里补一次武装再请求。
+        _armPipAutoEnter();
+        _requestPipAutoEnter();
+      }
     }
+  }
+
+  bool get _pipAutoEnterAvailable =>
+      Platform.isIOS &&
+      isShowing &&
+      IOSPipHelper.isAvailable &&
+      plPlayerController?.autoPiP == true;
+
+  /// 播放中武装自动画中画：原生先拿到纹理与播放状态，按 Home 才能起小窗。
+  void _armPipAutoEnter() {
+    if (_pipAutoArmed || !_pipAutoEnterAvailable) return;
+    final ctr = plPlayerController;
+    if (ctr == null ||
+        !ctr.playerStatus.isPlaying ||
+        ctr.videoController?.id.value == null) {
+      return;
+    }
+    _pipAutoArmed = true;
+    _pipStartRequested = false;
+    ctr.enterPip(autoEnter: true);
+  }
+
+  /// 暂停、离开播放页或切集时收起武装，避免之后回首页误弹。
+  void _disarmPipAutoEnter() {
+    if (!_pipAutoArmed) return;
+    _pipAutoArmed = false;
+    _pipStartRequested = false;
+    if (Platform.isIOS) {
+      IOSPipHelper.disableAutoEnter();
+    }
+  }
+
+  /// 按 Home 退后台时显式请求一次启动。sample buffer contentSource 不会
+  /// 因 `canStartPictureInPictureAutomaticallyFromInline` 自动起小窗。
+  void _requestPipAutoEnter() {
+    if (!_pipAutoArmed ||
+        _pipStartRequested ||
+        !_pipAutoEnterAvailable ||
+        IOSPipHelper.isActive) {
+      return;
+    }
+    final ctr = plPlayerController;
+    if (ctr == null || !ctr.playerStatus.isPlaying) return;
+    _pipStartRequested = true;
+    IOSPipHelper.requestStart();
   }
 
   void _setPlayCallBack() {
@@ -218,6 +294,13 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   // 播放器状态监听
   Future<void> playerListener(PlayerStatus status) async {
     final isPlaying = status.isPlaying;
+    if (isPlaying) {
+      _armPipAutoEnter();
+    } else if (!_pipInBackground &&
+        !_pipStartRequested &&
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+      _disarmPipAutoEnter();
+    }
     try {
       if (videoDetailController.scrollCtr.hasClients) {
         if (isPlaying) {
@@ -333,6 +416,8 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
 
   @override
   void dispose() {
+    _disarmPipAutoEnter();
+
     plPlayerController
       ?..removeStatusLister(playerListener)
       ..removePositionListener(positionListener);
@@ -374,6 +459,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
   void didPushNext() {
     super.didPushNext();
     isShowing = false;
+    _disarmPipAutoEnter();
 
     removeObserverMobile(this);
 
@@ -441,6 +527,9 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
     plPlayerController
       ?..addStatusLister(playerListener)
       ..addPositionListener(positionListener);
+    if (plPlayerController?.playerStatus.isPlaying == true) {
+      _armPipAutoEnter();
+    }
     if (videoDetailController.autoPlay) {
       videoDetailController.playerInit(
         autoplay: videoDetailController.playerStatus?.isPlaying ?? false,
