@@ -266,7 +266,18 @@ private final class PipSession: NSObject {
   private static let maxDimension = 1920.0
   /// 预热节流间隔：只用于「已 arm / 已请求启动，但 PiP 还没真正显示」的阶段。
   /// 一旦进入 PiP 就完全不节流，只保留 latest-wins 的在途帧合并。
-  private static let idleFrameInterval = 0.5
+  /// 0.5s 的间隔在 PiP 状态漏判时会把画面压到 ~2fps（实测 stat-fps 0.3-2.6、
+  /// throttleDrops 90%+）。改成按「不超过 ~30fps」限速：只削掉高帧率突发，
+  /// 24/30fps 片源不再被削，省电意图保留。
+  private static let idleFrameInterval = 1.0 / 30.0
+  /// 30fps 阈值附近的调度抖动容差，避免源本来就是 30fps 时被误丢。
+  private static let idleFrameTolerance = 0.002
+  /// 一次落盘，方便真机日志核对「改前 500ms / 改后 33ms」。
+  private static var throttleConfig: String {
+    "idleMs=\(Int(idleFrameInterval * 1000)) "
+      + "toleranceMs=\(Int(idleFrameTolerance * 1000)) "
+      + "maxFps=\(Int(1.0 / idleFrameInterval))"
+  }
 
   let textureId: Int64
   var onStop: (() -> Void)?
@@ -321,6 +332,8 @@ private final class PipSession: NSObject {
   private var lastTextureCallbackTime: CFTimeInterval = 0
   private var callbackWindowStart: CFTimeInterval = 0
   private var callbackWindowCount = 0
+  /// 当前 1s 窗口内被 idle 节流掉的帧数，随 stat-fps 一起落日志。
+  private var throttleWindowCount = 0
   /// 画中画 seek 的代数。异步补帧任务只认最新一次 seek，避免连续点
   /// 快进/快退时旧任务在新位置之后又把旧帧拉回来。
   private var seekGeneration = 0
@@ -391,6 +404,7 @@ private final class PipSession: NSObject {
       "mode: displayImmediately, layerTimebase=nil, timebase=delegate-only "
         + "texture=\(textureId)"
     )
+    PipTrace.log("throttle-config: \(Self.throttleConfig)")
 
     controller = AVPictureInPictureController(
       contentSource: .init(sampleBufferDisplayLayer: displayLayer, playbackDelegate: self)
@@ -616,7 +630,7 @@ private final class PipSession: NSObject {
         + "throttleDrops=\(throttleDropCount) enqueued=\(enqueuedFrameCount) "
         + "shown=\(shownFrameCount) droppedOld=\(droppedOldFrameCount) "
         + "direct=\(directFrameCount) render=\(renderFrameCount) "
-        + "idleMs=\(Int(Self.idleFrameInterval * 1000))"
+        + "idleMs=\(Int(Self.idleFrameInterval * 1000)) throttlePct=\(throttlePct)"
     )
     // 同步在 frameQueue 上取快照：tearDown() 随后会把 session 置空，
     // 异步闭包可能已经拿不到统计值。
@@ -647,10 +661,13 @@ private final class PipSession: NSObject {
       let fps = Double(callbackWindowCount) * 1000 / windowMs
       PipTrace.log(
         "stat-fps: callbacks=\(callbackWindowCount) windowMs=\(Int(windowMs)) "
-          + "fps=\(String(format: "%.1f", fps))"
+          + "fps=\(String(format: "%.1f", fps)) "
+          + "throttleDrops=\(throttleWindowCount) throttlePct=\(throttlePct) "
+          + "idleMs=\(Int(Self.idleFrameInterval * 1000))"
       )
       callbackWindowStart = callbackTime
       callbackWindowCount = 0
+      throttleWindowCount = 0
     }
     guard let texture = TextureTracker.texture(for: textureId) else {
       // 这里返回意味着 textureId 对不上：画中画永远拿不到帧。
@@ -660,6 +677,7 @@ private final class PipSession: NSObject {
     let now = CACurrentMediaTime()
     if !force && shouldThrottleForIdle(now: now) {
       throttleDropCount += 1
+      throttleWindowCount += 1
       return
     }
     lastFrameTime = now
@@ -679,21 +697,28 @@ private final class PipSession: NSObject {
     process(source)
   }
 
-  /// 只有「还没进 PiP 的预热阶段」才限速。
+  /// 只有「还没进 PiP 的预热阶段」才限速，且上限是 ~30fps。
   ///
   /// 不能只看自己的 `isActive`：自动进入画中画时 delegate 回调可能滞后，
   /// 甚至整段丢失，一旦漏置位就会把整个 PiP 期间都按 idle 节流（实测
   /// throttleDrops 占到 87%）。所以这里同时采信 AVKit 的
   /// `isPictureInPictureActive`，任一为真都视为已经在出小窗。
+  /// 即便这里仍漏判，1/30s 的间隔也只会退到 ~30fps，不会再出现 0.3-2.6fps。
   private func shouldThrottleForIdle(now: CFTimeInterval) -> Bool {
     if isActive || controller.isPictureInPictureActive { return false }
-    // 正在启动 / 已 arm 且 App 已退后台：PiP 马上要显示，这一段不能降到
-    // 2fps，否则起小窗的动画和首帧都会明显卡。
+    // 正在启动 / 已 arm 且 App 已退后台：PiP 马上要显示，这一段必须满帧，
+    // 连 ~30fps 的限速也不加，否则起小窗的动画和首帧都会明显卡。
     if pendingStart || pipStartRequested { return false }
     if autoEnter && UIApplication.shared.applicationState != .active {
       return false
     }
-    return now - lastFrameTime < Self.idleFrameInterval
+    return now - lastFrameTime < Self.idleFrameInterval - Self.idleFrameTolerance
+  }
+
+  /// 会话累计节流占比（%）。两个计数都只在主线程读写。
+  private var throttlePct: Int {
+    guard textureCallbackCount > 0 else { return 0 }
+    return Int((Double(throttleDropCount) * 100 / Double(textureCallbackCount)).rounded())
   }
 
   /// Runs one frame on `frameQueue`. Must be called on the main thread.
@@ -1472,7 +1497,8 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     restoring = false
     PipTrace.log(
       "WILL start: isActive=\(isActive) sourceViewInTree=\(sourceView.superview != nil) "
-        + "throttleDrops=\(throttleDropCount)"
+        + "throttleDrops=\(throttleDropCount) throttlePct=\(throttlePct) "
+        + "idleMs=\(Int(Self.idleFrameInterval * 1000))"
     )
     frameAvailable(force: true)
     sendEvent("onStateChanged", ["active": true])
@@ -1536,7 +1562,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     PipTrace.log(
       "DID stop: isActive=\(isActive) closed=\(closed) restoring=\(restoring) "
         + "stopRequested=\(stopRequested) "
-        + "throttleDropsDuringPip=\(throttledDuringPip) "
+        + "throttleDropsDuringPip=\(throttledDuringPip) throttlePct=\(throttlePct) "
         + "sourceViewInTree=\(sourceView.superview != nil)"
     )
     stopRequested = false
