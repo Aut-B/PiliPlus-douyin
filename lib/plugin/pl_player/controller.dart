@@ -17,6 +17,7 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_shot/data.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
+import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
@@ -50,6 +51,7 @@ import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/utils.dart';
+import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
@@ -482,6 +484,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   String? _hwdecOverride;
   bool? _enableHAOverride;
 
+  // 重开流要沿用的参数，以及 playurl 刷新的并发/次数保护。
+  Volume? _lastVolume;
+  int? _lastRotate;
+  bool _reloadingStream = false;
+  // 两次自动重取 playurl 的最小间隔：坏源连续报错时不要无限打接口，
+  // 但长视频第二次真的过期时仍有机会再取一次。
+  static const int _streamRefetchCooldownMs = 30000;
+  int _lastStreamRefetchAtMs = 0;
+
   late final progressType = Pref.btmProgressBehavior;
   late final enableQuickDouble = Pref.enableQuickDouble;
   late final fullScreenGestureReverse = Pref.fullScreenGestureReverse;
@@ -772,6 +783,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _isLocalFile = isLocalFile;
       _hwdecOverride = hwdecOverride;
       _enableHAOverride = enableHardwareAcceleration;
+      _lastVolume = volume;
+      _lastRotate = rotate;
+      _lastStreamRefetchAtMs = 0;
       _autoPlay = autoplay;
       // 初始化数据加载状态
       dataStatus.value = DataStatus.loading;
@@ -1014,12 +1028,172 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (isFileSource) {
       return null;
     }
+    // B 站点播：先重新请求 playurl 换一条新地址，再在原 Player 上重开。
+    // 刚刷新过又失败说明新地址也不好使，直接重开当前地址，避免循环请求。
+    if (_canRefetchBiliStream) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastStreamRefetchAtMs < _streamRefetchCooldownMs) {
+        return _reopenCurrentMedia();
+      }
+      _lastStreamRefetchAtMs = now;
+      return _refreshBiliStream();
+    }
+    return _reopenCurrentMedia();
+  }
+
+  /// mpv 的媒体流打开失败报文里带独立的 403/410 状态码，通常就是 CDN 地址
+  /// 过期。用数字边界匹配，避免把 URL 里 `cid=410123` 这类数字误判。
+  static final RegExp _expiredStreamStatus = RegExp(r'(?<!\d)(403|410)(?!\d)');
+  static bool _isExpiredStreamError(String event) =>
+      _expiredStreamStatus.hasMatch(event);
+
+  /// 只有 B 站点播（UGC/PGC）才有 cid + bvid/epid 去重新取 playurl。
+  /// 直播、本地文件、抖音/TikTok 都不适用，保持原来的重开旧地址行为。
+  bool get _canRefetchBiliStream =>
+      !isFileSource &&
+      !isLive &&
+      cid != null &&
+      (_bvid != null || _epid != null);
+
+  Future<void> _refreshBiliStream() async {
+    if (await reloadBiliStream(reason: 'stream-error')) return;
+    // 取流失败：退回重开旧地址，保留原来的兜底行为。
+    await _reopenCurrentMedia();
+  }
+
+  Future<void>? _reopenCurrentMedia() {
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
       var media = ctr.current.last;
       if (!isLive) media = media.copyWith(start: ctr.state.position);
       return ctr.open(media, play: true);
     }
     return null;
+  }
+
+  /// 重新请求 playurl，并用新拿到的 CDN 地址在原 Player 上重开。
+  ///
+  /// 返回 false 表示不适用（直播 / 本地 / 抖音）或取流失败，调用方应退回
+  /// 重开旧地址。同一时刻只允许一条刷新在飞。
+  Future<bool> reloadBiliStream({
+    String reason = 'stream-expired',
+    Duration? position,
+  }) async {
+    if (!_canRefetchBiliStream || _reloadingStream) return false;
+    _reloadingStream = true;
+    final watch = Stopwatch()..start();
+    try {
+      final result = await VideoHttp.videoUrl(
+        cid: cid!,
+        bvid: _bvid,
+        qn: cacheVideoQa ?? Pref.defaultVideoQa,
+        epid: _epid,
+        seasonId: _seasonId,
+        tryLook: tryLook,
+        videoType: _videoType,
+        voiceBalance: enableAudioNormalization,
+      );
+      if (result case Success(:final response)) {
+        final source = _buildNetworkSource(response);
+        if (source == null) {
+          _diagRefetch(reason, watch, ok: false, error: 'no usable dash/durl');
+          return false;
+        }
+        dataSource = source;
+        _lastVolume = response.volume ?? _lastVolume;
+        final start = position ?? _videoPlayerController?.state.position;
+        await _createVideoController(source, start, _lastVolume, _lastRotate);
+        // 自动刷新（非「从头重播」）时继续播；用户主动重播由调用方 play() 接管。
+        if (position == null) await _videoPlayerController?.play();
+        _diagRefetch(
+          reason,
+          watch,
+          ok: true,
+          host: Uri.tryParse(source.videoSource)?.host,
+        );
+        return true;
+      }
+      _diagRefetch(reason, watch, ok: false, error: '$result');
+      return false;
+    } catch (e) {
+      _diagRefetch(reason, watch, ok: false, error: e.toString());
+      return false;
+    } finally {
+      watch.stop();
+      _reloadingStream = false;
+    }
+  }
+
+  NetworkSource? _buildNetworkSource(PlayUrlModel response) {
+    final videoList = response.dash?.video;
+    if (videoList != null && videoList.isNotEmpty) {
+      final preferQa = cacheVideoQa ?? Pref.defaultVideoQa;
+      final supportFormats = response.supportFormats;
+      final VideoItem target;
+      if (supportFormats != null && supportFormats.isNotEmpty) {
+        target = VideoUtils.findTargetVideo(
+          videoList,
+          preferQa,
+          response.acceptQuality,
+          supportFormats,
+          Pref.preferCodecs,
+        ).$4;
+      } else {
+        target = videoList.firstWhere(
+          (e) => e.id == preferQa,
+          orElse: () => videoList.first,
+        );
+      }
+      final audioList = response.dash?.audio;
+      final audioUrl = audioList != null && audioList.isNotEmpty
+          ? VideoUtils.getCdnUrl(
+              VideoUtils.findTargetAudio(audioList, cacheAudioQa).playUrls,
+              isAudio: true,
+            )
+          : '';
+      return NetworkSource(
+        videoSource: VideoUtils.getCdnUrl(target.playUrls),
+        audioSource: audioUrl,
+      );
+    }
+
+    final durl = response.durl;
+    if (durl != null && durl.isNotEmpty) {
+      if (durl.length == 1) {
+        return NetworkSource(
+          videoSource: VideoUtils.getCdnUrl(durl.single.playUrls),
+          audioSource: '',
+        );
+      }
+      final sb = StringBuffer('edl://!no_chapters;');
+      for (final item in durl) {
+        final length = item.length;
+        if (length == null || length <= 0) return null;
+        final url = VideoUtils.getCdnUrl(item.playUrls);
+        sb.write('%${url.length}%$url,length=${length / 1000};');
+      }
+      return NetworkSource(videoSource: sb.toString(), audioSource: '');
+    }
+    return null;
+  }
+
+  void _diagRefetch(
+    String reason,
+    Stopwatch watch, {
+    required bool ok,
+    String? host,
+    String? error,
+  }) {
+    try {
+      DiagProbe.log('net-refetch', <String, Object?>{
+        'reason': reason,
+        'ok': ok,
+        'ms': watch.elapsedMilliseconds,
+        'host': host,
+        'error': error,
+      });
+    } catch (_) {
+      // 诊断不能影响重取本身。
+    }
   }
 
   // 开始播放
@@ -1200,7 +1374,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
               // }
               if (isBuffering.value && buffered.value == 0) {
                 SmartDialog.showToast(
-                  '视频链接打开失败，重试中',
+                  _isExpiredStreamError(event) && _canRefetchBiliStream
+                      ? '视频取流地址已过期，正在重新获取'
+                      : '视频链接打开失败，重试中',
                   displayTime: const Duration(milliseconds: 500),
                 );
                 refreshPlayer();
@@ -1275,7 +1451,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (hideControls) controls = false;
     // repeat为true，将从头播放
     if (repeat) {
-      await seekTo(Duration.zero);
+      // 单集循环 / 列表循环会反复走这里：不复用启动时缓存的 CDN 地址，
+      // 先重新取一次 playurl；取流失败再退回原地址从头播。
+      final refreshed =
+          _canRefetchBiliStream &&
+          await reloadBiliStream(
+            reason: 'replay',
+            position: Duration.zero,
+          );
+      if (!refreshed) await seekTo(Duration.zero);
     }
 
     await _videoPlayerController?.play();

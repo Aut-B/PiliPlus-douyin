@@ -360,10 +360,48 @@ abstract final class VideoHttp {
           fallback: fallback,
         );
       }
-      return Error(_parseVideoErr(res.data['code'], res.data['message']));
-    } catch (e, s) {
-      return Error('$e\n\n$s');
+      return _videoUrlError(res.statusCode, res.data);
+    } catch (e) {
+      // 不要把整段 stack trace 弹给用户；只留一行可读原因。
+      return Error('获取视频地址失败，请稍后重试（${_shortErrText(e)}）');
     }
+  }
+
+  /// 取流失败分三类：网络断开（没拿到响应）/ 签名风控 / 取流地址过期。
+  static Error _videoUrlError(int? status, dynamic data) {
+    final int? code = data is Map ? _asInt(data['code']) : null;
+    final String? msg = data is Map ? data['message']?.toString() : null;
+    if (status == null || status == -1) {
+      return const Error('网络连接中断，未能获取视频地址，请检查网络后重试', code: -1);
+    }
+    if (status == 412 ||
+        status == 403 ||
+        code == -352 ||
+        code == -403 ||
+        code == -412 ||
+        code == 403 ||
+        code == 412) {
+      final c = code ?? status;
+      return Error('签名或风控校验失败（$c），请稍后重试', code: c);
+    }
+    if (status == 410) {
+      return Error('视频取流地址已过期（HTTP $status），正在重新获取', code: status);
+    }
+    return Error(_parseVideoErr(code, msg), code: code);
+  }
+
+  static int? _asInt(Object? v) => v is int
+      ? v
+      : v is num
+      ? v.toInt()
+      : null;
+
+  /// 去掉 query 里的 access_key 等敏感参数，只保留一行短原因。
+  static String _shortErrText(Object e) {
+    var text = e.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
+    final q = text.indexOf('?');
+    if (q >= 0) text = text.substring(0, q);
+    return text.length > 80 ? '${text.substring(0, 80)}…' : text;
   }
 
   static String _parseVideoErr(int? code, String? msg) {
