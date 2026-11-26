@@ -302,6 +302,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   ///
   /// 全局硬解开关被用户关掉时也不能退化成软解：6S 上软解这些缓存视频一样卡，
   /// 表现和「网络慢」几乎一样。B 站播放页不传这个覆盖，行为保持不变。
+  ///
+  /// 不改成 `videotoolbox`：那是「只用 VT、失败就报错」，个别 10bit / 不常见
+  /// pixfmt 的 TikTok 会直接放不出来；auto-copy 调到的仍是 VT，失败时还能
+  /// 回落软解保画面。diag 里 hwdec-current=videotoolbox 占绝大多数，掉到 no
+  /// 的样本集中在同一个 texture 连播多条的时段，说明问题在纹理/解码器复用，
+  /// 不在解码器选择本身。
   static const String _hwdec = 'auto-copy';
 
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
@@ -370,6 +376,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
     // 普通包头一行就会 return，不产生文件。
     DiagProbe.startSession();
+    // 必须在 startSession 之后：会话起点会先把单例带进来的旧纹理按 carry
+    // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
+    _player.textureSource = 'douyin';
     DiagProbe.startSampling();
     _startPipTicker();
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
@@ -462,7 +471,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
     }
-    DiagProbe.stop();
     _stopPipTicker();
     _prefetchKey = null;
     _prefetchFuture = null;
@@ -491,6 +499,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         elapsedMs: disposeSw.elapsedMilliseconds,
       );
     }
+    // 放在 dispose 之后：dispose 会上报最后一次 texture release，先 stop 就
+    // 会把这条漏掉，session-summary 的 alive 峰值/收尾数会不准。
+    DiagProbe.stop();
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
     _releaseBackgroundKeepAlive();
@@ -633,17 +644,57 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'textureId': _player.videoController?.id.value,
     });
     String? openError;
+    // 共享实例中止时不会走到 beginOpen，收尾时不能拿上一条遗留的 tracker
+    // 去写 open-end，否则会多出一条错位的失败记录。
+    var beganOpen = false;
     try {
       final entry = _queue[target];
       // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
       // 是新纹理，无法判断「换了纹理但没画面」。
       final oldTextureId = _player.videoController?.id.value;
+      // 画中画活跃时绝不能拆纹理，也绝不能复用同一实例换源：原生 PiP 还
+      // 绑着这条 FlutterTexture，换源会让小窗立即黑屏/退出；而共享实例
+      // 换源会连带改掉 B站/PiP 正在用的播放器。直接中止本次切条并留证。
+      if (IOSPipHelper.isActive) {
+        openError = 'pip-active';
+        DiagProbe.event('switch-blocked', <String, Object?>{
+          'source': source,
+          'reason': 'pip-active',
+          'targetIndex': target,
+          'curIndex': fromIndex,
+          'oldTextureId': oldTextureId,
+          'pipEntered': _pipEntered,
+        });
+        if (mounted) {
+          setState(() => _error = '画中画使用中，请先关闭小窗再切换');
+        }
+        return;
+      }
+      // 共享单例被 B站/PiP 持有时不能拆：那会把别人的画面一起换掉。在改
+      // _index 之前就判，直接中止本次切换并留证，避免「标题已是下一条、
+      // 画面还在上一条」的错位。
+      if (!_player.canReleaseSolo) {
+        openError = 'shared-player';
+        DiagProbe.event('switch-blocked', <String, Object?>{
+          'source': source,
+          'reason': 'shared-player',
+          'targetIndex': target,
+          'curIndex': fromIndex,
+          'oldTextureId': oldTextureId,
+          'playerCount': PlPlayerController.playerCount,
+        });
+        if (mounted) {
+          setState(() => _error = '播放器正在别处使用，请稍后再试');
+        }
+        return;
+      }
       DiagProbe.beginOpen(
         index: target,
         key: entry.key,
         oldTextureId: oldTextureId,
         source: source,
       );
+      beganOpen = true;
       // 切条期间 mpv 正持有解码锁，后台采样再去同步读属性只会把主
       // isolate 一起堵住；采样在 open 收尾后恢复。
       DiagProbe.suspendSampling();
@@ -695,6 +746,102 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'host': Uri.tryParse(media.url)?.host,
         'hwdecRequested': _hwdec,
       });
+      // 切条必须在开新流前把旧 Player 连同 FlutterTexture 一起拆掉。
+      //
+      // build67 诊断里，同一条 texture 连播 20+ 条后，下一次 open 的
+      // video-params/w 要等 20s+ 才出现，hwdec-current 从 videotoolbox 掉到
+      // no，position 冻在换源前。这是 mpv 在同一上下文反复换源、VideoToolbox
+      // 解码器重建失败且旧 FlutterTexture 不释放的典型表现。B 站页面每次进入
+      // 都是新单例，不存在长期复用同一条纹理，所以这里也要在换源前断开。
+      //
+      // 共享单例与 PiP 已在改 _index 前判过，这里只需执行拆旧纹理。
+      if (oldTextureId != null) {
+        // resolve 是网络 await，期间别的页面仍可能 getInstance 把单例抬成
+        // 共享。真正拆之前再确认一次独占：不等独占就中止，绝不拆别人的
+        // 画面（C51D review 2 的硬约束）。
+        if (!_player.canReleaseSolo) {
+          openError = 'shared-player';
+          DiagProbe.event('switch-blocked', <String, Object?>{
+            'source': source,
+            'reason': 'shared-player',
+            'phase': 'pre-release',
+            'targetIndex': target,
+            'curIndex': fromIndex,
+            'oldTextureId': oldTextureId,
+            'playerCount': PlPlayerController.playerCount,
+          });
+          if (mounted) {
+            setState(() {
+              _index = fromIndex;
+              _error = '播放器正在别处使用，请稍后再试';
+            });
+            if (_panel == _PlayerPanel.comments) {
+              unawaited(_ensureComments());
+            }
+          }
+          // 上一步已经按 target 写过后台播放卡片，这里退回上一条要同步。
+          _applyBackgroundKeepAlive();
+          return;
+        }
+        final releaseSw = Stopwatch()..start();
+        DiagProbe.openPhase('release-texture');
+        _detachPlayerListeners();
+        try {
+          await _player.releaseTexture(reason: 'switch');
+        } catch (error) {
+          // 只有 native dispose 成功才算旧纹理没了。失败时 releaseTexture
+          // 保留原实例并上报 release-failed，这里必须整体中止：继续
+          // setDataSource 会让旧纹理和解码器叠在新流下面。
+          releaseSw.stop();
+          _diagUiBlock(
+            'open',
+            'release-texture',
+            releaseSw,
+            extra: <String, Object?>{
+              'index': target,
+              'oldTextureId': oldTextureId,
+              'error': '$error',
+            },
+          );
+          DiagProbe.event('switch-blocked', <String, Object?>{
+            'source': source,
+            'reason': 'release-failed',
+            'targetIndex': target,
+            'curIndex': fromIndex,
+            'oldTextureId': oldTextureId,
+            'error': '$error',
+          });
+          openError = 'release-failed';
+          _attachPlayerListeners();
+          if (mounted) {
+            setState(() {
+              _index = fromIndex;
+              _error = '切换失败：旧播放器未能释放';
+            });
+            if (_panel == _PlayerPanel.comments) {
+              unawaited(_ensureComments());
+            }
+          }
+          _applyBackgroundKeepAlive();
+          return;
+        }
+        _player = PlPlayerController.getInstance();
+        _player.textureSource = 'douyin';
+        _attachPlayerListeners();
+        releaseSw.stop();
+        _diagUiBlock(
+          'open',
+          'release-texture',
+          releaseSw,
+          extra: <String, Object?>{
+            'index': target,
+            'oldTextureId': oldTextureId,
+          },
+        );
+        if (!mounted || _disposed || _leaving || session != _openSession) {
+          return;
+        }
+      }
       // 抖音 / TikTok 的 CDN 认网页 UA 和 referer，上游 controller 里默认写死了
       // 桌面 UA + B 站 referer，直接用会 403 或者只给到一部分数据（表现为
       // 「有声音没画面」）。这里在开播前把 header 换成本条自己的来源。
@@ -797,8 +944,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       openError = '$error';
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
-      DiagProbe.endOpen(error: openError);
-      DiagProbe.resumeSampling();
+      if (beganOpen) {
+        DiagProbe.endOpen(error: openError);
+        DiagProbe.resumeSampling();
+      }
       // 只有仍然持有 `_opening` 的会话才有资格收尾。被新请求作废的旧
       // open 可能刚醒过来，不能把新 open 的标志清掉、也不能替它消费
       // pending，否则新 open 会立刻被当成「已结束」而丢状态。
@@ -1128,23 +1277,44 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     required int retry,
   }) async {
     final sw = Stopwatch()..start();
-    var disposeCalls = 0;
+    int? releasedTextureId;
     try {
+      // 与切条同一原则：共享单例不能拆，否则会把 B站/PiP 的画面一起换掉。
+      // 自愈失败时留证交给看门狗放弃，不再继续拆。
+      if (!_player.canReleaseSolo) {
+        DiagProbe.event('auto-recover-skipped', <String, Object?>{
+          'index': index,
+          'reason': 'shared-player',
+          'source': openSource,
+        });
+        return false;
+      }
       _detachPlayerListeners();
       _lastPositionTickMs = 0;
+      // 必须等 native texture 真正释放：旧代码只调同步 dispose() 就立刻
+      // getInstance，旧 FlutterTexture 还在拆、新解码器已经建起来，等于
+      // 又踩回「同一 MPV 上下文/旧纹理未清」的坑。releaseTexture 内部
+      // await Player.dispose()，返回时 VideoOutputManager 已收尾。
+      //
+      // dispose 失败时不能继续：getInstance 会拿回同一个实例，等于在旧
+      // 纹理上重开新流。这里透传失败、恢复监听并交给看门狗放弃。
       try {
-        // 单例按引用计数管理：若别的页面还持有旧实例，第一次 dispose 只会
-        // 减计数、不拆 texture，自愈就退化成「同一个实例再 open 一次」，
-        // 黑屏救不回来。这里补调用到引用计数归零（_instance 置空为标志），
-        // 最多 8 次，避免异常状态下无限拆。
-        while (disposeCalls < 8 && PlPlayerController.instance != null) {
-          _player.dispose();
-          disposeCalls++;
-        }
-      } catch (_) {}
+        releasedTextureId = await _player.releaseTexture(reason: 'recover');
+      } catch (error) {
+        DiagProbe.event('auto-recover-failed', <String, Object?>{
+          'index': index,
+          'reason': reason,
+          'phase': 'release-texture',
+          'error': '$error',
+          'retry': retry,
+        });
+        _attachPlayerListeners();
+        return false;
+      }
       if (!mounted || _disposed || _leaving) return false;
       final instanceCleared = PlPlayerController.instance == null;
       _player = PlPlayerController.getInstance();
+      _player.textureSource = 'douyin';
       _attachPlayerListeners();
       _progress.value = const _PlaybackProgress();
       sw.stop();
@@ -1152,7 +1322,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'index': index,
         'reason': reason,
         'disposeMs': sw.elapsedMilliseconds,
-        'disposeCalls': disposeCalls,
+        'releasedTextureId': releasedTextureId,
         'instanceCleared': instanceCleared,
         'textureId': _player.videoController?.id.value,
         'retry': retry,
@@ -1247,13 +1417,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'textureId': _player.videoController?.id.value,
       'retry': attempt,
     });
-    await _rebuildPlayerInstance(
+    final rebuilt = await _rebuildPlayerInstance(
       index: nextIndex,
       reason: 'proactive-rebuild',
       openSource: 'auto',
       retry: attempt,
     );
-    return true;
+    return rebuilt;
   }
 
   void _notePlayed(String key) {

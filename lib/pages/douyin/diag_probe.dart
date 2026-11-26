@@ -143,6 +143,17 @@ abstract final class DiagProbe {
   static final Map<String, int> _sessionOpenBySource = <String, int>{};
   static final Map<String, int> _sessionBlackBySource = <String, int>{};
 
+  /// 纹理生命周期账本：textureId -> source。
+  ///
+  /// 只统计 controller 通过 [PlPlayerController.textureObserver] 上报的纹理，
+  /// 用来验证「切条前旧纹理已释放」与会话内并发纹理数上限。
+  static final Map<int, String> _aliveTextures = <int, String>{};
+  static final Map<String, int> _aliveBySource = <String, int>{};
+  static int _textureCreateSeq = 0;
+  static int _textureReleaseSeq = 0;
+  static int _textureReleaseFailedCount = 0;
+  static int _sessionMaxAliveTexture = 0;
+
   /// 最近一次 App 回到前台的时间，以及「回前台后首个请求」的待消费标记。
   ///
   /// 网络失败取证需要知道失败请求离最近一次 resume 有多久、是不是 resume
@@ -184,6 +195,98 @@ abstract final class DiagProbe {
     _sessionTextureIds.clear();
     _sessionOpenBySource.clear();
     _sessionBlackBySource.clear();
+    _sessionMaxAliveTexture = 0;
+    _aliveTextures.clear();
+    _aliveBySource.clear();
+    _textureCreateSeq = 0;
+    _textureReleaseSeq = 0;
+    _textureReleaseFailedCount = 0;
+    PlPlayerController.textureObserver = _onTextureEvent;
+    // 进入播放页时单例可能还带着上一条的 texture（PiP / 共享实例）。此时
+    // 调用方还没把 textureSource 改成 douyin，先按 carry 登记，避免把来
+    // 源打错成 douyin，导致 aliveBySource 无法区分。
+    final carry = _currentTextureId();
+    if (carry != null) {
+      textureLife(
+        event: 'carry',
+        textureId: carry,
+        source: 'carry',
+        reason: 'session-start',
+      );
+    }
+  }
+
+  static int? _currentTextureId() {
+    try {
+      return PlPlayerController.instance?.videoController?.id.value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static void _onTextureEvent(
+    String event,
+    int? textureId,
+    String source,
+    String reason,
+  ) {
+    textureLife(
+      event: event,
+      textureId: textureId,
+      source: source,
+      reason: reason,
+    );
+  }
+
+  /// 记录一次纹理创建/释放。release 后 alive 立刻减一，用来证明切条不是
+  /// 「新建一条、旧的不拆」。
+  static void textureLife({
+    required String event,
+    required int? textureId,
+    String source = 'unknown',
+    String reason = '',
+  }) {
+    if (!kDiagEnabled || textureId == null) return;
+    if (event == 'create') _textureCreateSeq += 1;
+    String? releasedSource;
+    if (event == 'create' || event == 'carry') {
+      if (!_aliveTextures.containsKey(textureId)) {
+        _aliveTextures[textureId] = source;
+        _aliveBySource[source] = (_aliveBySource[source] ?? 0) + 1;
+      }
+      _sessionTextureIds.add(textureId);
+    } else if (event == 'release') {
+      _textureReleaseSeq += 1;
+      final prev = _aliveTextures.remove(textureId);
+      releasedSource = prev;
+      if (prev != null) {
+        final left = (_aliveBySource[prev] ?? 1) - 1;
+        if (left <= 0) {
+          _aliveBySource.remove(prev);
+        } else {
+          _aliveBySource[prev] = left;
+        }
+      }
+    } else if (event == 'release-failed') {
+      // 原生 dispose 失败：纹理可能还活着，alive 必须保持不变。单独计数，
+      // 免得「release 后 alive 立刻下降」被失败事件伪造成成功。
+      _textureReleaseFailedCount += 1;
+    }
+    if (_aliveTextures.length > _sessionMaxAliveTexture) {
+      _sessionMaxAliveTexture = _aliveTextures.length;
+    }
+    _append('texture-life', <String, Object?>{
+      'event': event,
+      'textureId': textureId,
+      'source': releasedSource ?? source,
+      'reason': reason,
+      'alive': _aliveTextures.length,
+      'maxAlive': _sessionMaxAliveTexture,
+      'aliveBySource': Map<String, int>.of(_aliveBySource),
+      'textureCreateSeq': _textureCreateSeq,
+      'textureReleaseSeq': _textureReleaseSeq,
+      'textureReleaseFailedCount': _textureReleaseFailedCount,
+    });
   }
 
   /// 本页从进入到现在经过的毫秒数；未开会话时返回 0。
@@ -519,6 +622,7 @@ abstract final class DiagProbe {
     stopSampling();
     _stopOpenProbe();
     _appendSessionSummary();
+    PlPlayerController.textureObserver = null;
     unawaited(flush());
   }
 
@@ -535,6 +639,12 @@ abstract final class DiagProbe {
       ),
       'blackCount': _sessionBlackCount,
       'distinctTextureCount': _sessionTextureIds.length,
+      'maxAliveTexture': _sessionMaxAliveTexture,
+      'aliveTextureAtEnd': _aliveTextures.length,
+      'aliveTextureBySource': Map<String, int>.of(_aliveBySource),
+      'textureCreateCount': _textureCreateSeq,
+      'textureReleaseCount': _textureReleaseSeq,
+      'textureReleaseFailedCount': _textureReleaseFailedCount,
       'pageAliveMs': sessionElapsedMs,
       'bySource': <String, Object?>{
         'auto': bySource('auto'),

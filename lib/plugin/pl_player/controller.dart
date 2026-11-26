@@ -75,6 +75,27 @@ import 'package:window_manager/window_manager.dart';
 typedef PlayCallback = Future<void>? Function();
 typedef PlayOwner = ({String tag, Type? type});
 
+/// `Player.dispose()` 失败，旧原生纹理可能还活着。
+///
+/// 调用方看到这个异常必须中止本次换源：继续在共享单例上 `setDataSource`
+/// 会同时踩到「旧纹理未释放」和「别处画面被换掉」两个问题。
+class PlPlayerTextureReleaseException implements Exception {
+  const PlPlayerTextureReleaseException(
+    this.textureId,
+    this.reason,
+    this.cause,
+  );
+
+  final int? textureId;
+  final String reason;
+  final String cause;
+
+  @override
+  String toString() =>
+      'PlPlayerTextureReleaseException(textureId: $textureId, '
+      'reason: $reason, cause: $cause)';
+}
+
 class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   Player? _videoPlayerController;
   VideoController? _videoController;
@@ -109,6 +130,20 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   int _playerCount = 0;
+
+  /// 当前纹理归属（douyin / unknown ...）。只用于诊断：DiagProbe 通过
+  /// [textureObserver] 记账时给纹理打来源标签。
+  String textureSource = 'unknown';
+
+  /// 纹理创建/释放钩子。controller 属于插件层，不能反向 import 页面层的
+  /// DiagProbe；由 `DiagProbe.startSession()` 注入，页面退出时清空。
+  static void Function(
+    String event,
+    int? textureId,
+    String source,
+    String reason,
+  )?
+  textureObserver;
 
   late double lastPlaybackSpeed = 1.0;
   final RxDouble _playbackSpeed = Pref.playSpeedDefault.obs;
@@ -705,6 +740,83 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       .._playerCount += 1;
   }
 
+  /// 只被当前页面持有时，才允许为了切条整实例释放纹理。
+  ///
+  /// 别的播放页（B站/直播/PiP）还持有单例时不能拆：那会把别人的画面一起
+  /// 换掉。调用方应排队等独占，等不到就中止本次切换并留证。
+  bool get canReleaseSolo => _playerCount <= 1;
+
+  /// 当前单例的引用计数，只用于诊断日志。
+  static int get playerCount => _instance?._playerCount ?? 0;
+
+  /// 切条专用：拆掉当前 Player，并等待纹理真正释放。
+  ///
+  /// 不能复用 `_videoPlayerController` 直接 `open` 下一条：mpv 在同一上下文
+  /// 里反复换源，会让 VideoToolbox 解码器重建失败（diag 里 hwdec-current 从
+  /// videotoolbox 掉到 no、position 冻结数秒），旧 FlutterTexture 也会一直
+  /// 挂着。media_kit 的 `VideoOutputManager.Dispose` 在 `Player.dispose()`
+  /// 内部 await，所以这里必须等它结束，旧纹理才算真的没了。
+  ///
+  /// 只有 `Player.dispose()` 真正成功后才清引用、写 `release`。失败时保留
+  /// 当前实例并抛 [PlPlayerTextureReleaseException]，调用方必须中止本次
+  /// 换源；否则会出现「诊断已记 alive-1、原生纹理还在」的假阳性，下一次
+  /// 开流继续堆叠纹理。
+  Future<int?> releaseTexture({String reason = 'switch'}) async {
+    final player = _videoPlayerController;
+    final textureId = _videoController?.id.value;
+    // 双保险：调用方在 resolve 前判过一次 canReleaseSolo，但 resolve 是
+    // 网络 await，期间别的页面仍可能 getInstance 把计数抬上去。真到这里
+    // 发现不独占就拒绝拆，避免把 B站/PiP 正在用的画面一起换掉。
+    if (_playerCount > 1) {
+      _notifyTexture(
+        'release-failed',
+        textureId,
+        '$reason: shared(playerCount=$_playerCount)',
+      );
+      throw PlPlayerTextureReleaseException(
+        textureId,
+        reason,
+        'shared playerCount=$_playerCount',
+      );
+    }
+    if (player != null) {
+      try {
+        await player.dispose();
+      } catch (error) {
+        _notifyTexture('release-failed', textureId, '$reason: $error');
+        throw PlPlayerTextureReleaseException(textureId, reason, '$error');
+      }
+    }
+    // 与 dispose() 对齐：切条后旧实例会被丢弃，不摘方向监听/唤醒锁就会
+    // 每次切条多留一份，几十条之后主 isolate 被无关回调拖慢。
+    _stopOrientationListener();
+    _disableAutoEnterPip();
+    setPlayCallBack(null);
+    _timer?.cancel();
+    _timer = null;
+    _removeListeners();
+    _positionListeners.clear();
+    _statusListeners.clear();
+    _stopWakeLockTimer();
+    WakelockPlus.disable();
+    _videoPlayerController = null;
+    _videoController = null;
+    _playerCount = 0;
+    _isLocalFile = false;
+    if (identical(_instance, this)) _instance = null;
+    _notifyTexture('release', textureId, reason);
+    return textureId;
+  }
+
+  void _notifyTexture(String event, int? textureId, String reason) {
+    if (textureId == null) return;
+    final observer = textureObserver;
+    if (observer == null) return;
+    try {
+      observer(event, textureId, textureSource, reason);
+    } catch (_) {}
+  }
+
   bool _processing = false;
   bool get processing => _processing;
 
@@ -950,6 +1062,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
     _startListeners(player);
 
+    _notifyTexture('create', _videoController?.id.value, 'player-create');
     return player;
   }
 
@@ -1931,11 +2044,15 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     if (kDebugMode) {
       debugPrint('dispose player');
     }
+    final releasedTextureId = _videoController?.id.value;
     _videoPlayerController?.dispose();
     _videoPlayerController = null;
     _videoController = null;
     _isLocalFile = false;
-    _instance = null;
+    // 只清自己：重建路径会先 dispose 旧引用，这里若无条件置空，
+    // 会把之后新建的实例一起抹掉，下一次 getInstance 又变回“共享旧纹理”。
+    if (identical(_instance, this)) _instance = null;
+    _notifyTexture('release', releasedTextureId, 'dispose');
     videoPlayerServiceHandler?.clear();
   }
 
