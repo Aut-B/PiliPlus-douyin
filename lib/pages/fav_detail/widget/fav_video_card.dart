@@ -156,6 +156,11 @@ class FavVideoCardH extends StatelessWidget {
   }
 
   Widget content(BuildContext context, ColorScheme colorScheme, bool isOwner) {
+    final enableMultiSelect = ctr?.enableMultiSelect.value ?? false;
+    final canAdd =
+        !isSort &&
+        !enableMultiSelect &&
+        BaseFavController.canAddToPlaylist(item);
     return Expanded(
       child: Stack(
         clipBehavior: Clip.none,
@@ -210,37 +215,54 @@ class FavVideoCardH extends StatelessWidget {
                 ),
             ],
           ),
-          if (isOwner)
+          if (isOwner || canAdd)
             Positioned(
               right: 0,
               bottom: -8,
-              child: iconButton(
-                icon: const Icon(Icons.clear),
-                tooltip: '取消收藏',
-                iconColor: colorScheme.outline,
-                onPressed: () => showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('提示'),
-                    content: const Text('要取消收藏吗?'),
-                    actions: [
-                      TextButton(
-                        onPressed: Get.back,
-                        child: Text(
-                          '取消',
-                          style: TextStyle(color: colorScheme.outline),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (canAdd)
+                    iconButton(
+                      icon: const Icon(Icons.playlist_add),
+                      tooltip: '加入播放列表',
+                      iconColor: colorScheme.outline,
+                      onPressed: () => ctr!.addToPlaylist([item]),
+                    ),
+                  if (isOwner)
+                    iconButton(
+                      icon: const Icon(Icons.clear),
+                      tooltip: '取消收藏',
+                      iconColor: colorScheme.outline,
+                      onPressed: () => showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          title: const Text('提示'),
+                          content: const Text('要取消收藏吗?'),
+                          actions: [
+                            TextButton(
+                              onPressed: Get.back,
+                              child: Text(
+                                '取消',
+                                style: TextStyle(color: colorScheme.outline),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                Get.back();
+                                ctr!.onCancelFav(
+                                  index!,
+                                  item.id!,
+                                  item.type!,
+                                );
+                              },
+                              child: const Text('确定取消'),
+                            ),
+                          ],
                         ),
                       ),
-                      TextButton(
-                        onPressed: () {
-                          Get.back();
-                          ctr!.onCancelFav(index!, item.id!, item.type!);
-                        },
-                        child: const Text('确定取消'),
-                      ),
-                    ],
-                  ),
-                ),
+                    ),
+                ],
               ),
             ),
         ],

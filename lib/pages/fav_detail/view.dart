@@ -312,13 +312,27 @@ class _FavDetailPageState extends State<FavDetailPage>
   }
 
   List<Widget> _selectActions(ThemeData theme) {
-    final btnStyle = TextButton.styleFrom(visualDensity: .compact);
+    final btnStyle = TextButton.styleFrom(
+      visualDensity: .compact,
+      minimumSize: Size.zero,
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
     final textStyle = TextStyle(color: theme.colorScheme.onSurfaceVariant);
     return [
       TextButton(
         style: btnStyle,
         onPressed: () => controller.handleSelect(checked: true),
         child: const Text('全选'),
+      ),
+      IconButton(
+        tooltip: '加入播放列表',
+        iconSize: 20,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+        visualDensity: VisualDensity.compact,
+        onPressed: controller.addCheckedToPlaylist,
+        icon: const Icon(Icons.playlist_add),
       ),
       TextButton(
         style: btnStyle,
