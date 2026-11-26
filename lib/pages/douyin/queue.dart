@@ -19,6 +19,7 @@ class QueueEntry {
     required this.durationMs,
     this.short,
     this.bvid,
+    this.cid,
   });
 
   factory QueueEntry.fromShortVideo(ShortVideo video) => QueueEntry(
@@ -36,6 +37,7 @@ class QueueEntry {
     required String author,
     required String cover,
     required int durationMs,
+    int? cid,
   }) => QueueEntry(
     key: 'bili:$bvid',
     title: title,
@@ -43,6 +45,7 @@ class QueueEntry {
     cover: cover,
     durationMs: durationMs,
     bvid: bvid,
+    cid: cid,
   );
 
   final String key;
@@ -56,6 +59,10 @@ class QueueEntry {
 
   /// B 站视频的 bvid。
   final String? bvid;
+
+  /// B 站视频的 cid。收藏接口已经带回来时直接用，省掉一次 videoIntro；
+  /// 为空（老播放列表 / 其它入口）时 [_resolveBili] 会自己回查。
+  final int? cid;
 
   bool get isBili => bvid != null;
 
@@ -191,7 +198,7 @@ Future<QueueMedia?> resolveQueueEntry(
     return _resolveShortVideo(video, cookie);
   }
   if (entry.bvid case final bvid?) {
-    return _resolveBili(bvid);
+    return _resolveBili(bvid, cid: entry.cid);
   }
   return null;
 }
@@ -369,15 +376,15 @@ Future<bool> _probe(
 ///
 /// media_kit 的 B 站播放就是这么做的（DASH 是两条流），这里照着来，
 /// 这样「全选 → 下一首播放」的队列里可以混着 B 站和抖音/TikTok。
-Future<QueueMedia?> _resolveBili(String bvid) async {
+Future<QueueMedia?> _resolveBili(String bvid, {int? cid}) async {
   try {
-    final intro = await VideoHttp.videoIntro(bvid: bvid);
-    final cid = intro.dataOrNull?.cid;
-    if (cid == null) return null;
+    final resolvedCid =
+        cid ?? (await VideoHttp.videoIntro(bvid: bvid)).dataOrNull?.cid;
+    if (resolvedCid == null) return null;
 
     final play = await VideoHttp.videoUrl(
       bvid: bvid,
-      cid: cid,
+      cid: resolvedCid,
       qn: 64,
       tryLook: true,
       videoType: VideoType.ugc,

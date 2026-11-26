@@ -8,6 +8,19 @@ import 'package:PiliPlus/utils/storage.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:material_ui/material_ui.dart';
 
+/// 播放列表里一条属于哪个来源。列表本身不关心怎么取流，
+/// 由各来源自己解析（B 站走 DASH，抖音 / TikTok 走网页直链或本地缓存）。
+enum PlaylistSource {
+  bili('bili', 'B站'),
+  douyin('douyin', '抖音'),
+  tiktok('tiktok', 'TikTok');
+
+  const PlaylistSource(this.id, this.label);
+
+  final String id;
+  final String label;
+}
+
 /// 播放列表里的一条。
 ///
 /// B 站收藏和抖音 / TikTok 收藏以前各播各的，这里把两种条目放在同一个列表里，
@@ -21,6 +34,7 @@ class PlaylistItem {
     required this.durationMs,
     this.short,
     this.bvid,
+    this.cid,
   });
 
   factory PlaylistItem.fromShortVideo(ShortVideo video) => PlaylistItem(
@@ -38,6 +52,7 @@ class PlaylistItem {
     required String author,
     required String cover,
     required int durationMs,
+    int? cid,
   }) => PlaylistItem(
     type: 'bili',
     title: title,
@@ -45,6 +60,7 @@ class PlaylistItem {
     cover: cover,
     durationMs: durationMs,
     bvid: bvid,
+    cid: cid,
   );
 
   /// 从播放队列的一条转过来（播放页「存为播放列表」用）。
@@ -58,6 +74,7 @@ class PlaylistItem {
         author: entry.author,
         cover: entry.cover,
         durationMs: entry.durationMs,
+        cid: entry.cid,
       );
     }
     final video = entry.short;
@@ -85,6 +102,7 @@ class PlaylistItem {
           cover: '${json['cover'] ?? ''}',
           durationMs: (json['durationMs'] as num?)?.toInt() ?? 0,
           bvid: bvid,
+          cid: (json['cid'] as num?)?.toInt(),
         );
       }
     } catch (_) {}
@@ -101,12 +119,25 @@ class PlaylistItem {
   final ShortVideo? short;
   final String? bvid;
 
+  /// B 站视频的 cid。收藏接口直接带回 `ugc.first_cid`，有了它就不必在
+  /// 播放前再打一次 videoIntro；老数据没有 cid 时解析侧会自己回查。
+  final int? cid;
+
   bool get isBili => type == 'bili';
+
+  PlaylistSource get source {
+    if (isBili) return PlaylistSource.bili;
+    return short?.platform == 'tiktok'
+        ? PlaylistSource.tiktok
+        : PlaylistSource.douyin;
+  }
+
+  /// 来源内的原始 id：B 站是 bvid，抖音 / TikTok 是站点视频 id。
+  String get id => isBili ? (bvid ?? '') : (short?.id ?? '');
 
   /// 平台标签。
   String get platformLabel {
-    if (isBili) return 'B站';
-    return short?.platform == 'tiktok' ? 'TikTok' : '抖音';
+    return source.label;
   }
 
   String get key => isBili ? 'bili:$bvid' : 'short:${short?.key ?? ''}';
@@ -127,6 +158,7 @@ class PlaylistItem {
         author: author,
         cover: cover,
         durationMs: durationMs,
+        cid: cid,
       );
     }
     final video = short;
@@ -134,10 +166,19 @@ class PlaylistItem {
     return QueueEntry.fromShortVideo(video);
   }
 
+  /// 按自己的来源解析出可直接开播的地址。播放列表 / 队列不关心来源差异，
+  /// 切换下一条时只调用这一入口。
+  Future<QueueMedia?> resolveStream({String cookie = ''}) async {
+    final entry = toEntry();
+    if (entry == null) return null;
+    return resolveQueueEntry(entry, cookie: cookie);
+  }
+
   Map<String, dynamic> toJson() => {
     'type': type,
     if (short != null) 'short': short!.toJson(),
     if (bvid != null) 'bvid': bvid,
+    if (cid != null) 'cid': cid,
     'title': title,
     'author': author,
     'cover': cover,
@@ -183,21 +224,44 @@ abstract final class ShortVideoPlaylistRepo {
     } catch (_) {}
   }
 
-  /// 追加，去重（同一条已经在列表里就跳过）。返回真正加进去的条数。
+  /// 追加，去重（同一条已经在列表里就跳过）。返回新增条数；
+  /// 只补全了 cid 的旧条目也计 1，避免调用方误报「已经在列表里」。
   static int add(Iterable<PlaylistItem> items) {
     final current = load();
-    final keys = current.map((e) => e.key).toSet();
+    final indexByKey = <String, int>{
+      for (var i = 0; i < current.length; i++) current[i].key: i,
+    };
     var added = 0;
+    var upgraded = 0;
     for (final item in items) {
-      if (!keys.add(item.key)) continue;
+      final at = indexByKey[item.key];
+      if (at != null) {
+        // 旧版本存的 B 站条目没有 cid；再次加入同一条时把 cid 补上，
+        // 别让「已经加过了」把新拿到的 cid 永远挡在门外。
+        final existing = current[at];
+        if (existing.isBili && existing.cid == null && item.cid != null) {
+          current[at] = PlaylistItem(
+            type: existing.type,
+            title: existing.title,
+            author: existing.author,
+            cover: existing.cover,
+            durationMs: existing.durationMs,
+            bvid: existing.bvid,
+            cid: item.cid,
+          );
+          upgraded++;
+        }
+        continue;
+      }
+      indexByKey[item.key] = current.length;
       current.add(item);
       added++;
     }
-    if (added > 0) {
+    if (added > 0 || upgraded > 0) {
       save(current);
       _notifyChanged();
     }
-    return added;
+    return added + upgraded;
   }
 
   static void remove(String key) {

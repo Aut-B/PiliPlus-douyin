@@ -12,6 +12,7 @@ import 'package:PiliPlus/pages/common/common_list_controller.dart';
 import 'package:PiliPlus/pages/common/multi_select/base.dart';
 import 'package:PiliPlus/pages/common/multi_select/multi_select_controller.dart';
 import 'package:PiliPlus/pages/common/page_order/page_order_mixin.dart';
+import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/fav_sort/view.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/extension/scroll_controller_ext.dart';
@@ -33,6 +34,65 @@ mixin BaseFavController
   ValueChanged<int>? updateCount;
 
   void onViewFav(FavDetailItemModel item, int? index);
+
+  /// 收藏夹里哪些条目能直接进混合播放列表：
+  /// 普通视频（有 bvid），排除音频、PGC 和已删除条目。
+  /// cid 不是硬条件：收藏接口没带 first_cid 时，播放侧会回查 videoIntro。
+  static bool canAddToPlaylist(FavDetailItemModel item) {
+    if (item.bvid == null || item.bvid!.isEmpty) return false;
+    if (item.type == 12 || item.type == 24) return false;
+    if (item.attr == 1 || item.attr == 9) return false;
+    return true;
+  }
+
+  List<PlaylistItem> playlistItemsOf(Iterable<FavDetailItemModel> items) {
+    final result = <PlaylistItem>[];
+    final seen = <String>{};
+    for (final item in items) {
+      if (!canAddToPlaylist(item)) continue;
+      final bvid = item.bvid!;
+      if (!seen.add(bvid)) continue;
+      final title = (item.title ?? '').trim();
+      result.add(
+        PlaylistItem.fromBili(
+          bvid: bvid,
+          cid: item.ugc?.firstCid,
+          title: title.isEmpty ? '视频' : title,
+          author: (item.upper?.name ?? '').trim(),
+          cover: item.cover ?? '',
+          durationMs: (item.duration ?? 0) * 1000,
+        ),
+      );
+    }
+    return result;
+  }
+
+  /// 单选 / 多选共用入口：把能播的条目加进 B 站·抖音·TikTok 混排列表。
+  void addToPlaylist(Iterable<FavDetailItemModel> items) {
+    final list = playlistItemsOf(items);
+    if (list.isEmpty) {
+      SmartDialog.showToast('没有可加入播放列表的视频');
+      return;
+    }
+    final added = ShortVideoPlaylistRepo.add(list);
+    if (added == 0) {
+      SmartDialog.showToast('这些已经在播放列表里了');
+      return;
+    }
+    final skipped = list.length - added;
+    SmartDialog.showToast(
+      skipped > 0 ? '已加入 $added 条，$skipped 条重复已跳过' : '已加入 $added 条',
+    );
+  }
+
+  void addCheckedToPlaylist() {
+    final checked = allChecked.toList(growable: false);
+    if (checked.isEmpty) {
+      SmartDialog.showToast('先选几条');
+      return;
+    }
+    addToPlaylist(checked);
+  }
 
   Future<void> onCancelFav(int index, int id, int type) async {
     final res = await FavHttp.favVideo(

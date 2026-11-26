@@ -78,6 +78,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 随机播放的牌堆。空表示需要重新发牌。
   final List<String> _deck = <String>[];
+
+  /// 随机历史的加载任务。首条播完可能早于历史读完，切换前先等它。
+  Future<void>? _shuffleRestore;
+  /// 历史已读完（或队列换过、历史已作废）后才允许在预取阶段补牌。
+  bool _shuffleRestored = false;
   String _deckSignature = '';
 
   bool _opening = false;
@@ -389,7 +394,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       unawaited(_dumpViewHierarchy());
       unawaited(PiliRootScan.run());
       unawaited(_open(_index, source: 'initial'));
-      unawaited(_restoreShuffle());
+      _shuffleRestore = _restoreShuffle();
     });
   }
 
@@ -1476,24 +1481,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     return resolveQueueEntry(entry, cookie: cookie);
   }
 
-  /// 算下一条要预热谁的 key。顺序模式取队列下一条，随机模式取牌堆首项。
+  /// 算下一条要预热谁的 key，与播完自动下一项走同一套 [_nextIndex]。
   String _prefetchTargetKey() {
     if (_queue.length <= 1) return '';
-    final String? key = _shuffle
-        ? (_deck.isNotEmpty
-              ? _deck.first
-              : _queue[(_index + 1) % _queue.length].key)
-        : switch (_repeat) {
-            PlayRepeat.pause => null,
-            PlayRepeat.singleCycle => null,
-            PlayRepeat.listOrder =>
-              _index + 1 < _queue.length ? _queue[_index + 1].key : null,
-            PlayRepeat.listCycle => _queue[(_index + 1) % _queue.length].key,
-            PlayRepeat.autoPlayRelated =>
-              _queue[(_index + 1) % _queue.length].key,
-          };
-    if (key == null) return '';
-    return key == _current.key ? '' : key;
+    // 历史读完之前不提前发牌：提前发牌会把上次播过的条目又放进来。
+    // 读完（或队列换过、旧历史作废）后牌堆空了就补一轮，保证一轮末尾
+    // 仍能预取出下一条。
+    if (_shuffle && _deck.isEmpty && _shuffleRestored) _refillDeck();
+    final index = _nextIndex(auto: true, consumeDeck: false);
+    if (index == null || index == _index) return '';
+    return _queue[index].key;
   }
 
   /// 本条已经起播后，提前解析下一条的地址。切条时 [_resolveMedia] 命中，
@@ -1552,7 +1549,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'queueLength': _queue.length,
     });
     if (_shuffle) {
-      await _next();
+      await _advance(auto: true);
       return;
     }
     switch (_repeat) {
@@ -1574,61 +1571,105 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       case PlayRepeat.listOrder:
       case PlayRepeat.listCycle:
       case PlayRepeat.autoPlayRelated:
-        await _next();
+        await _advance(auto: true);
         return;
     }
   }
 
   Future<void> _restoreShuffle() async {
     final keys = _queue.map((e) => e.key).toList(growable: false);
-    _deckSignature = ShortVideoShuffleStore.signatureOf(keys);
+    final signature = ShortVideoShuffleStore.signatureOf(keys);
+    _deckSignature = signature;
     final saved = await ShortVideoShuffleStore.load();
-    if (!mounted || saved == null) return;
-    if (saved.signature != _deckSignature) return;
-    _played.addAll(saved.played.where(keys.contains));
+    if (!mounted) return;
+    // 读取历史期间队列可能被整份替换（从播放列表点播），旧签名作废。
+    if (_deckSignature != signature) return;
+    _shuffleRestored = true;
+    if (saved != null && saved.signature == signature) {
+      _played.addAll(saved.played.where(keys.contains));
+      // 用户在历史读完前就切到随机并发了牌：把历史里已播过的从牌堆剔除，
+      // 否则这一轮可能马上又抽到刚播过的条目。
+      _deck.removeWhere(_played.contains);
+    }
+    // 历史读回来之前牌堆是空的，首条播完后拿不到预取目标。恢复完就按
+    // 同一套牌堆发一次牌，并提前解析下一条；仍然只保留 1 条预取。
+    if (_shuffle && _deck.isEmpty && _queue.length > 1) {
+      _refillDeck();
+      _prefetchNext();
+    }
   }
 
-  /// 下一条。顺序模式就是下一条，随机模式从牌堆里取，保证一轮之内不重复。
-  Future<void> _next({String source = 'auto'}) async {
-    if (_queue.length <= 1) {
-      _diagSwitchRequest(source, _index);
-      _diagSwitchBlocked(source, 'single-item', targetIndex: _index);
-      return;
-    }
-    if (!_shuffle) {
-      final int? next = switch (_repeat) {
-        PlayRepeat.pause => _index + 1 < _queue.length ? _index + 1 : null,
-        PlayRepeat.listOrder => _index + 1 < _queue.length ? _index + 1 : null,
-        PlayRepeat.singleCycle => (_index + 1) % _queue.length,
-        PlayRepeat.listCycle => (_index + 1) % _queue.length,
-        PlayRepeat.autoPlayRelated => (_index + 1) % _queue.length,
-      };
-      if (next == null) {
-        _diagSwitchRequest(source, _index);
-        _diagSwitchBlocked(source, 'end-of-queue', targetIndex: _index);
-        return;
+  /// 统一选下一项。自动播完与手动「下一条」共用这一套模式判定，只有
+  /// 两处语义差别：播完暂停在末尾停、单曲循环在播完时重播；手动切条
+  /// 始终往后走一项。随机从牌堆取，且绝不把当前这条再发回来。
+  ///
+  /// [consumeDeck] 为 false 时只预览随机目标，不把牌堆项取走（预取用）。
+  int? _nextIndex({required bool auto, bool consumeDeck = true}) {
+    final length = _queue.length;
+    if (length <= 1) return null;
+    if (_shuffle) {
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (_deck.isEmpty) _refillDeck();
+        for (var i = 0; i < _deck.length; i++) {
+          final key = _deck[i];
+          final index = _queue.indexWhere((e) => e.key == key);
+          if (index < 0 ||
+              index == _index ||
+              _played.contains(key)) {
+            // 队列被整份换过（旧牌失效）、已经播过或就是当前这条：
+            // 都从牌堆里清掉，保证一轮之内不重复。
+            _deck.removeAt(i);
+            i--;
+            continue;
+          }
+          if (consumeDeck) _deck.removeAt(i);
+          return index;
+        }
+        // 牌堆里只剩当前项 / 已播项：发下一轮再从新牌堆里挑。
+        // 预取同样走这一步，播完时直接命中下一轮的首项。
+        if (attempt == 0) continue;
+        break;
       }
-      _diagSwitchRequest(source, next);
-      if (source == 'auto' && await _maybeAutoRebuildBeforeNext(next)) return;
-      await _open(next, source: source);
-      return;
+      // 极端情况下整条队列都被标成已播：退回到紧跟其后的一条，
+      // 至少不会原地重播当前视频。
+      return (_index + 1) % length;
     }
-    if (_deck.isEmpty) _refillDeck();
-    while (_deck.isNotEmpty) {
-      final key = _deck.removeAt(0);
-      if (key == _current.key) continue;
-      final index = _queue.indexWhere((e) => e.key == key);
-      if (index < 0) continue;
-      _diagSwitchRequest(source, index);
-      if (source == 'auto' && await _maybeAutoRebuildBeforeNext(index)) return;
-      await _open(index, source: source);
-      return;
-    }
-    final fallback = (_index + 1) % _queue.length;
-    _diagSwitchRequest(source, fallback);
-    if (source == 'auto' && await _maybeAutoRebuildBeforeNext(fallback)) return;
-    await _open(fallback, source: source);
+    return switch (_repeat) {
+      PlayRepeat.pause =>
+        auto ? null : (_index + 1 < length ? _index + 1 : null),
+      PlayRepeat.listOrder => _index + 1 < length ? _index + 1 : null,
+      PlayRepeat.singleCycle => auto ? _index : (_index + 1) % length,
+      PlayRepeat.listCycle => (_index + 1) % length,
+      PlayRepeat.autoPlayRelated => (_index + 1) % length,
+    };
   }
+
+  /// 取下一项并开流。播完自动走 [auto] = true，手动切条走 false。
+  Future<void> _advance({required bool auto, String source = 'auto'}) async {
+    if (_shuffle) await _shuffleRestore;
+    final next = _nextIndex(auto: auto);
+    if (next == null || next == _index) {
+      _diagSwitchRequest(source, _index);
+      _diagSwitchBlocked(
+        source,
+        _queue.length <= 1
+            ? 'single-item'
+            : _shuffle
+            ? 'shuffle-exhausted'
+            : 'end-of-queue',
+        targetIndex: _index,
+      );
+      return;
+    }
+    _diagSwitchRequest(source, next);
+    if (auto && await _maybeAutoRebuildBeforeNext(next)) return;
+    await _open(next, source: source);
+  }
+
+  /// 下一条按钮 / 后台「下一首」：手动语义，即使当前是播完暂停或单曲
+  /// 循环也要往后走。
+  Future<void> _next({String source = 'auto'}) =>
+      _advance(auto: false, source: source);
 
   /// 重新发牌：这一轮没播过的都进去，洗一遍。
   void _refillDeck() {
@@ -1637,8 +1678,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         .where((key) => key != _current.key && !_played.contains(key))
         .toList();
     if (remaining.isEmpty) {
-      // 一轮播完了：重开一轮，但把刚才那几条留在排除集里，
-      // 避免新一轮第一首又正好是刚播过的。
+      // 一轮播完了：重开一轮，但把当前这条留在排除集里，
+      // 避免新一轮第一首又正好是刚播完的视频。
       _played.clear();
       remaining.addAll(
         _queue.map((e) => e.key).where((key) => key != _current.key),
@@ -1734,6 +1775,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ..addAll(entries);
       _index = target;
     });
+    // 队列换成了播放列表的整份条目：随机牌堆和历史签名跟着换，
+    // 否则旧牌的 key 全都不在队列里，随机模式会一直走回退的顺播。
+    final signature = ShortVideoShuffleStore.signatureOf(
+      entries.map((e) => e.key),
+    );
+    if (signature != _deckSignature) {
+      _played.clear();
+      _deck.clear();
+      _deckSignature = signature;
+      _shuffleRestored = true;
+      if (_shuffle) {
+        _refillDeck();
+        _prefetchNext();
+      }
+    }
     // 点的就是当前这条：画面正常就只把队列换成列表顺序，不重新加载打断
     // 播放；但如果现在是黑屏/卡在 buffering/错误态，这一点就是用户手动
     // 救场，必须走和下拉列表选其它条一样的完整重建。
