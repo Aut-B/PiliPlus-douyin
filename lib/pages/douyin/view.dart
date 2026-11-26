@@ -295,16 +295,21 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   static const int _metaBackfillLimit = 8;
   bool _metaBackfilling = false;
 
+  /// 详情里也拿不到封面的条目，本次会话不再反复解析（每次都要开一个
+  /// 离屏网页，6S 上很贵）。
+  final Set<String> _metaMisses = <String>{};
+
   static bool _needsMeta(ShortVideo video) =>
       video.videoId.isNotEmpty &&
       (video.desc.trim().isEmpty ||
           video.desc.trim() == '分享链接添加的视频' ||
-          video.author.trim().isEmpty);
+          video.author.trim().isEmpty ||
+          video.cover.trim().isEmpty);
 
   Future<void> _backfillMeta() async {
     if (_metaBackfilling) return;
     final targets = _videos
-        .where(_needsMeta)
+        .where((e) => _needsMeta(e) && !_metaMisses.contains(e.key))
         .take(_metaBackfillLimit)
         .toList(growable: false);
     if (targets.isEmpty) return;
@@ -327,13 +332,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         final current = _videos[index];
         final title = resolved.title.trim();
         final author = resolved.author.trim();
-        final cover = resolved.cover.trim();
+        final cover = ShortVideo.thumbnailCover(resolved.cover);
         final durationMs = resolved.durationMs;
         // 一个字段都没补到就别写回，省得反复解析。
         if (title.isEmpty &&
             author.isEmpty &&
             cover.isEmpty &&
             durationMs <= 0) {
+          _metaMisses.add(key);
           continue;
         }
         final updated = current.copyWith(
@@ -344,6 +350,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         );
         setState(() => _videos[index] = updated);
         ShortVideoRepo.save(platform, _videos);
+        if (cover.isEmpty) {
+          _metaMisses.add(key);
+        } else {
+          _metaMisses.remove(key);
+        }
       }
     } finally {
       _metaBackfilling = false;
@@ -649,7 +660,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         platform: target.id,
         desc: title,
         author: resolved.author.trim(),
-        cover: resolved.cover.trim(),
+        cover: ShortVideo.thumbnailCover(resolved.cover),
         durationMs: resolved.durationMs,
         playUrl: resolved.url,
         videoId: link.videoId,
@@ -961,11 +972,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       title: const Text('清空本地缓存？'),
       content: Text(
         '会删掉已经下到本机的 ${_fmtBytes(_cacheBytes)} 视频文件。'
-        '收藏列表和 WebDAV 上的记录不受影响，收藏与播放列表里的视频会自动补回。',
+        '收藏列表和 WebDAV 上的记录不受影响，收藏与播放列表里的视频会自动补回。'
+        '封面只存缩略图地址，不占视频空间。',
       ),
     );
     if (!confirmed || !mounted) return;
     await ShortVideoMediaCache.clear();
+    // 封面本身只存缩略图地址，但滚动时解码出来的位图还在全局图片缓存里。
+    PaintingBinding.instance.imageCache.clear();
     if (mounted) {
       setState(() {
         _cachedKeys.clear();
