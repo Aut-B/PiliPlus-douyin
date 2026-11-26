@@ -2089,9 +2089,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   Widget build(BuildContext context) {
     final entry = _current;
     final viewPadding = MediaQuery.viewPaddingOf(context);
-    final topInset = _chromeVisible ? viewPadding.top + _topBarHeight : 0.0;
+    // 收紧后的栏高只留刚够用的空间；系统字号放大到 1.6 时标题和时间行
+    // 会变高，这里按比例补回一点，避免底栏按钮被挤出屏幕。
+    final double textScale = MediaQuery.textScalerOf(context).scale(1.0);
+    final double extra = (textScale - 1.0).clamp(0.0, 0.6).toDouble();
+    final double topBarHeight = _topBarHeight + extra * 8;
+    final double bottomBarHeight = _bottomBarHeight + extra * 20;
+    final topInset = _chromeVisible ? viewPadding.top + topBarHeight : 0.0;
     final bottomInset = _chromeVisible
-        ? viewPadding.bottom + _bottomBarHeight
+        ? viewPadding.bottom + bottomBarHeight
         : 0.0;
     return PopScope(
       // 系统返回手势 / 安卓返回键也要走收尾。注意这里是同步触发，
@@ -2169,7 +2175,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 top: 0,
                 left: 0,
                 right: 0,
-                height: viewPadding.top + _topBarHeight,
+                height: viewPadding.top + topBarHeight,
                 child: _chromeBackdrop(
                   child: SafeArea(
                     top: true,
@@ -2186,7 +2192,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 left: 0,
                 right: 0,
                 bottom: 0,
-                height: viewPadding.bottom + _bottomBarHeight,
+                height: viewPadding.bottom + bottomBarHeight,
                 child: _chromeBackdrop(
                   bottom: true,
                   child: SafeArea(
@@ -2208,28 +2214,34 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 控件条底色。
   ///
-  /// 以前控件条直接压在白底视频上：6S 是 375pt 宽，右上一个「更多设置」
-  /// 图标本来就小，白色图标落在浅色画面上等于看不见，用户会当成「按了没用」。
-  /// 现在上下各加一层很薄的黑色渐变，只做可读性，不做满屏蒙版。
+  /// 控件条和视频区在几何上分开，这里只是一层静态纯黑底，再加一条 0.5pt
+  /// 细线把控制区和画面分开。不用渐变 / 模糊：6S 上这两条每次重绘都要
+  /// 跑一遍着色器，静态纯色没有额外开销。
   Widget _chromeBackdrop({required Widget child, bool bottom = false}) {
     return DecoratedBox(
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: bottom ? Alignment.bottomCenter : Alignment.topCenter,
-          end: bottom ? Alignment.topCenter : Alignment.bottomCenter,
-          colors: const [Color(0xCC000000), Color(0x00000000)],
+        color: Colors.black,
+        border: Border(
+          top: bottom
+              ? const BorderSide(color: Color(0x1FFFFFFF), width: 0.5)
+              : BorderSide.none,
+          bottom: bottom
+              ? BorderSide.none
+              : const BorderSide(color: Color(0x1FFFFFFF), width: 0.5),
         ),
       ),
       child: child,
     );
   }
 
-  /// 顶部控件条高度；视频区域按这个留白，保证控件不被视频手势层覆盖。
-  static const double _topBarHeight = 56;
+  /// 顶部控件条高度（不含状态栏）：一行 36pt 按钮 + 上下各 2pt 内边距。
+  /// 视频区域按这个留白，保证控件不被视频手势层覆盖。
+  static const double _topBarHeight = 44;
 
-  /// 底部控件条高度：进度行（时间 + 4px 轨道）+ 一排 34pt 按钮。15PM 的
-  /// 底部安全区会再吃掉 34pt，这里留出余量，避免新布局在小屏上溢出。
-  static const double _bottomBarHeight = 104;
+  /// 底部控件条高度（不含底部安全区）：13pt 进度行 + 2pt 间隔 + 34pt
+  /// 按钮 + 上下各 2pt 内边距，合计约 53pt；留到 56pt 兼容不同字体的行高。
+  /// 15PM 的底部安全区会再吃掉 34pt，由上面的 Positioned 高度单独叠加。
+  static const double _bottomBarHeight = 56;
 
   /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
@@ -2661,7 +2673,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 本来就会吃掉自己区域内的触摸，命中测试按 Stack 逆序走，先到控件层。
   Widget _controls(Widget child) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      // 上下只留 2pt：栏高已经收紧，多余空白都还给视频区。左右两侧
+      // 统一 10pt，顶栏右下工具组和底栏右侧工具组落在同一条竖线上。
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
       child: child,
     );
   }
@@ -2778,7 +2792,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 进度条和时间文本，不跟着 position 回调刷新整页。
     //
     // 布局分两行：
-    // * 进度行：当前时间 + 加粗进度条（带拖动圆点）+ 总时长，三者同一行
+    // * 进度行：当前时间 + 进度条（带拖动圆点）+ 总时长，三者同一行
     //   基线对齐，时间不会和进度条错位；
     // * 操作行：左侧「上一条 / 暂停 / 下一条」播放组，右侧「评论 / 画中画 /
     //   旋转 / 更多」工具组，中间留白把两组分开。
@@ -2800,15 +2814,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                       buffered: progress.buffered,
                       total: progress.duration,
                       // 已播 / 缓冲 / 未播三段颜色拉开，4px 轨道在深色画面上
-                      // 也能看清；拖动时手柄带一圈柔光。
+                      // 也能看清；拖动时只画纯色圆点，不做柔光/阴影。
                       baseBarColor: const Color(0x3DFFFFFF),
                       progressBarColor: Colors.white,
                       bufferedBarColor: const Color(0x8AFFFFFF),
                       thumbColor: Colors.white,
-                      thumbGlowColor: const Color(0x33FFFFFF),
+                      // 柔光半径等于手柄半径时不会绘制，颜色仅为满足必填参数。
+                      thumbGlowColor: Colors.transparent,
                       barHeight: 4,
                       thumbRadius: 6,
-                      thumbGlowRadius: 14,
+                      thumbGlowRadius: 6,
                       // RenderProgressBar 只有 onDragStart/onHover 非空时才参与
                       // 命中测试，否则整条进度条点不动。空回调只为了可拖。
                       onDragStart: (_) {},
