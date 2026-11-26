@@ -1,5 +1,6 @@
 import 'dart:async' show unawaited;
 
+import 'package:PiliPlus/common/style.dart' show Style;
 import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
 import 'package:PiliPlus/pages/douyin/auto_cache.dart';
 import 'package:PiliPlus/pages/douyin/cache.dart';
@@ -11,6 +12,8 @@ import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/rootscan_view.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
+import 'package:PiliPlus/pages/main/controller.dart';
+import 'package:flutter/foundation.dart' show clampDouble;
 import 'package:flutter/services.dart' show Clipboard;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
@@ -85,7 +88,7 @@ class _ShortVideoPageState extends State<ShortVideoPage> {
 
   @override
   Widget build(BuildContext context) {
-    // 只保留收藏页自己的 Scaffold：平台切换放进它的 AppBar 底部，
+    // 只保留收藏页自己的 Scaffold：平台切换直接放进 AppBar 标题行，
     // 避免外面再套一层 AppBar 出现两条标题栏。
     return ShortVideoFavoritesPage(
       key: ValueKey(_platform.id),
@@ -147,6 +150,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 56 只够旧的 BottomNavigationBar，默认的 M3 导航栏比它高 24。
   static const double _mainBottomNavHeight = 88;
 
+  /// 上滑收起底栏时累计位移的封顶值，约等于 M3 导航栏高度。
+  static const double _bottomBarHideOffset = 80;
+
+  /// 底栏收起进度：0 为完全展开，[_bottomBarHideOffset] 为完全收起。
+  final ValueNotifier<double> _barOffset = ValueNotifier<double>(0);
+
+  /// 主界面悬浮四 tab 导航栏的位移，与 B站首页 `CommonPageState` 共用
+  /// 同一个 Rx（量纲是 `Style.topBarHeight`）。用户在设置里关掉「隐藏底栏」
+  /// 时该值为 null，此时只收起本页自己的操作条。
+  RxDouble? _mainBarOffset;
+
   final List<ShortVideo> _videos = [];
   bool _syncing = false;
   String _status = '';
@@ -192,6 +206,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   @override
   void initState() {
     super.initState();
+    _mainBarOffset = Get.isRegistered<MainController>()
+        ? Get.find<MainController>().barOffset
+        : null;
     _reload();
     _refreshCacheSize();
     _status = _videos.isEmpty
@@ -200,9 +217,69 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _autoSync());
   }
 
+  /// 上滑累计正位移收起底栏，下滑再退回来；只跟随手指拖动，
+  /// 松手后的惯性滚动不改位移，避免回弹闪动。
+  bool _onScrollNotification(ScrollNotification notification) {
+    if (_videos.isEmpty || notification.metrics.axis == Axis.horizontal) {
+      return false;
+    }
+    final double delta;
+    if (notification is ScrollUpdateNotification) {
+      if (notification.dragDetails == null) return false;
+      delta = notification.scrollDelta ?? 0;
+    } else if (notification is OverscrollNotification) {
+      delta = notification.overscroll;
+    } else {
+      return false;
+    }
+    if (delta == 0) return false;
+    // 列表在顶部继续下拉时不要收起底栏（与 CommonPageState 一致）。
+    if (notification.metrics.pixels < 0 && delta > 0) return false;
+    _barOffset.value = clampDouble(
+      _barOffset.value + delta,
+      0.0,
+      _bottomBarHideOffset,
+    );
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null) {
+      mainBarOffset.value = clampDouble(
+        mainBarOffset.value + delta,
+        0.0,
+        Style.topBarHeight,
+      );
+    }
+    return false;
+  }
+
+  /// 本页操作条与主界面悬浮导航栏一起回到展开状态。
+  void _resetBarOffset() {
+    _barOffset.value = 0;
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null && mainBarOffset.value != 0) {
+      mainBarOffset.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    // 切到别的 tab 时本页可能带着主界面底栏的位移一起消失：延到下一帧
+    // 复位，避免在销毁过程中触发主界面重建。主界面控制器若已关闭，
+    // 写入会被 Rx 自己忽略。
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        mainBarOffset.value = 0;
+      });
+    }
+    _barOffset.dispose();
+    super.dispose();
+  }
+
   void _reload() {
     final stored = ShortVideoRepo.load(platform);
     if (!mounted) return;
+    // 切换平台/重新拉取后列表回到顶部，底栏也跟着展开。
+    _resetBarOffset();
     setState(() {
       _videos
         ..clear()
@@ -218,16 +295,21 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   static const int _metaBackfillLimit = 8;
   bool _metaBackfilling = false;
 
+  /// 详情里也拿不到封面的条目，本次会话不再反复解析（每次都要开一个
+  /// 离屏网页，6S 上很贵）。
+  final Set<String> _metaMisses = <String>{};
+
   static bool _needsMeta(ShortVideo video) =>
       video.videoId.isNotEmpty &&
       (video.desc.trim().isEmpty ||
           video.desc.trim() == '分享链接添加的视频' ||
-          video.author.trim().isEmpty);
+          video.author.trim().isEmpty ||
+          video.cover.trim().isEmpty);
 
   Future<void> _backfillMeta() async {
     if (_metaBackfilling) return;
     final targets = _videos
-        .where(_needsMeta)
+        .where((e) => _needsMeta(e) && !_metaMisses.contains(e.key))
         .take(_metaBackfillLimit)
         .toList(growable: false);
     if (targets.isEmpty) return;
@@ -250,13 +332,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         final current = _videos[index];
         final title = resolved.title.trim();
         final author = resolved.author.trim();
-        final cover = resolved.cover.trim();
+        final cover = ShortVideo.thumbnailCover(resolved.cover);
         final durationMs = resolved.durationMs;
         // 一个字段都没补到就别写回，省得反复解析。
         if (title.isEmpty &&
             author.isEmpty &&
             cover.isEmpty &&
             durationMs <= 0) {
+          _metaMisses.add(key);
           continue;
         }
         final updated = current.copyWith(
@@ -267,6 +350,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         );
         setState(() => _videos[index] = updated);
         ShortVideoRepo.save(platform, _videos);
+        if (cover.isEmpty) {
+          _metaMisses.add(key);
+        } else {
+          _metaMisses.remove(key);
+        }
       }
     } finally {
       _metaBackfilling = false;
@@ -358,6 +446,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('打开网页失败: $e');
     } finally {
       _openingWeb = false;
+      // 网页是独立路由，回来时把底栏展开，别停在上次滚动的收起态。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -384,6 +474,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       SmartDialog.showToast('直连同步失败: $e');
     } finally {
       _openingWeb = false;
+      // 与打开网页一致：独立路由返回后把底栏展开。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -568,7 +660,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         platform: target.id,
         desc: title,
         author: resolved.author.trim(),
-        cover: resolved.cover.trim(),
+        cover: ShortVideo.thumbnailCover(resolved.cover),
         durationMs: resolved.durationMs,
         playUrl: resolved.url,
         videoId: link.videoId,
@@ -617,6 +709,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       await openShortVideoQueue(queue, index);
     } finally {
       _openingPlayer = false;
+      // 播放页是独立路由，本页底栏不参与其竖滑；退出回来时重新展开。
+      if (mounted) _resetBarOffset();
     }
   }
 
@@ -855,7 +949,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final cached = <String>{};
     for (final video in videos) {
       if (!mounted || scanId != _cacheScanId) return;
-      if (await ShortVideoMediaCache.localPath(video) != null) {
+      if (await ShortVideoMediaCache.localPath(video, track: false) != null) {
         cached.add(video.key);
       }
     }
@@ -878,11 +972,14 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       title: const Text('清空本地缓存？'),
       content: Text(
         '会删掉已经下到本机的 ${_fmtBytes(_cacheBytes)} 视频文件。'
-        '收藏列表和 WebDAV 上的记录不受影响，收藏与播放列表里的视频会自动补回。',
+        '收藏列表和 WebDAV 上的记录不受影响，收藏与播放列表里的视频会自动补回。'
+        '封面只存缩略图地址，不占视频空间。',
       ),
     );
     if (!confirmed || !mounted) return;
     await ShortVideoMediaCache.clear();
+    // 封面本身只存缩略图地址，但滚动时解码出来的位图还在全局图片缓存里。
+    PaintingBinding.instance.imageCache.clear();
     if (mounted) {
       setState(() {
         _cachedKeys.clear();
@@ -908,6 +1005,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       return;
     }
     ShortVideoAutoCache.refreshProtection();
+    // 手动选的条目多数不在播放列表里；批次期间临时纳入保护，
+    // 下载触发的淘汰才不会把刚存下的文件当普通缓存删掉。
+    ShortVideoMediaCache.beginManualCache(videos.map((video) => video.key));
     setState(() {
       _caching = true;
       _cacheDone = 0;
@@ -917,76 +1017,124 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     });
     var ok = 0;
     var skipped = 0;
-    final cookie = await ShortVideoWeb.cookieHeader(
-      platform.cookieDomainNeedle,
-    );
-    for (var i = 0; i < videos.length; i++) {
-      if (!mounted) break;
-      final video = videos[i];
-      final existing = await ShortVideoMediaCache.localPath(video);
-      if (existing != null) {
-        skipped++;
-        if (mounted) {
+    var stopped = 0;
+    final limit = ShortVideoMediaCache.limitBytes;
+    try {
+      final cookie = await ShortVideoWeb.cookieHeader(
+        platform.cookieDomainNeedle,
+      );
+      for (var i = 0; i < videos.length; i++) {
+        if (!mounted) break;
+        final video = videos[i];
+        final existing = await ShortVideoMediaCache.localPath(
+          video,
+          track: false,
+        );
+        if (existing != null) {
+          skipped++;
+          if (mounted) {
+            setState(() {
+              _cachedKeys.add(video.key);
+              _cacheDone = i + 1;
+            });
+          }
+          continue;
+        }
+        if (!mounted) break;
+        // 到硬上限就先停手：再下只会触发淘汰，白耗流量。
+        if (await ShortVideoMediaCache.size() >= limit) {
+          stopped = videos.length - i;
+          break;
+        }
+        setState(() {
+          _cacheProgress[video.key] = 0;
+          _status = '缓存中 ${i + 1}/${videos.length}：${video.title}';
+        });
+        final urls = <String>[
+          if (video.playUrl.isNotEmpty) video.playUrl,
+          ...stableUrls(video),
+        ];
+        final total = videos.length;
+        final result = await ShortVideoMediaCache.download(
+          video,
+          urls: urls,
+          userAgent: platform.userAgent,
+          referer: platform.referer,
+          cookie: cookie,
+          appUserAgent: platform == ShortVideoPlatform.tiktok
+              ? tiktokAppUserAgent
+              : '',
+          onProgress: (progress) {
+            if (!mounted) return;
+            final now = DateTime.now().millisecondsSinceEpoch;
+            final last = _cacheProgressAt[video.key] ?? 0;
+            if (progress < 1 && now - last < 180) return;
+            _cacheProgressAt[video.key] = now;
+            setState(() {
+              _cacheProgress[video.key] = progress.clamp(0.0, 1.0);
+              _status =
+                  '缓存中 ${i + 1}/$total'
+                  '（${(progress * 100).clamp(0, 100).round()}%）：'
+                  '${video.title}';
+            });
+          },
+        );
+        if (!mounted) break;
+        if (result.ok) {
+          // 下载返回 path 不代表盘上还留着：淘汰可能紧接着把它删掉。
+          // 以磁盘为准复核，_cachedKeys 才不会出现「显示已缓存但播不了」。
+          final saved = await ShortVideoMediaCache.localPath(
+            video,
+            track: false,
+          );
+          if (saved != null) {
+            ok++;
+            setState(() {
+              _cacheProgress.remove(video.key);
+              _cacheProgressAt.remove(video.key);
+              _cacheDone = i + 1;
+              _cachedKeys.add(video.key);
+            });
+          } else {
+            setState(() {
+              _cacheProgress.remove(video.key);
+              _cacheProgressAt.remove(video.key);
+              _cacheDone = i + 1;
+              _cachedKeys.remove(video.key);
+            });
+            SmartDialog.showToast('缓存已满，这条未能保留：${video.title}');
+          }
+        } else {
           setState(() {
-            _cachedKeys.add(video.key);
+            _cacheProgress.remove(video.key);
+            _cacheProgressAt.remove(video.key);
             _cacheDone = i + 1;
           });
+          SmartDialog.showToast(
+            '缓存失败：${video.title}（${result.error ?? '未知错误'}）',
+          );
         }
-        continue;
       }
-      if (!mounted) break;
+      if (!mounted) return;
+      await ShortVideoMediaCache.enforceLimit();
+      final cachedNow = <String>{};
+      for (final video in videos) {
+        if (await ShortVideoMediaCache.localPath(video, track: false) != null) {
+          cachedNow.add(video.key);
+        }
+      }
+      if (!mounted) return;
       setState(() {
-        _cacheProgress[video.key] = 0;
-        _status = '缓存中 ${i + 1}/${videos.length}：${video.title}';
+        for (final video in videos) {
+          if (cachedNow.contains(video.key)) {
+            _cachedKeys.add(video.key);
+          } else {
+            _cachedKeys.remove(video.key);
+          }
+        }
       });
-      final urls = <String>[
-        if (video.playUrl.isNotEmpty) video.playUrl,
-        ...stableUrls(video),
-      ];
-      final total = videos.length;
-      final result = await ShortVideoMediaCache.download(
-        video,
-        urls: urls,
-        userAgent: platform.userAgent,
-        referer: platform.referer,
-        cookie: cookie,
-        appUserAgent: platform == ShortVideoPlatform.tiktok
-            ? tiktokAppUserAgent
-            : '',
-        onProgress: (progress) {
-          if (!mounted) return;
-          final now = DateTime.now().millisecondsSinceEpoch;
-          final last = _cacheProgressAt[video.key] ?? 0;
-          if (progress < 1 && now - last < 180) return;
-          _cacheProgressAt[video.key] = now;
-          setState(() {
-            _cacheProgress[video.key] = progress.clamp(0.0, 1.0);
-            _status =
-                '缓存中 ${i + 1}/$total'
-                '（${(progress * 100).clamp(0, 100).round()}%）：'
-                '${video.title}';
-          });
-        },
-      );
-      if (!mounted) break;
-      if (result.ok) {
-        ok++;
-        setState(() {
-          _cacheProgress.remove(video.key);
-          _cacheProgressAt.remove(video.key);
-          _cacheDone = i + 1;
-          _cachedKeys.add(video.key);
-        });
-      } else {
-        setState(() {
-          _cacheProgress.remove(video.key);
-          _cacheProgressAt.remove(video.key);
-          _cacheDone = i + 1;
-        });
-        SmartDialog.showToast(
-          '缓存失败：${video.title}（${result.error ?? '未知错误'}）',
-        );
-      }
+    } finally {
+      ShortVideoMediaCache.endManualCache();
     }
     if (!mounted) return;
     setState(() {
@@ -995,11 +1143,17 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       _cacheProgressAt.clear();
       _cacheTotal = 0;
       _cacheDone = 0;
-      _status =
-          '缓存完成：新增 $ok 条'
-          '${skipped > 0 ? '，已有 $skipped 条' : ''}'
-          '${ok + skipped == videos.length ? '' : '，失败 ${videos.length - ok - skipped} 条'}';
+      _status = stopped > 0
+          ? '缓存已达上限：新增 $ok 条'
+                '${skipped > 0 ? '，已有 $skipped 条' : ''}'
+                '，剩余 $stopped 条未缓存'
+          : '缓存完成：新增 $ok 条'
+                '${skipped > 0 ? '，已有 $skipped 条' : ''}'
+                '${ok + skipped == videos.length ? '' : '，失败 ${videos.length - ok - skipped} 条'}';
     });
+    if (stopped > 0) {
+      SmartDialog.showToast('缓存已达上限，剩余 $stopped 条未缓存');
+    }
     await _refreshCacheSize();
   }
 
@@ -1093,17 +1247,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
+      extendBody: true,
       appBar: AppBar(
-        toolbarHeight: 48,
-        title: Text(
-          platform.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        titleTextStyle: theme.textTheme.titleMedium?.copyWith(
-          fontWeight: FontWeight.w600,
-          color: theme.colorScheme.onSurface,
-        ),
+        // 外层 MainLayout 已按状态栏高度给 body 补过 padding，
+        // AppBar 若再 primary:true 会重复加一次安全区，顶部出现大片空白。
+        primary: false,
+        toolbarHeight: 44,
+        title: _platformSwitcher(theme),
         titleSpacing: 16,
         actions: [
           _headIcon(
@@ -1148,11 +1298,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           _moreMenu(theme),
           const SizedBox(width: 4),
         ],
-        // 分段控件放在标题栏底部，固定在顶部，避免滚动时平台入口消失。
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(44),
-          child: _platformSwitcher(theme),
-        ),
       ),
       body: Column(
         children: [
@@ -1193,24 +1338,40 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ),
           _statusBar(theme),
           Expanded(
-            child: _videos.isEmpty
-                ? _empty(theme)
-                : Column(
-                    children: [
-                      _listHeader(theme),
-                      Expanded(child: _list(theme)),
-                    ],
-                  ),
+            child: Builder(
+              builder: (bodyContext) {
+                // extendBody 下 Scaffold 会把底栏高度注入 body 的
+                // MediaQuery.padding.bottom，列表尾部按它留白，
+                // 否则最后一张卡片会被悬浮底栏盖住。
+                final bottomInset = MediaQuery.paddingOf(bodyContext).bottom;
+                return NotificationListener<ScrollNotification>(
+                  onNotification: _onScrollNotification,
+                  child: _videos.isEmpty
+                      ? _empty(theme)
+                      : Column(
+                          children: [
+                            _listHeader(theme),
+                            Expanded(child: _list(theme, bottomInset)),
+                          ],
+                        ),
+                );
+              },
+            ),
           ),
         ],
       ),
-      // 底栏原来放在 Column 里。问题在于主界面用 MainLayout 布局：body 按
-      // 整屏高度布局（bodyConstraints = 全高），底部导航栏是**叠画在 body
-      // 之上**的，不是挤压。所以 body 里最后那排按钮正好被底栏盖住，点不到。
-      // 放进 bottomNavigationBar 由 Scaffold 自己避让；同时因为 body 被
-      // 撑满整屏，Scaffold 算出来的 bottom padding 不可靠，_bottomBar 里
-      // 再按 MediaQuery.viewPadding 显式补一份。
-      bottomNavigationBar: _videos.isEmpty ? null : _bottomBar(theme),
+      // 底栏叠在 body 之上：上滑只把它向下平移，body 不跟着变形；
+      // 底栏自己补系统安全区与主界面导航栏高度，按钮不会被底部导航栏盖住。
+      bottomNavigationBar: _videos.isEmpty
+          ? null
+          : ValueListenableBuilder<double>(
+              valueListenable: _barOffset,
+              child: _bottomBar(theme),
+              builder: (context, offset, child) => FractionalTranslation(
+                translation: Offset(0, offset / _bottomBarHideOffset),
+                child: child,
+              ),
+            ),
     );
   }
 
@@ -1282,37 +1443,45 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 平台切换：居中的胶囊分段控件，当前平台用主题色高亮。
+  /// 平台切换：标题行左侧的胶囊分段控件，当前平台用主题色高亮。
   Widget _platformSwitcher(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-      child: Center(
-        child: SegmentedButton<ShortVideoPlatform>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment(
-              value: ShortVideoPlatform.douyin,
-              label: Text('抖音'),
-            ),
-            ButtonSegment(
-              value: ShortVideoPlatform.tiktok,
-              label: Text('TikTok'),
-            ),
-          ],
-          selected: {platform},
-          onSelectionChanged: (selection) =>
-              widget.onPlatformChanged(selection.first),
-          style: SegmentedButton.styleFrom(
-            minimumSize: const Size(96, 32),
-            visualDensity: VisualDensity.compact,
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            backgroundColor: scheme.surfaceContainerHighest,
-            foregroundColor: scheme.onSurfaceVariant,
-            selectedBackgroundColor: scheme.primaryContainer,
-            selectedForegroundColor: scheme.onPrimaryContainer,
-            side: BorderSide(
-              color: scheme.outlineVariant.withValues(alpha: 0.7),
+      padding: const EdgeInsets.fromLTRB(0, 0, 8, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        // 右侧 actions 较多，窄屏或大字号时允许整体等比缩小，避免横向溢出。
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: SegmentedButton<ShortVideoPlatform>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment(
+                value: ShortVideoPlatform.douyin,
+                label: Text('抖音'),
+              ),
+              ButtonSegment(
+                value: ShortVideoPlatform.tiktok,
+                label: Text('TikTok'),
+              ),
+            ],
+            selected: {platform},
+            onSelectionChanged: (selection) =>
+                widget.onPlatformChanged(selection.first),
+            style: SegmentedButton.styleFrom(
+              minimumSize: const Size(72, 32),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              textStyle: theme.textTheme.labelMedium,
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              backgroundColor: scheme.surfaceContainerHighest,
+              foregroundColor: scheme.onSurfaceVariant,
+              selectedBackgroundColor: scheme.primaryContainer,
+              selectedForegroundColor: scheme.onPrimaryContainer,
+              side: BorderSide(
+                color: scheme.outlineVariant.withValues(alpha: 0.7),
+              ),
             ),
           ),
         ),
@@ -1400,7 +1569,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget _listHeader(ThemeData theme) {
     final scheme = theme.colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 6, 0),
+      padding: const EdgeInsets.fromLTRB(10, 0, 4, 0),
       child: Row(
         children: [
           Text(
@@ -1425,15 +1594,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
               visualDensity: VisualDensity.compact,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               minimumSize: const Size(0, 32),
-              padding: const EdgeInsets.symmetric(horizontal: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
             ),
             icon: _addingLink
                 ? const SizedBox(
-                    width: 14,
-                    height: 14,
+                    width: 12,
+                    height: 12,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.link, size: 16),
+                : const Icon(Icons.link, size: 14),
             label: const Text('粘贴链接'),
           ),
         ],
@@ -1621,15 +1790,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  Widget _list(ThemeData theme) {
+  Widget _list(ThemeData theme, double bottomInset) {
     return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
+      padding: EdgeInsets.fromLTRB(10, 0, 10, bottomInset + 6),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
         final checked = widget.selected.containsKey(video.key);
         return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: 6),
           child: Material(
             color: _selecting && checked
                 ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
@@ -1671,7 +1840,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                                 height: 1.25,
                               ),
                             ),
-                            const SizedBox(height: 3),
+                            const SizedBox(height: 2),
                             Text(
                               video.author.trim().isEmpty
                                   ? '未知作者'
@@ -1730,7 +1899,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 2),
                     if (_selecting)
                       SizedBox(
                         width: 36,
@@ -1987,9 +2156,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     return Padding(
       padding: EdgeInsets.fromLTRB(
         12,
-        6,
+        4,
         12,
-        safeBottom + _mainBottomNavHeight + 4,
+        safeBottom + _mainBottomNavHeight + 2,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2070,7 +2239,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                     onPressed: _openWeb,
                     style: FilledButton.styleFrom(
                       visualDensity: VisualDensity.compact,
-                      minimumSize: const Size.fromHeight(42),
+                      minimumSize: const Size.fromHeight(38),
                     ),
                     icon: const Icon(Icons.public, size: 18),
                     label: const Text('打开网页 / 抓取'),
@@ -2081,7 +2250,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                   onPressed: _videos.isEmpty ? null : _playAll,
                   style: OutlinedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    minimumSize: const Size(0, 42),
+                    minimumSize: const Size(0, 38),
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                   ),
                   icon: const Icon(Icons.play_arrow_rounded, size: 18),
@@ -2089,7 +2258,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 ),
               ],
             ),
-            const SizedBox(height: 2),
             Row(
               children: [
                 TextButton.icon(

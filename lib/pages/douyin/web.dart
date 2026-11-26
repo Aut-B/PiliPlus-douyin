@@ -192,7 +192,9 @@ abstract final class ShortVideoWeb {
             url: value,
             title: _metaText(raw['title']),
             author: _metaText(raw['author']),
-            cover: _metaText(raw['cover']),
+            // 原生详情也会先给 `cover`（小图）；这里再兜一层，别让
+            // `data:` 之类的大图进入收藏缓存。
+            cover: ShortVideo.thumbnailCover(_metaText(raw['cover'])),
             durationMs: _metaInt(raw['durationMs']),
           );
         }

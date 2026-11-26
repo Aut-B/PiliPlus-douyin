@@ -409,7 +409,12 @@ abstract final class ShortVideoSync {
       for (final entry in delta.adds.entries) {
         final existing = byKey[entry.key];
         if (existing == null || entry.value.updatedAt >= existing.updatedAt) {
-          byKey[entry.key] = entry.value;
+          byKey[entry.key] = _keepCover(entry.value, existing);
+        } else if (existing.cover.isEmpty && entry.value.cover.isNotEmpty) {
+          // 远端这条更旧但带封面：只补封面，不把本地更新的记录退回旧版本。
+          byKey[entry.key] = existing.copyWith(
+            cover: ShortVideo.thumbnailCover(entry.value.cover),
+          );
         }
       }
       for (final entry in delta.deletes.entries) {
@@ -423,6 +428,14 @@ abstract final class ShortVideoSync {
       delta: delta,
       items: byKey.values.toList(),
     );
+  }
+
+  /// 用新记录覆盖旧记录时保住封面：新记录缺缩略图就沿用旧的那条。
+  static ShortVideo _keepCover(ShortVideo next, ShortVideo? previous) {
+    if (previous == null || next.cover.isNotEmpty || previous.cover.isEmpty) {
+      return next;
+    }
+    return next.copyWith(cover: previous.cover);
   }
 
   /// 本地 + 远端取并集，只把新增 / 删除写进增量文件。
@@ -487,7 +500,11 @@ abstract final class ShortVideoSync {
     final adds = <String, ShortVideo>{};
     for (final video in localActive) {
       final existing = remoteByKey[video.key];
-      if (existing == null || video.updatedAt > existing.updatedAt) {
+      if (existing == null ||
+          video.updatedAt > existing.updatedAt ||
+          // 远端那条没封面、本地抓到了：只推这一条带封面的增量，别等
+          // updatedAt 再变一次，否则封面永远补不上去。
+          (existing.cover.isEmpty && video.cover.isNotEmpty)) {
         adds[video.key] = video;
       }
     }

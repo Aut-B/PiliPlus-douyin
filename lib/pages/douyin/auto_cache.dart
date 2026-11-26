@@ -1,4 +1,5 @@
 import 'dart:async' show Timer, unawaited;
+import 'dart:io' show File;
 
 import 'package:PiliPlus/pages/douyin/cache.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
@@ -7,10 +8,11 @@ import 'package:PiliPlus/pages/douyin/queue.dart';
 import 'package:PiliPlus/pages/douyin/repo.dart';
 import 'package:PiliPlus/pages/douyin/web.dart';
 
-/// 收藏 / 播放列表的后台落盘器。
+/// 播放列表 / 正在播的后台落盘器。
 ///
 /// 签名直链会过期，TikTok 尤其容易隔天就 403；只有本地文件才算「随时能播的
-/// 收藏」。这里串行把抓到的条目补下到持久目录，不阻塞收藏页刷新。
+/// 收藏」。这里串行把播放列表和最近起播的条目补下到持久目录，不阻塞收藏页
+/// 刷新。收藏夹本身不再全量预下载——6S 只有 16G，收藏越多越会吃光磁盘。
 abstract final class ShortVideoAutoCache {
   static bool _running = false;
   static bool _pending = false;
@@ -28,9 +30,16 @@ abstract final class ShortVideoAutoCache {
   static int lastDoneAt = 0;
 
   static List<ShortVideo> collectVideos() {
-    final byKey = <String, ShortVideo>{
-      for (final video in ShortVideoRepo.loadAll()) video.key: video,
-    };
+    final byKey = <String, ShortVideo>{};
+    // 正在播 / 刚播过的条目优先，容量不够时也要先保住它们。
+    final recent = _recentKeys();
+    if (recent.isNotEmpty) {
+      for (final video in ShortVideoRepo.loadAll()) {
+        if (!recent.contains(video.key)) continue;
+        byKey.putIfAbsent(video.key, () => video);
+      }
+    }
+    // 播放列表是用户明确要连着播的，整份都值得落盘。
     for (final item in ShortVideoPlaylistRepo.load()) {
       final video = item.short;
       if (video != null) byKey.putIfAbsent(video.key, () => video);
@@ -38,11 +47,22 @@ abstract final class ShortVideoAutoCache {
     return byKey.values.toList(growable: false);
   }
 
+  /// 最近起播的 key（最多两条）：第一条是正在播，第二条是刚播过的。
+  ///
+  /// 顺序由 [ShortVideoMediaCache.localPath] 在播放解析入口显式维护，
+  /// 不再从 [ShortVideoPlayStats] 的 Set 尾部推断（重复 add 不会重排）。
+  static List<String> _recentKeys() =>
+      ShortVideoMediaCache.recentPlaybackKeys(2);
+
   /// 先更新保护名单再单独下载：下载成功后顺手清理不受保护的旧文件。
   static void refreshProtection() {
+    final videos = collectVideos();
     ShortVideoMediaCache.protect(
-      collectVideos().map((video) => video.key),
+      videos.map((video) => video.key),
+      keep: _recentKeys(),
     );
+    // 旧版本可能已经把整个收藏夹落了盘；这里立刻压一次，不必等下一次下载。
+    unawaited(ShortVideoMediaCache.enforceLimit());
   }
 
   static void schedule() {
@@ -62,17 +82,38 @@ abstract final class ShortVideoAutoCache {
 
   static Future<void> _run() async {
     final all = collectVideos();
-    ShortVideoMediaCache.protect(all.map((video) => video.key));
+    final keep = _recentKeys();
+    ShortVideoMediaCache.protect(
+      all.map((video) => video.key),
+      keep: keep,
+    );
+    // 先按机型硬上限清一轮（6S 是 350MB），别让旧缓存挤占新条目的空间。
+    await ShortVideoMediaCache.enforceLimit();
+    // 目录已经到上限时不再往里塞：否则下载 → prune 删旧 → 下次再下，白耗流量。
+    var used = await ShortVideoMediaCache.size();
+    final limit = ShortVideoMediaCache.limitBytes;
     var failed = 0;
     for (final video in all) {
+      if (used >= limit && !keep.contains(video.key)) break;
       // 单条失败绝不能中断整批：以前一个 403 会让后面的收藏全部不下。
       try {
-        if (await ShortVideoMediaCache.localPath(video) != null) {
+        if (await ShortVideoMediaCache.localPath(video, track: false) != null) {
           _attempts.remove(video.key);
           continue;
         }
         if ((_attempts[video.key] ?? 0) >= maxAttempts) continue;
-        if (!await _fetchOne(video)) failed++;
+        final result = await _fetchOne(video);
+        if (!result.ok) {
+          failed++;
+          continue;
+        }
+        final path = result.path;
+        if (path != null) {
+          try {
+            used += await File(path).length();
+          } catch (_) {}
+        }
+        if (used >= limit) break;
       } catch (_) {
         _bump(video.key);
         failed++;
@@ -83,7 +124,7 @@ abstract final class ShortVideoAutoCache {
     if (failed > 0) _scheduleRetry();
   }
 
-  static Future<bool> _fetchOne(ShortVideo video) async {
+  static Future<ShortVideoDownload> _fetchOne(ShortVideo video) async {
     final platform =
         ShortVideoPlatform.fromId(video.platform) ?? ShortVideoPlatform.douyin;
     final cookie = await ShortVideoWeb.cookieHeader(
@@ -109,14 +150,14 @@ abstract final class ShortVideoAutoCache {
     if (result.ok) {
       _attempts.remove(video.key);
       _errors.remove(video.key);
-      return true;
+      return result;
     }
     _bump(video.key);
     final reason = (result.error ?? 'unknown').trim();
     _errors[video.key] = reason.length > 160
         ? reason.substring(0, 160)
         : reason;
-    return false;
+    return result;
   }
 
   static void _bump(String key) {

@@ -281,6 +281,21 @@ class ShortVideo {
 
   String get title => desc.trim().isEmpty ? '短视频' : desc.trim();
 
+  /// 只保留能当缩略图用的封面地址。
+  ///
+  /// 平台的 `cover` 字段本身就是生成好的小图；`origin_cover` / `dynamic_cover`
+  /// 是原图和动图，6S 空间有限，一律不落库。不是 http(s) 地址（例如 `data:`
+  /// 内联大图）也直接丢掉——宁可显示占位图，也不把大图写进收藏缓存。
+  static String thumbnailCover(String raw) {
+    final url = raw.trim();
+    if (url.isEmpty) return '';
+    final lower = url.toLowerCase();
+    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
+      return '';
+    }
+    return url;
+  }
+
   String get durationText {
     if (durationMs <= 0) return '--:--';
     final total = durationMs ~/ 1000;
@@ -312,7 +327,7 @@ class ShortVideo {
     'platform': platform,
     'desc': desc,
     'author': author,
-    'cover': cover,
+    'cover': ShortVideo.thumbnailCover(cover),
     'durationMS': durationMs,
     'playURL': playUrl,
     'videoID': videoId,
@@ -326,7 +341,7 @@ class ShortVideo {
       platform: _normalizePlatform('${json['platform'] ?? ''}', playUrl),
       desc: '${json['desc'] ?? ''}',
       author: '${json['author'] ?? ''}',
-      cover: '${json['cover'] ?? ''}',
+      cover: ShortVideo.thumbnailCover('${json['cover'] ?? ''}'),
       durationMs: json['durationMS'] is num
           ? (json['durationMS'] as num).toInt()
           : int.tryParse('${json['durationMS'] ?? ''}') ?? 0,
@@ -523,25 +538,13 @@ abstract final class ShortVideoParser {
         ]);
         videoId = _uri(videoMap);
         durationMs = _int(videoMap['duration']) ?? 0;
-        cover =
-            _firstUrl(videoMap, const [
-              'cover',
-              'origin_cover',
-              'dynamic_cover',
-            ]) ??
-            '';
+        cover = _coverUrl(videoMap, const ['cover', 'coverUrl']) ?? '';
       case ShortVideoPlatform.tiktok:
         playUrl = _tiktokPlayUrl(videoMap);
         videoId = _string(videoMap['id']) ?? _string(videoMap['videoID']) ?? '';
         // TikTok 的 duration 是秒。
         durationMs = (_int(videoMap['duration']) ?? 0) * 1000;
-        cover =
-            _string(videoMap['cover']) ??
-            _urlFromMap(videoMap['cover']) ??
-            _string(videoMap['originCover']) ??
-            _urlFromMap(videoMap['originCover']) ??
-            _firstUrl(videoMap, const ['cover', 'origin_cover']) ??
-            '';
+        cover = _coverUrl(videoMap, const ['cover', 'coverUrl']) ?? '';
     }
 
     if (playUrl == null || playUrl.isEmpty) return null;
@@ -637,6 +640,36 @@ abstract final class ShortVideoParser {
     return null;
   }
 
+  /// 只从缩略图字段取封面：`cover` 既可能是字符串，也可能是
+  /// `{ "url_list": [...] }` / `{ "UrlList": [...] }`，老接口还有 `{ "url": … }`。
+  /// 取到的地址统一过 [ShortVideo.thumbnailCover]，非 http(s) 一律丢弃。
+  static String? _coverUrl(
+    Map<String, dynamic> container,
+    List<String> keys,
+  ) {
+    for (final key in keys) {
+      final entry = container[key];
+      final direct = _string(entry);
+      if (direct != null) {
+        final url = ShortVideo.thumbnailCover(direct);
+        if (url.isNotEmpty) return url;
+      }
+      final fromMap = _urlFromMap(entry);
+      if (fromMap != null) {
+        final url = ShortVideo.thumbnailCover(fromMap);
+        if (url.isNotEmpty) return url;
+      }
+      if (entry is Map) {
+        final single = _string(entry['url']);
+        if (single != null) {
+          final url = ShortVideo.thumbnailCover(single);
+          if (url.isNotEmpty) return url;
+        }
+      }
+    }
+    return null;
+  }
+
   static String? _string(Object? value) {
     if (value is String) return value;
     if (value is num) return value.toString();
@@ -701,13 +734,23 @@ List<ShortVideo> mergeShortVideos(
       continue;
     }
     final winner = video.updatedAt > existing.updatedAt ? video : existing;
+    final loser = identical(winner, video) ? existing : video;
     var playUrl = winner.playUrl;
     if (playUrl.isEmpty) playUrl = existing.playUrl;
     if (playUrl.isEmpty) playUrl = video.playUrl;
     var videoId = winner.videoId;
     if (videoId.isEmpty) videoId = existing.videoId;
     if (videoId.isEmpty) videoId = video.videoId;
-    byKey[key] = winner.copyWith(playUrl: playUrl, videoId: videoId);
+    // 另一台设备 / 旧版本写进来的条目可能没有封面：合并时用另一侧的缩略图
+    // 补上，别让更新的那条把封面冲掉。
+    final cover = ShortVideo.thumbnailCover(
+      winner.cover.trim().isNotEmpty ? winner.cover : loser.cover,
+    );
+    byKey[key] = winner.copyWith(
+      cover: cover,
+      playUrl: playUrl,
+      videoId: videoId,
+    );
   }
 
   return order.map((key) => byKey[key]!).toList();
