@@ -22,13 +22,12 @@ const bool kDiagEnabled = !bool.fromEnvironment('PILIPLUS_DIAG_OFF');
 
 /// 深度诊断开关。
 ///
-/// 默认关闭：常规包只保留低频、轻量的采样，避免同步 FFI 把主 isolate
-/// 拖住。需要抓解码/渲染细节时用
-/// `--dart-define=PILIPLUS_DIAG_VERBOSE=true` 打开，采样恢复为每次整轮
-/// 读取全部 mpv 指标。
+/// 默认关闭：正常播放不采样，只在开流/首帧/异常/导出时各完整读取一次，
+/// 避免同步 FFI 把主 isolate 拖住。需要更细的轮转读取时用
+/// `--dart-define=PILIPLUS_DIAG_VERBOSE=true` 打开。
 const bool kDiagVerbose = bool.fromEnvironment('PILIPLUS_DIAG_VERBOSE');
 
-/// mpv 解码/渲染侧需要入证的指标。读不到就记 null，不抛错。
+/// mpv 解码/渲染侧需要入证的指标。读不到会在采样里写明原因，不抛错。
 const List<String> kMpvDiagKeys = <String>[
   'hwdec-current',
   'video-codec',
@@ -42,6 +41,19 @@ const List<String> kMpvDiagKeys = <String>[
   'cache-speed',
   'demuxer-cache-time',
 ];
+
+/// mpv 属性别名：键是采样里对外稳定的名字，值才是 mpv 真正支持的属性名。
+///
+/// - `drop-frame-count` 在部分 libmpv/老版本里叫 `frame-drop-count`；
+/// - `video-params/pixfmt` 不是 mpv 的属性（`video-params` 的子项叫
+///   `pixelformat`）。
+///
+/// 直接读原键只会拿到空串，采样里就永远是 null。这里显式回退，并把真正
+/// 命中的键写进 `mpvKeysUsed`，避免又变成「静默 null」。
+const Map<String, String> _mpvAliases = <String, String>{
+  'drop-frame-count': 'frame-drop-count',
+  'video-params/pixfmt': 'video-params/pixelformat',
+};
 
 const String kDiagPlaybackFile = 'diag_playback.log';
 
@@ -69,11 +81,12 @@ const int _openSlowPollMs = 500;
 /// 单段同步工作超过这个值就写一条 `ui-block`，供下一份诊断包定位。
 const int _uiBlockMs = 50;
 
-/// 常规模式：播放采样时按 [_mpvLightKeys] 轮转补读 mpv 指标。
+/// 调用方显式要轻量快照（`snapshot(full: false)`）时，按 [_mpvLightKeys]
+/// 轮转补读 mpv 指标。
 ///
-/// 之前 10 秒才读一次 drop-frame-count，其余键永远留在空缓存里，真机 playback
-/// 采样里 hwdec-current / video-params/w / video-codec 全是 null。现在每拍只读
-/// 一个键：既让缓存里迟早拿到全部指标，又不会把主 isolate 一次卡住半秒。
+/// 正常播放已经不再周期性采样，只剩开流/首帧/异常/导出这些一次性采样，
+/// 它们都走完整读取。这条轻量路径留给仍然愿意按拍轮转的调用方：每拍只读
+/// 一个键，不会把主 isolate 一次卡住半秒。
 const int _mpvLightRefreshMs = 2500;
 
 /// 轮转顺序：先补黑屏判定/硬解取证最关键的三个，其余靠后。
@@ -91,7 +104,7 @@ const List<String> _mpvLightKeys = <String>[
   'demuxer-cache-time',
 ];
 
-/// verbose 模式：每次采样都整轮刷新 mpv 指标。
+/// verbose 模式下的轻量快照整轮刷新间隔。
 const int _mpvVerboseRefreshMs = 1000;
 
 /// 诊断日志批量落盘：攒够行数或等 500ms 再写，不再每行 flush。
@@ -119,12 +132,9 @@ abstract final class DiagProbe {
     'piliplus/diag_export',
   );
 
-  static Timer? _sampleTimer;
   static Timer? _openTimer;
   static Timer? _writeFlushTimer;
   static bool _openSlowPoll = false;
-  static bool _samplingRequested = false;
-  static int _samplingSuspended = 0;
   static _OpenTracker? _tracker;
   static Future<void> _writeChain = Future<void>.value();
   static Future<Directory>? _documentsDir;
@@ -167,6 +177,12 @@ abstract final class DiagProbe {
   static int _mpvLightRefreshAt = 0;
   static int _mpvLightCursor = 0;
   static final Map<String, Object?> _mpvCache = <String, Object?>{};
+
+  /// 本轮完整读取里确实没拿到值的键 -> 原因。采样直接带上，绝不留静默 null。
+  static final Map<String, String> _mpvMissing = <String, String>{};
+
+  /// 通过别名读到值的键 -> 真正命中的 mpv 属性名。
+  static final Map<String, String> _mpvKeyUsed = <String, String>{};
 
   static Future<Directory> _docDir() =>
       _documentsDir ??= getApplicationDocumentsDirectory();
@@ -296,8 +312,14 @@ abstract final class DiagProbe {
 
   /// 一次读取当前播放器的 mpv 指标、position 与 textureId。
   ///
-  /// rootscan 也直接复用这个快照，保证两处字段完全一致。
-  static Map<String, Object?> snapshot({bool full = false}) {
+  /// rootscan 也直接复用这个快照，保证两处字段完全一致。诊断已改为按需
+  /// 采样，默认就是完整读取：否则 rootscan 拿到的会是一份空缓存。
+  static Map<String, Object?> snapshot({
+    bool full = true,
+    bool refresh = true,
+    bool readMpv = true,
+    String skippedMpvReason = 'not-sampled',
+  }) {
     final out = <String, Object?>{
       'positionMs': null,
       'textureId': null,
@@ -311,6 +333,10 @@ abstract final class DiagProbe {
       for (final key in kMpvDiagKeys) {
         out[key] = null;
       }
+      out['mpvMissing'] = <String, String>{
+        for (final key in kMpvDiagKeys) key: 'no-player',
+      };
+      out['mpvKeysUsed'] = <String, String>{};
       return out;
     }
     try {
@@ -319,51 +345,110 @@ abstract final class DiagProbe {
       out['dataStatus'] = player.dataStatus.value.name;
     } catch (_) {}
 
-    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。常规路径每
-    // 拍只轮转补读一个指标，让 hwdec-current / video-params/w / video-codec
-    // 等键在几秒内落进缓存，采样不再全 null；verbose 模式才整轮刷新。
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (full) {
-      _refreshMpv(player, now);
-    } else if (kDiagVerbose) {
-      if (now - _mpvCacheAt >= _mpvVerboseRefreshMs) {
+    // `getProperty` 是同步 FFI 调用，mpv 核心忙时会阻塞调用线程。按需完整
+    // 采样时整轮读取；调用方显式要轻量快照（full: false）时每拍只轮转补读
+    // 一个指标，避免把主 isolate 一次卡住半秒。
+    if (refresh && readMpv) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (full) {
         _refreshMpv(player, now);
+      } else if (kDiagVerbose) {
+        if (now - _mpvCacheAt >= _mpvVerboseRefreshMs) {
+          _refreshMpv(player, now);
+        }
+      } else if (player.dataStatus.value == DataStatus.loaded &&
+          now - _mpvLightRefreshAt >= _mpvLightRefreshMs) {
+        _mpvLightRefreshAt = now;
+        final key = _mpvLightKeys[_mpvLightCursor % _mpvLightKeys.length];
+        _mpvLightCursor += 1;
+        _readMpvKey(player, key);
       }
-    } else if (player.dataStatus.value == DataStatus.loaded &&
-        now - _mpvLightRefreshAt >= _mpvLightRefreshMs) {
-      _mpvLightRefreshAt = now;
-      final key = _mpvLightKeys[_mpvLightCursor % _mpvLightKeys.length];
-      _mpvLightCursor += 1;
-      _readMpvKey(player, key);
+    }
+    if (!readMpv) {
+      // 明确「这次不读」的采样（如 open-start）：所有键都写原因，绝不静默 null。
+      for (final key in kMpvDiagKeys) {
+        out[key] = null;
+      }
+      out['mpvMissing'] = <String, String>{
+        for (final key in kMpvDiagKeys) key: skippedMpvReason,
+      };
+      out['mpvKeysUsed'] = <String, String>{};
+      return out;
     }
     for (final key in kMpvDiagKeys) {
       out[key] = _mpvCache[key];
     }
+    out['mpvMissing'] = Map<String, String>.of(_mpvMissing);
+    out['mpvKeysUsed'] = Map<String, String>.of(_mpvKeyUsed);
     return out;
   }
 
+  /// 只返回上一次采样留下的缓存，不触发任何 mpv 读取。
+  ///
+  /// 页内面板展示用：正常播放不该因为用户点开一个面板就再多采一轮，
+  /// 采样时机仍限定在开流/首帧/异常/导出。
+  static Map<String, Object?> cachedSnapshot() =>
+      snapshot(full: false, refresh: false);
+
   static void _refreshMpv(PlPlayerController player, int now) {
+    _mpvMissing.clear();
+    _mpvKeyUsed.clear();
     for (final key in kMpvDiagKeys) {
-      _readMpvKey(player, key);
+      _readMpvKey(player, key, strict: true);
     }
     _mpvCacheAt = now;
     _mpvLightRefreshAt = now;
   }
 
-  static void _readMpvKey(PlPlayerController player, String key) {
-    final value = _liveStr(player, key);
-    // 单次读取失败（mpv 正忙）别把已拿到的值抹成 null；切条时
-    // [invalidateSnapshotCache] 会整体清空，不会把上一条的视频串过来。
-    if (value != null) _mpvCache[key] = value;
+  static void _readMpvKey(
+    PlPlayerController player,
+    String key, {
+    bool strict = false,
+  }) {
+    final (value, reason) = _readLiveKey(player, key);
+    if (value != null && value.isNotEmpty) {
+      _mpvCache[key] = value;
+      _mpvMissing.remove(key);
+      return;
+    }
+    // 完整刷新必须丢弃读空/读失败的陈旧值：切到新视频时，上一条的丢帧
+    // 数/解码器绝不能留在缓存里被当成本条上报。轻量轮转（非 strict）仍
+    // 保留旧值，避免 mpv 偶发繁忙把已经拿到的指标抹掉。
+    if (strict || !_mpvCache.containsKey(key)) {
+      _mpvCache.remove(key);
+      _mpvMissing[key] = reason ?? 'unknown';
+    }
   }
 
   /// 切条前后 mpv 状态会整体换掉，缓存必须作废，否则新视频的宽高/解码
   /// 指标要等到下一次完整刷新才更新。
   static void invalidateSnapshotCache() {
     _mpvCache.clear();
+    _mpvMissing.clear();
+    _mpvKeyUsed.clear();
     _mpvCacheAt = 0;
     _mpvLightRefreshAt = 0;
     _mpvLightCursor = 0;
+  }
+
+  /// 一次性采样，写一行 `probe`。正常播放不调用。
+  ///
+  /// 只在开流、首帧、异常判定和用户导出诊断时调用：mpv 的 `getProperty`
+  /// 是同步 FFI，常驻采样在开流/seek 期间会和解码锁抢主 isolate。这里
+  /// 把时机收敛到少量关键点，每次完整读取全部指标。
+  static Map<String, Object?> probeOnce(
+    String reason, {
+    Map<String, Object?> extra = const {},
+    bool readMpv = true,
+  }) {
+    final out = snapshot(
+      full: true,
+      readMpv: readMpv,
+      skippedMpvReason: 'not-sampled-at-$reason',
+    );
+    if (!kDiagEnabled) return out;
+    _append('probe', <String, Object?>{'reason': reason, ...extra, ...out});
+    return out;
   }
 
   /// App 版本 / 构建号 / 系统 / 机型。
@@ -393,54 +478,11 @@ abstract final class DiagProbe {
     return out;
   }
 
-  /// 播放期间每 2 秒一行 JSONL。诊断包常开，普通包直接 return。
-  ///
-  /// 常规模式每行只读 position/texture/status，mpv 指标走低频缓存；
-  /// 切条/seek 期间由调用方 suspend，避免和 mpv 锁竞争。
-  static void startSampling() {
-    if (!kDiagEnabled) return;
-    _samplingRequested = true;
-    _restartSampleTimer();
-  }
-
-  static void _restartSampleTimer() {
-    _sampleTimer?.cancel();
-    _sampleTimer = null;
-    if (!_samplingRequested || _samplingSuspended > 0) return;
-    _sampleTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      final sw = Stopwatch()..start();
-      _append('playback', snapshot());
-      _eventIfSlow('snapshot', sw);
-    });
-  }
-
-  static void stopSampling() {
-    if (!kDiagEnabled) return;
-    _samplingRequested = false;
-    _samplingSuspended = 0;
-    _sampleTimer?.cancel();
-    _sampleTimer = null;
-  }
-
-  /// 切条 / seek 期间暂停采样，避免同步读 mpv 属性撞上解码锁。
-  static void suspendSampling() {
-    if (!kDiagEnabled) return;
-    _samplingSuspended += 1;
-    _sampleTimer?.cancel();
-    _sampleTimer = null;
-  }
-
-  static void resumeSampling() {
-    if (!kDiagEnabled) return;
-    if (_samplingSuspended > 0) _samplingSuspended -= 1;
-    if (_samplingSuspended == 0) _restartSampleTimer();
-  }
-
   /// 写一条 `diag_event`，用于记录 Dart 主 isolate 的卡顿等一次性事件。
   static void event(String event, [Map<String, Object?> fields = const {}]) {
     if (!kDiagEnabled) return;
-    // ticker-gap 由 500ms 定时器逐拍上报；这里统一按 3 倍间隔过滤，
-    // 只在真正停顿时留证，避免单类事件刷出几万条。
+    // ticker-gap 只由 PiP ticker（500ms，仅 armed/active 时运行）逐拍
+    // 上报；这里统一按 3 倍间隔过滤，只在真正停顿时留证，避免刷出几万条。
     if (event == 'ticker-gap') {
       final gapMs = _asInt(fields['gapMs']);
       if (gapMs == null || gapMs <= _tickerGapThresholdMs) return;
@@ -492,9 +534,19 @@ abstract final class DiagProbe {
     _stopOpenProbe();
     invalidateSnapshotCache();
     final startedAt = DateTime.now().millisecondsSinceEpoch;
-    // 常规模式不再为一次 open 同步读全部 mpv 指标；drop-frame-count 会在
-    // 缓存作废后由 snapshot() 补读一次，足够作为丢帧基线。
-    final snap = snapshot();
+    // 开流瞬间只记 position/texture/status：此刻 player 可能还绑在上一
+    // 条媒体上，读 mpv 会把旧视频的丢帧/解码指标回填进新缓存。丢帧基线
+    // 改为首帧完整采样时再取。
+    final snap = probeOnce(
+      'open-start',
+      readMpv: false,
+      extra: <String, Object?>{
+        'index': index,
+        'key': key,
+        'oldTextureId': oldTextureId,
+        'source': source,
+      },
+    );
     final seq = ++_openSeq;
     if (oldTextureId != null) _sessionTextureIds.add(oldTextureId);
     _sessionOpenBySource[source] = (_sessionOpenBySource[source] ?? 0) + 1;
@@ -506,7 +558,7 @@ abstract final class DiagProbe {
       startedAt: startedAt,
       oldTextureId: oldTextureId,
       startPositionMs: _asInt(snap['positionMs']),
-      dropBaseline: _asInt(snap['drop-frame-count']),
+      dropBaseline: null,
     );
     _tracker = tracker;
     _append('open-start', <String, Object?>{
@@ -536,8 +588,13 @@ abstract final class DiagProbe {
     final sw = Stopwatch()..start();
     tracker.ended = true;
     invalidateSnapshotCache();
-    // 缓存刚被作废，默认快照会自己刷新一次；不再强制 full，避免多读一轮。
-    final snap = snapshot();
+    // open 收尾（含失败）采样一次，完整读取本轮 mpv 指标。
+    final snap = probeOnce('open-end', extra: <String, Object?>{
+      'seq': tracker.seq,
+      'source': tracker.source,
+      'index': tracker.index,
+      'error': error,
+    });
     final now = DateTime.now().millisecondsSinceEpoch;
     final newTextureId = _asInt(tracker.newTextureId ?? snap['textureId']);
     if (newTextureId != null) _sessionTextureIds.add(newTextureId);
@@ -619,7 +676,6 @@ abstract final class DiagProbe {
   /// 页面退出时统一收尾。
   static void stop() {
     if (!kDiagEnabled) return;
-    stopSampling();
     _stopOpenProbe();
     _appendSessionSummary();
     PlPlayerController.textureObserver = null;
@@ -661,6 +717,8 @@ abstract final class DiagProbe {
   /// 缺失的文件直接跳过；没有任何文件或打包失败返回 null，不弹异常。
   static Future<String?> exportAndShare() async {
     if (!kDiagEnabled) return null;
+    // 用户主动导出诊断时补采一次，保证包里有一份当前播放状态的完整读数。
+    probeOnce('export');
     // 先把缓冲里的最后几行落盘，否则刚写的事件会漏出诊断包。
     await flush();
     File? zipFile;
@@ -775,22 +833,19 @@ abstract final class DiagProbe {
           tracker.oldTextureId == null || textureChanged || positionReset;
       if (tracker.firstFrameAt == null && position > 0 && newVideoWindow) {
         tracker.firstFrameAt = now;
-        // 丢帧基线改在首帧时采，避免拿上一条的累计丢帧数算增量。
-        tracker.dropBaseline = _liveNum(player, 'drop-frame-count')?.toInt();
-        // 首帧这一刻解码器已初始化、mpv 不忙，顺手读三个关键指标并回填缓存，
-        // 后面的 playback 采样就能直接读到，不用再同步 FFI。
-        final firstWidth = _liveNum(player, 'video-params/w');
-        final firstCodec = _liveStr(player, 'video-codec');
-        final firstHwdec = _liveStr(player, 'hwdec-current');
-        // 缓存里统一存 String：轮转补读走的是 mpv 的字符串属性，两处类型
-        // 不一致会让下游解析（_asNum）之外的读取路径踩类型坑。
-        if (firstWidth != null) {
-          _mpvCache['video-params/w'] = firstWidth.toString();
-        }
-        if (firstCodec != null) _mpvCache['video-codec'] = firstCodec;
-        if (firstHwdec != null) _mpvCache['hwdec-current'] = firstHwdec;
-        // 首帧这一刻已经同步读了几个键，轮转补读往后挪一拍，别在起播瞬间叠加。
-        _mpvLightRefreshAt = now;
+        // 首帧这一刻解码器已初始化、mpv 不忙：完整采样一次，拿到实际
+        // 分辨率/像素格式/解码器/丢帧等全部指标。丢帧基线也在这一刻重取，
+        // 避免拿上一条的累计丢帧数算增量。
+        final snap = probeOnce('first-frame', extra: <String, Object?>{
+          'seq': tracker.seq,
+          'source': tracker.source,
+          'index': tracker.index,
+          'textureId': textureId,
+        });
+        final firstWidth = _asNum(snap['video-params/w']);
+        final firstCodec = snap['video-codec'] as String?;
+        final firstHwdec = snap['hwdec-current'] as String?;
+        tracker.dropBaseline = _asInt(snap['drop-frame-count']);
         _append('open-first-frame', <String, Object?>{
           'index': tracker.index,
           'textureId': textureId,
@@ -835,6 +890,12 @@ abstract final class DiagProbe {
           // 正在播却读不到画面参数，才是真正的「有声音没画面」。
           tracker.firstFrameMissLogged = true;
           _markBlack(tracker);
+          final snap = probeOnce('first-frame-miss', extra: <String, Object?>{
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+            'key': tracker.key,
+          });
           _append('first-frame-miss', <String, Object?>{
             'seq': tracker.seq,
             'source': tracker.source,
@@ -843,13 +904,14 @@ abstract final class DiagProbe {
             'afterOpenMs': elapsed,
             'positionMs': position,
             'videoParamsW': liveWidth,
-            'videoCodec': _liveStr(player, 'video-codec'),
-            'hwdec': _liveStr(player, 'hwdec-current'),
+            'videoCodec': snap['video-codec'],
+            'hwdec': snap['hwdec-current'],
             'dataStatus': status.name,
             'textureId': textureId,
             'playing': playing,
             'buffering': player.isBuffering.value,
             'audioReady': _audioReady(player),
+            'mpvMissing': snap['mpvMissing'],
           });
         } else if (!tracker.pendingLogged) {
           // 暂停 / 未起播时读不到画面参数不能当黑屏，只留一条待定证据。
@@ -872,6 +934,12 @@ abstract final class DiagProbe {
       // 误记成「5 秒没结束」。
       if (!tracker.ended && !tracker.stuckLogged && elapsed >= _openStuckMs) {
         tracker.stuckLogged = true;
+        probeOnce('open-stuck', extra: <String, Object?>{
+          'seq': tracker.seq,
+          'source': tracker.source,
+          'index': tracker.index,
+          'phase': tracker.phase,
+        });
         _append('open-stuck', <String, Object?>{
           'seq': tracker.seq,
           'source': tracker.source,
@@ -894,6 +962,11 @@ abstract final class DiagProbe {
       }
       if (elapsed >= _openProbeTimeoutMs) {
         if (tracker.firstFrameAt == null) {
+          probeOnce('open-no-first-frame', extra: <String, Object?>{
+            'seq': tracker.seq,
+            'source': tracker.source,
+            'index': tracker.index,
+          });
           _append('diag_event', <String, Object?>{
             'event': 'open-no-first-frame',
             'seq': tracker.seq,
@@ -933,8 +1006,14 @@ abstract final class DiagProbe {
       reason = 'drop-frame-count-jump';
     }
     if (reason == null) return;
-    // 真的要留证时才完整刷新一次，保证日志里的宽高/解码字段不是陈旧值。
-    final snap = snapshot(full: true);
+    // 真的要留证时才完整采样一次，保证日志里的宽高/解码字段不是陈旧值。
+    final snap = probeOnce('blackscreen-suspect', extra: <String, Object?>{
+      'reason': reason,
+      'index': tracker.index,
+      'key': tracker.key,
+      'elapsedMs': elapsed,
+      'positionMs': position,
+    });
     _markBlack(tracker);
     _append('diag_event', <String, Object?>{
       'event': 'blackscreen-suspect',
@@ -992,21 +1071,6 @@ abstract final class DiagProbe {
       Duration(milliseconds: ms),
       (_) => _pollOpen(),
     );
-  }
-
-  static void _eventIfSlow(
-    String step,
-    Stopwatch sw, [
-    Map<String, Object?> extra = const {},
-  ]) {
-    final ms = sw.elapsedMilliseconds;
-    if (ms < _uiBlockMs) return;
-    event('ui-block', <String, Object?>{
-      'stage': 'diag',
-      'step': step,
-      'ms': ms,
-      ...extra,
-    });
   }
 
   static void _passiveUiBlock(String step, Stopwatch sw) {
@@ -1131,13 +1195,43 @@ abstract final class DiagProbe {
   static int? _asInt(Object? value) => _asNum(value)?.toInt();
 
   /// 实时读取单个 mpv 属性，绕过 [_mpvCache]。
-  static String? _liveStr(PlPlayerController player, String key) {
+  ///
+  /// 返回 `(值, 失败原因)`。mpv 对不存在的属性返回空串而不是抛错，所以
+  /// 「空串」也要记成原因；[key] 有别名时依次尝试，真正命中的属性名会
+  /// 记进 [_mpvKeyUsed]。
+  static (String?, String?) _readLiveKey(
+    PlPlayerController? player,
+    String key,
+  ) {
+    if (player == null) return (null, 'no-player');
     try {
-      final raw = player.videoPlayerController?.getProperty(key);
-      if (raw != null && raw.isNotEmpty) return raw;
-    } catch (_) {}
-    return null;
+      final controller = player.videoPlayerController;
+      if (controller == null) return (null, 'no-player-controller');
+      final alias = _mpvAliases[key];
+      final candidates = alias == null
+          ? <String>[key]
+          : <String>[key, alias];
+      final reasons = <String>[];
+      for (final candidate in candidates) {
+        try {
+          final raw = controller.getProperty(candidate);
+          if (raw.isNotEmpty) {
+            _mpvKeyUsed[key] = candidate;
+            return (raw, null);
+          }
+          reasons.add('$candidate: empty');
+        } catch (error) {
+          reasons.add('$candidate: $error');
+        }
+      }
+      return (null, reasons.isEmpty ? 'empty-value' : reasons.join('; '));
+    } catch (error) {
+      return (null, 'controller-error: $error');
+    }
   }
+
+  static String? _liveStr(PlPlayerController player, String key) =>
+      _readLiveKey(player, key).$1;
 
   /// 实时读取单个数值型 mpv 属性，绕过 [_mpvCache]。
   static num? _liveNum(PlPlayerController player, String key) {
