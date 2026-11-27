@@ -194,6 +194,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 画面顺时针旋转的 90° 次数（0..3）。只旋转渲染层，不改原生屏幕方向。
   int _quarterTurns = 0;
 
+  /// 画质/解码面板打开时一次性读到的当前流信息。
+  ///
+  /// 不在 build 里同步读 mpv：那是 FFI 调用，每帧读会把主 isolate 拖住。
+  /// 只在用户点开对应面板时读一次，读不到就显示「未读到」。
+  String? _qualityWidth;
+  String? _qualityHeight;
+  String _decodeCurrent = '';
+
+  /// 当前已起播的媒体地址，供投屏使用；切条开始/失败时清空。
+  String? _currentMediaUrl;
+  String _currentMediaTitle = '';
+
   /// 画面填充：true = 裁剪铺满（BoxFit.cover），false = 适应（BoxFit.contain）。
   ///
   /// 用户反馈竖屏短视频上下黑边太大。默认开启裁剪铺满，让短边贴合屏幕
@@ -378,14 +390,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _restoreVideoFit();
     _attachPlayerListeners();
     _pushProgress(force: true);
-    // 诊断包常开：每秒把 mpv 指标写进 Documents/diag_playback.log。
+    // 诊断包常开：会话摘要仍写进 Documents/diag_playback.log，但正常
+    // 播放不再常驻采样，只在开流/首帧/异常/导出时各采一次。
     // 普通包头一行就会 return，不产生文件。
     DiagProbe.startSession();
     // 必须在 startSession 之后：会话起点会先把单例带进来的旧纹理按 carry
     // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
     _player.textureSource = 'douyin';
-    DiagProbe.startSampling();
-    _startPipTicker();
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
     _scheduleChromeHide();
     unawaited(_primeBrightness());
@@ -700,9 +711,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         source: source,
       );
       beganOpen = true;
-      // 切条期间 mpv 正持有解码锁，后台采样再去同步读属性只会把主
-      // isolate 一起堵住；采样在 open 收尾后恢复。
-      DiagProbe.suspendSampling();
       DiagProbe.openPhase('resolve');
       setState(() {
         _index = target;
@@ -861,6 +869,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       } else {
         _player.overrideMediaHeader();
       }
+      // 切源开始后旧地址就失效了：在起播成功前，投屏入口不能还指向
+      // 上一条。等 play() 成功后再写回本条地址。
+      _currentMediaUrl = null;
       DiagProbe.openPhase('set-datasource');
       final sourceSw = Stopwatch()..start();
       await _player.setDataSource(
@@ -925,6 +936,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (!mounted || _disposed || _leaving || session != _openSession) {
         return;
       }
+      // 听音频是页面级开关，切到下一条后新的 file-local-options 会重置；
+      // 保持用户的选择，不让画面偷偷恢复。
+      if (_player.onlyPlayAudio.value) {
+        try {
+          _player.videoPlayerController?.setProperty(
+            'file-local-options/vid',
+            'no',
+          );
+        } catch (_) {}
+      }
       _publishPipState();
       _armPipAutoEnter('open');
       _completionArmed = true;
@@ -944,14 +965,22 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _prefetchNext();
       // videoController 是本次 setDataSource 才建出来的，必须重建一次把
       // 加载圈换成画面。这是一次切换一次，不是按帧刷新。
-      if (mounted) setState(() {});
+      //
+      // 顺手记下本条的网络地址给投屏用；本地缓存是磁盘路径，不能投递，
+      // 保持为空，投屏按钮会明确提示而不是把本地路径当直链发出去。
+      if (mounted) {
+        setState(() {
+          _currentMediaUrl = media.isLocal ? null : media.url;
+          _currentMediaTitle = entry.title;
+        });
+      }
     } catch (error) {
       openError = '$error';
+      _currentMediaUrl = null;
       if (mounted) setState(() => _error = '播放失败：$error');
     } finally {
       if (beganOpen) {
         DiagProbe.endOpen(error: openError);
-        DiagProbe.resumeSampling();
       }
       // 只有仍然持有 `_opening` 的会话才有资格收尾。被新请求作废的旧
       // open 可能刚醒过来，不能把新 open 的标志清掉、也不能替它消费
@@ -1853,10 +1882,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 手动按钮立即启动画中画并退后台，和 B 站播放页一致；autoEnter 只 arm
     // 不 start，用户点了按钮却留在前台会看起来什么都没发生。
     _player.enterPip(autoEnter: false);
+    _syncPipTicker();
+    // 原生 isActive 是异步回来的：暂停时手动进小窗没有 armed 兜底，这里
+    // 追几拍补同步，等状态真正变成 active 再把 ticker 起来。只在一次手动
+    // 请求后跑有限几拍，不是常驻定时器。
+    unawaited(_syncPipTickerAfterEnter());
     // 必须先 enter 再 update：PipSession 还不存在时 update 会被原生直接丢掉。
     unawaited(_pushPipLiteMode());
     // 显式带上 position：进入 PiP 必须强制下发一次，不能命中「状态未变」跳过。
     _publishPipState(_player.positionInMilliseconds);
+  }
+
+  Future<void> _syncPipTickerAfterEnter() async {
+    // 原生小窗激活偶尔超过 1.6s，补够 3.2s；一旦 active 立即结束，仍然是
+    // 有界的一次性追踪，不是常驻定时器。
+    for (var i = 0; i < 8; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (_disposed || _leaving) return;
+      _syncPipTicker();
+      if (IOSPipHelper.isActive) return;
+    }
   }
 
   /// 播放中武装自动画中画：原生置
@@ -1869,6 +1914,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipAutoArmed = true;
     _pipStartRequested = false;
     _player.enterPip(autoEnter: true);
+    _syncPipTicker();
     // arm 后原生要先拿到当前状态；显式 position 绕过状态签名去重。
     _publishPipState(_player.positionInMilliseconds);
     DiagProbe.event('pip-auto-arm', <String, Object?>{
@@ -1883,10 +1929,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 暂停、切条、离开页面时收起 arm，避免残留后在后台误弹小窗。
   void _disarmPipAutoEnter(String reason) {
-    if (!_pipAutoArmed) return;
+    if (!_pipAutoArmed) {
+      _syncPipTicker();
+      return;
+    }
     _pipAutoArmed = false;
     _pipStartRequested = false;
     IOSPipHelper.disableAutoEnter();
+    _syncPipTicker();
     DiagProbe.event('pip-auto-arm', <String, Object?>{
       'armed': false,
       'reason': reason,
@@ -1899,6 +1949,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _onPipAutoEnter() {
     if (_disposed) return;
     _pipStartRequested = false;
+    _syncPipTicker();
     DiagProbe.event('pip-auto-enter', <String, Object?>{
       'textureId': _player.videoController?.id.value,
       'isPlaying': _player.playerStatus.isPlaying,
@@ -1951,8 +2002,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// PiP 活跃时每 500ms 推一次 position，原生 timebase 才会前进；只在进入
   /// 画中画时推一次的话，老机型依旧会卡帧。非活跃时 [_publishPipState]
   /// 只在状态变化时真正下发，不再每 500ms 走一次 method channel。
+  bool get _pipShouldTick => _pipAutoArmed || IOSPipHelper.isActive;
+
+  /// 只在 PiP armed / active 时跑 ticker，正常前台播放不产生 500ms 定时器。
+  void _syncPipTicker() {
+    if (_pipShouldTick) {
+      _startPipTicker();
+    } else {
+      _stopPipTicker();
+    }
+  }
+
   void _startPipTicker() {
     _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+      // 原生小窗可能在页面不知情时结束：发现不再需要就自行停掉。
+      if (!_pipShouldTick) {
+        _stopPipTicker();
+        return;
+      }
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       if (_lastPipTickMs != 0) {
         final gapMs = nowMs - _lastPipTickMs;
@@ -2036,13 +2103,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   Future<void> _bgRemoteSeek(Duration position) async {
     if (!_canDriveBackground()) return;
-    DiagProbe.suspendSampling();
     try {
       await _player.seekTo(position);
     } catch (_) {
       // 切条/退出时播放器可能已被释放，seek 失败不影响后续状态刷新。
-    } finally {
-      DiagProbe.resumeSampling();
     }
     if (!_canDriveBackground()) return;
     _pushProgress(force: true);
@@ -2341,17 +2405,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         backgroundColor: Colors.black,
         body: Stack(
           children: [
-            // 视频只占中间那块。上下各留出一条，放控件，控件区和视频
-            // 手势区在几何上不重叠，手指落在按钮上永远不会被视频层截走。
-            //
-            // 沉浸式（_chromeVisible 为 false）时上下两条都归零，视频铺满
-            // 整个屏幕，和 B 站点一下画面进入沉浸式是同一个效果。
-            Positioned.fill(
-              child: Padding(
-                padding: EdgeInsets.only(top: topInset, bottom: bottomInset),
-                child: _video(),
-              ),
-            ),
+            // 视频永远铺满整屏，控件以半透明渐变叠在画面上。之前把视频
+            // 上下各缩进一条栏高，竖屏短视频会在顶部/底部留下整块黑边，
+            // 用户反复反馈的「上下多余空白」就是这一条。控件层仍是独立的
+            // Positioned，命中测试按 Stack 逆序先到控件，不会互相截事件。
+            Positioned.fill(child: _video()),
             // 亮度/音量/进度提示。IgnorePointer 保证它只负责显示，
             // 命中测试继续落到下面的视频手势层。
             _gestureOverlay(),
@@ -2438,22 +2496,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 控件条底色。
+  /// 控件层背景：顶部/底部向画面中间渐隐的黑色遮罩。
   ///
-  /// 控件条和视频区在几何上分开，这里只是一层静态纯黑底，再加一条 0.5pt
-  /// 细线把控制区和画面分开。不用渐变 / 模糊：6S 上这两条每次重绘都要
-  /// 跑一遍着色器，静态纯色没有额外开销。
+  /// 视频铺满全屏后，控件直接叠在画面上，纯黑底会重新切出一条「黑边」；
+  /// 这里用单层线性渐变保证白字可读，同时让画面自然过渡到控件。不用模糊，
+  /// 6S 上模糊每次重绘都要跑着色器。
   Widget _chromeBackdrop({required Widget child, bool bottom = false}) {
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: Colors.black,
-        border: Border(
-          top: bottom
-              ? const BorderSide(color: Color(0x1FFFFFFF), width: 0.5)
-              : BorderSide.none,
-          bottom: bottom
-              ? BorderSide.none
-              : const BorderSide(color: Color(0x1FFFFFFF), width: 0.5),
+        gradient: LinearGradient(
+          begin: bottom ? Alignment.bottomCenter : Alignment.topCenter,
+          end: bottom ? Alignment.topCenter : Alignment.bottomCenter,
+          colors: const <Color>[
+            Color(0xCC000000),
+            Color(0x66000000),
+            Color(0x00000000),
+          ],
+          stops: const <double>[0.0, 0.55, 1.0],
         ),
       ),
       child: child,
@@ -2461,13 +2520,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 顶部控件条高度（不含状态栏）：一行 36pt 按钮 + 上下各 2pt 内边距。
-  /// 视频区域按这个留白，保证控件不被视频手势层覆盖。
+  /// 视频层已铺满，这个高度只用于定位顶栏，不再给视频留黑边。
   static const double _topBarHeight = 44;
 
-  /// 底部控件条高度（不含底部安全区）：13pt 进度行 + 2pt 间隔 + 34pt
-  /// 按钮 + 上下各 2pt 内边距，合计约 53pt；留到 56pt 兼容不同字体的行高。
+  /// 底部控件条高度（不含底部安全区）：进度行 + 间隔 + 34pt 操作行 +
+  /// 上下内边距，合计约 60pt；留到 64pt 兼容不同字体的行高。
   /// 15PM 的底部安全区会再吃掉 34pt，由上面的 Positioned 高度单独叠加。
-  static const double _bottomBarHeight = 56;
+  static const double _bottomBarHeight = 64;
 
   /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
@@ -2583,9 +2642,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final durationMs = _player.durationInMilliseconds;
     _seekDragging = durationMs > 0;
     if (!_seekDragging) return;
-    // 拖动本身不 seek，但松手后马上会 seek；从拖动开始就暂停后台采样，
-    // 避免采样在 seek 的锁竞争窗口里同步读 mpv 属性。
-    DiagProbe.suspendSampling();
     var start = _player.positionInMilliseconds;
     if (start <= 0) start = _player.position.value * 1000;
     _seekStartMs = start.clamp(0, durationMs).toInt();
@@ -2618,7 +2674,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     unawaited(
       _player
           .seekTo(Duration(milliseconds: _seekTargetMs))
-          .whenComplete(DiagProbe.resumeSampling),
     );
     _pushProgress(force: true);
     _publishPipState(_seekTargetMs);
@@ -2631,7 +2686,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _onHorizontalDragCancel() {
     if (!_seekDragging) return;
     _seekDragging = false;
-    DiagProbe.resumeSampling();
     _hideHintSoon();
   }
 
@@ -2718,22 +2772,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 视频宽高比只有首帧渲染后才拿得到（VideoController.rect 由渲染循环
     // 回填），用 ValueListenableBuilder 跟着 rect 更新一次，避免首帧前
     // 按「未知比例」定死填充方式。
-    final video = RepaintBoundary(
-      child: ValueListenableBuilder<Rect?>(
-        valueListenable: controller.rect,
-        builder: (context, rect, _) {
-          return ClipRect(
-            child: FittedBox(
-              fit: _videoFitFor(rect),
-              alignment: Alignment.center,
-              child: SimpleVideo(
-                controller: controller,
-                fill: Colors.black,
-                aspectRatio: null,
-              ),
-            ),
-          );
-        },
+    final video = Obx(
+      () => Transform.flip(
+        flipX: _player.flipX.value,
+        flipY: _player.flipY.value,
+        child: RepaintBoundary(
+          child: ValueListenableBuilder<Rect?>(
+            valueListenable: controller.rect,
+            builder: (context, rect, _) {
+              return ClipRect(
+                child: FittedBox(
+                  fit: _videoFitFor(rect),
+                  alignment: Alignment.center,
+                  child: SimpleVideo(
+                    controller: controller,
+                    fill: Colors.black,
+                    aspectRatio: null,
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
       ),
     );
     return GestureDetector(
@@ -2777,9 +2837,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           //
           // 没旋转时不要再套 RotatedBox：它会给子树多一层 render object，
           // 每帧都要参与变换。轻量模式下这层完全省掉，需要旋转时才加回来。
-          child: _pipLite && _quarterTurns == 0
-              ? video
-              : RotatedBox(quarterTurns: _quarterTurns, child: video),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (_pipLite && _quarterTurns == 0)
+                video
+              else
+                RotatedBox(quarterTurns: _quarterTurns, child: video),
+              Obx(
+                () => _player.onlyPlayAudio.value
+                    ? const IgnorePointer(child: _AudioOnlyBadge())
+                    : const SizedBox.shrink(),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -2977,13 +3048,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 height: buttonSize,
               ),
               ComBtn(
-                icon: Icon(_playModeIcon, color: _playModeColor, size: 22),
-                onTap: _openPlayModePanel,
-                tooltip: _playModeLabel,
-                width: buttonSize,
-                height: buttonSize,
-              ),
-              ComBtn(
                 icon: const Icon(
                   Icons.picture_in_picture_alt,
                   color: Colors.white,
@@ -3020,8 +3084,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 布局分两行：
     // * 进度行：当前时间 + 进度条（带拖动圆点）+ 总时长，三者同一行
     //   基线对齐，时间不会和进度条错位；
-    // * 操作行：左侧「上一条 / 暂停 / 下一条」播放组，右侧「评论 / 画中画 /
-    //   旋转 / 更多」工具组，中间留白把两组分开。
+    // * 操作行：左侧「上一条 / 暂停 / 下一条」播放组，右侧横向滚动的
+    //   动作组（评论、画质、音质、解码、循环、字幕、旋转翻转、投屏、听音频）。
     return _controls(
       Column(
         mainAxisAlignment: MainAxisAlignment.end,
@@ -3055,12 +3119,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                       onDragStart: (_) {},
                       onSeek: (milliseconds) {
                         _player.position.value = milliseconds ~/ 1000;
-                        // seek 会短暂抢 mpv 解码锁，采样先让开，完成后再恢复。
-                        DiagProbe.suspendSampling();
                         unawaited(
-                          _player
-                              .seekTo(Duration(milliseconds: milliseconds))
-                              .whenComplete(DiagProbe.resumeSampling),
+                          _player.seekTo(Duration(milliseconds: milliseconds)),
                         );
                         _pushProgress(force: true);
                         _publishPipState(milliseconds);
@@ -3113,61 +3173,70 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 width: _bottomButtonSize,
                 height: _bottomButtonSize,
               ),
-              // 工具组在窄屏（6S/SE）上整体等比缩小，不换行、不溢出。
+              const SizedBox(width: 4),
+              // 动作组和 B 站播放页对齐：弹幕/评论、画质、音质、解码、
+              // 循环、字幕、旋转翻转、投屏、听音频。窄屏（6S/SE）上横向
+              // 滚动，不做等比缩小——缩小后 34pt 命中区会掉到手指点不准。
               Expanded(
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        ComBtn(
-                          icon: const Icon(
-                            Icons.chat_bubble_outline,
-                            color: Colors.white,
-                            size: 20,
-                          ),
-                          onTap: () => _openPanel(_PlayerPanel.comments),
-                          tooltip: '评论',
-                          width: _bottomButtonSize,
-                          height: _bottomButtonSize,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _barAction(
+                        icon: Icons.chat_bubble_outline,
+                        tooltip: '弹幕 / 评论',
+                        onTap: () => _openPanel(_PlayerPanel.comments),
+                      ),
+                      _barAction(
+                        icon: Icons.high_quality_outlined,
+                        tooltip: '画质',
+                        onTap: () => _openPanel(_PlayerPanel.quality),
+                      ),
+                      _barAction(
+                        icon: Icons.album_outlined,
+                        tooltip: '音质',
+                        onTap: () => _openPanel(_PlayerPanel.audioQuality),
+                      ),
+                      _barAction(
+                        icon: Icons.memory_outlined,
+                        tooltip: '解码',
+                        onTap: () => _openPanel(_PlayerPanel.decode),
+                      ),
+                      _barAction(
+                        icon: _playModeIcon,
+                        color: _playModeColor,
+                        tooltip: '循环 / $_playModeLabel',
+                        onTap: _openPlayModePanel,
+                      ),
+                      _barAction(
+                        icon: Icons.closed_caption_off_outlined,
+                        tooltip: '字幕',
+                        onTap: () => _openPanel(_PlayerPanel.subtitle),
+                      ),
+                      _barAction(
+                        icon: Icons.screen_rotation_alt,
+                        tooltip: '旋转翻转',
+                        onTap: () => _openPanel(_PlayerPanel.rotateFlip),
+                      ),
+                      _barAction(
+                        icon: Icons.cast,
+                        tooltip: '投屏',
+                        onTap: _castToDevice,
+                      ),
+                      Obx(
+                        () => _barAction(
+                          icon: _player.onlyPlayAudio.value
+                              ? Icons.headphones
+                              : Icons.headphones_outlined,
+                          color: _player.onlyPlayAudio.value
+                              ? Colors.lightBlueAccent
+                              : Colors.white,
+                          tooltip: '听音频',
+                          onTap: _toggleOnlyAudio,
                         ),
-                        ComBtn(
-                          icon: const Icon(
-                            Icons.picture_in_picture_alt,
-                            color: Colors.white,
-                            size: 20,
-                          ),
-                          onTap: () => unawaited(_enterPip()),
-                          tooltip: '画中画',
-                          width: _bottomButtonSize,
-                          height: _bottomButtonSize,
-                        ),
-                        ComBtn(
-                          icon: const Icon(
-                            Icons.screen_rotation_alt,
-                            color: Colors.white,
-                            size: 20,
-                          ),
-                          onTap: _rotateVideo,
-                          tooltip: '画面旋转',
-                          width: _bottomButtonSize,
-                          height: _bottomButtonSize,
-                        ),
-                        ComBtn(
-                          icon: const Icon(
-                            Icons.more_vert_outlined,
-                            color: Colors.white,
-                            size: 20,
-                          ),
-                          onTap: () => _openPanel(_PlayerPanel.more),
-                          tooltip: '更多设置',
-                          width: _bottomButtonSize,
-                          height: _bottomButtonSize,
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -3180,6 +3249,55 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 底部按钮统一命中区，图标大小在按钮内单独控制。
   static const double _bottomButtonSize = 34;
+
+  Widget _barAction({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+    Color color = Colors.white,
+  }) {
+    return ComBtn(
+      icon: Icon(icon, color: color, size: 21),
+      onTap: onTap,
+      tooltip: tooltip,
+      width: _bottomButtonSize,
+      height: _bottomButtonSize,
+    );
+  }
+
+  /// 投屏：把当前已经起播的直链交给 DLNA 页。没有地址时明确提示，
+  /// 不做「按了没反应」。
+  void _castToDevice() {
+    final url = _currentMediaUrl;
+    if (url == null || url.isEmpty) {
+      SmartDialog.showToast('当前视频还没有可投屏的播放地址');
+      return;
+    }
+    Get.toNamed(
+      '/dlna',
+      parameters: <String, String>{
+        'url': url,
+        'title': _currentMediaTitle,
+      },
+    );
+  }
+
+  /// 听音频：只关视频轨，音频继续。该来源是单条 mp4，没有独立音轨档位，
+  /// 所以切回来时只恢复视频轨，不做音轨切换。
+  void _toggleOnlyAudio() {
+    final next = !_player.onlyPlayAudio.value;
+    _player.onlyPlayAudio.value = next;
+    try {
+      _player.videoPlayerController?.setProperty(
+        'file-local-options/vid',
+        next ? 'no' : 'auto',
+      );
+    } catch (_) {}
+    setState(() {});
+    SmartDialog.showToast(
+      next ? '听音频模式（该来源无独立音轨）' : '已恢复画面',
+    );
+  }
 
   /// 进度条两端的时间文字。等宽数字，避免播放时整行左右抖动。
   Widget _timeText(int seconds, Color color) {
@@ -3195,6 +3313,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   void _rotateVideo() {
     setState(() => _quarterTurns = (_quarterTurns + 1) % 4);
+  }
+
+  /// mpv 采样值统一转文本：null / 空串都当「没读到」，面板显示占位而不是
+  /// 空白，避免用户以为信息丢了。
+  String? _mpvText(Object? value) {
+    if (value == null) return null;
+    final text = '$value';
+    return text.isEmpty || text == 'null' ? null : text;
   }
 
   /// 点击画面：切换沉浸式。
@@ -3268,8 +3394,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 打开页内面板。评论 / 画质 / 更多共用这一层。
+  ///
+  /// 画质和解码面板显示最近一次采样（开流/首帧/异常/导出）留下的缓存，
+  /// 不因为点开面板再多读一轮 mpv。读不到就原样显示「未读到」。
   void _openPanel(_PlayerPanel panel) {
     _chromeTimer?.cancel();
+    if (panel == _PlayerPanel.quality) {
+      final snap = DiagProbe.cachedSnapshot();
+      _qualityWidth = _mpvText(snap['video-params/w']);
+      _qualityHeight = _mpvText(snap['video-params/h']);
+    } else if (panel == _PlayerPanel.decode) {
+      final snap = DiagProbe.cachedSnapshot();
+      _decodeCurrent = _mpvText(snap['hwdec-current']) ?? '';
+    }
     setState(() => _panel = panel);
     if (panel == _PlayerPanel.comments) unawaited(_ensureComments());
   }
@@ -3351,6 +3488,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _PlayerPanel.comments => _commentsPanelBody(),
       _PlayerPanel.more => _morePanelBody(),
       _PlayerPanel.quality => _qualityPanelBody(),
+      _PlayerPanel.audioQuality => _audioQualityPanelBody(),
+      _PlayerPanel.decode => _decodePanelBody(),
+      _PlayerPanel.subtitle => _subtitlePanelBody(),
+      _PlayerPanel.rotateFlip => _rotateFlipPanelBody(),
       _PlayerPanel.title => _titlePanelBody(),
       _PlayerPanel.playMode => _playModePanelBody(),
     };
@@ -3813,8 +3954,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 画质：接口没有档位，只显示当前实际使用的「默认」，点开说明原因。
+  /// 画质：接口没有档位，只显示打开面板时读到的实际分辨率。
+  ///
+  /// 不伪造「默认/高清/超清」这类档位：收藏接口只返回一条播放地址，
+  /// 点这些假档位不会改变任何东西，正是用户反馈里最像「假按钮」的东西。
   Widget _qualityPanelBody() {
+    final resolution = _qualityWidth != null && _qualityHeight != null
+        ? '$_qualityWidth × $_qualityHeight'
+        : null;
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
       child: Column(
@@ -3829,17 +3976,170 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               size: 20,
               color: Colors.lightBlueAccent,
             ),
-            title: const Text(
-              '默认',
-              style: TextStyle(color: Colors.white, fontSize: 14),
+            title: Text(
+              resolution == null ? '当前分辨率未读到' : '当前 $resolution',
+              style: const TextStyle(color: Colors.white, fontSize: 14),
             ),
             subtitle: const Text(
-              '收藏接口只返回播放地址，不提供分辨率档位，'
-              '当前按源地址的默认清晰度播放。',
+              '收藏接口只返回一条播放地址，没有分辨率档位可切；'
+              '这里显示的是最近一次采样到的实际分辨率。',
               style: TextStyle(color: Colors.white54, fontSize: 11),
             ),
           ),
           const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
+
+  /// 音质：单条 mp4 只有一条内嵌音轨，不提供音质档位。
+  Widget _audioQualityPanelBody() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('音质'),
+          const ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(
+              Icons.graphic_eq,
+              size: 20,
+              color: Colors.lightBlueAccent,
+            ),
+            title: Text(
+              '源音轨',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            subtitle: Text(
+              '收藏接口返回的是单条 mp4，只有一条内嵌音轨，'
+              '没有可切换的音质档位，按源音量播放。',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+          ),
+          const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
+
+  /// 解码：只展示请求值和播放器实际上报的当前解码器，不改 hwdec 取值。
+  Widget _decodePanelBody() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('解码'),
+          _sheetTile(
+            icon: Icons.settings_suggest_outlined,
+            title: '请求解码器',
+            subtitle: _hwdec,
+          ),
+          _sheetTile(
+            icon: Icons.memory_outlined,
+            title: '当前解码器',
+            subtitle: _decodeCurrent.isEmpty
+                ? '未读到（还没有采到当前流的解码器）'
+                : _decodeCurrent,
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(20, 4, 20, 8),
+            child: Text(
+              '解码方式由播放器按机型能力自动选择，这里只做展示。',
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 字幕：该来源没有字幕数据，不伪造档位，也不给会报错的开关。
+  Widget _subtitlePanelBody() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('字幕'),
+          const ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(
+              Icons.closed_caption_off_outlined,
+              size: 20,
+              color: Colors.white70,
+            ),
+            title: Text(
+              '无字幕轨道',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            subtitle: Text(
+              '该来源只提供单条视频流，接口没有返回字幕数据，'
+              '因此没有可切换的字幕档位。',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+          ),
+          const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
+
+  /// 旋转翻转：旋转渲染层 + 左右/上下镜像，和 B 站播放页的翻转入口一致。
+  Widget _rotateFlipPanelBody() {
+    return SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetHeader('旋转翻转'),
+          _sheetTile(
+            icon: Icons.rotate_90_degrees_cw,
+            title: '顺时针旋转',
+            subtitle: '当前 ${_quarterTurns * 90}°',
+            onTap: _rotateVideo,
+          ),
+          SwitchListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            secondary: const Icon(
+              Icons.flip,
+              size: 20,
+              color: Colors.white70,
+            ),
+            title: const Text(
+              '左右翻转',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            value: _player.flipX.value,
+            activeThumbColor: Colors.lightBlueAccent,
+            onChanged: (value) {
+              _player.flipX.value = value;
+              setState(() {});
+            },
+          ),
+          SwitchListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+            secondary: const Icon(
+              Icons.flip,
+              size: 20,
+              color: Colors.white70,
+            ),
+            title: const Text(
+              '上下翻转',
+              style: TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            value: _player.flipY.value,
+            activeThumbColor: Colors.lightBlueAccent,
+            onChanged: (value) {
+              _player.flipY.value = value;
+              setState(() {});
+            },
+          ),
+          const SizedBox(height: 8),
         ],
       ),
     );
@@ -3858,7 +4158,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           _sheetTile(
             icon: Icons.high_quality_outlined,
             title: '画质',
-            subtitle: '默认 · 接口未提供分辨率',
+            subtitle: '接口未提供分辨率档位',
             onTap: () => _openPanel(_PlayerPanel.quality),
           ),
           _sheetTile(
@@ -3987,7 +4287,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 enum _SwipeTarget { brightness, volume }
 
 /// 播放页内嵌面板的类型。
-enum _PlayerPanel { comments, more, quality, title, playMode }
+enum _PlayerPanel {
+  comments,
+  more,
+  quality,
+  audioQuality,
+  decode,
+  subtitle,
+  rotateFlip,
+  title,
+  playMode,
+}
 
 /// 评论加载中的占位行，和真实评论保持同一套间距。
 class _CommentSkeletonTile extends StatelessWidget {
@@ -4074,6 +4384,38 @@ class _GestureHint {
   final String title;
   final String detail;
   final double? progress;
+}
+
+/// 听音频模式下的画面提示。
+///
+/// 单条 mp4 没有独立音轨，关掉视频轨后画面会停在最后一帧（或变黑），
+/// 不给提示的话看起来像播放器坏了。这一层不接手势，滑动/双击仍然照常。
+class _AudioOnlyBadge extends StatelessWidget {
+  const _AudioOnlyBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xB3000000),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.headphones, color: Colors.white, size: 18),
+            SizedBox(width: 8),
+            Text(
+              '仅音频播放',
+              style: TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 /// 播放页构建器注册。`startPipQaIfRequested` 之类的外部入口靠它拿到页面。
