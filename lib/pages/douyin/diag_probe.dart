@@ -217,6 +217,12 @@ abstract final class DiagProbe {
   /// [IOSPipHelper.isActive] 即可证明同一时刻只有一个消费者。
   static bool frontFramePulling = false;
 
+  /// PiP 活跃时页内是否只挂着 2×2 的最小纹理消费者。
+  ///
+  /// 为真表示没有整块视频层，但 Flutter 仍在按帧从 texture 取 buffer；
+  /// 配合原生 `pip-frame-health` 可区分「没有新帧」与「页内根本没消费」。
+  static bool pipFrameKeepAlive = false;
+
   /// 诊断：PiP 轻量模式。默认开启；关闭后回到源分辨率渲染路径，便于 A/B。
   static bool get pipLiteMode {
     try {
@@ -412,6 +418,7 @@ abstract final class DiagProbe {
       'dataStatus': null,
       'pipActive': IOSPipHelper.isActive,
       'frontFramePull': frontFramePulling,
+      'pipFrameKeepAlive': pipFrameKeepAlive,
     };
     PlPlayerController? player;
     try {
@@ -1254,6 +1261,7 @@ abstract final class DiagProbe {
       ...fields,
       'pipActive': IOSPipHelper.isActive,
       'frontFramePull': frontFramePulling,
+      'pipFrameKeepAlive': pipFrameKeepAlive,
     });
     _writeBuffer.add(line);
     if (_writeBuffer.length >= _writeBatchLines) {

@@ -418,10 +418,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 接管画面」；否则控制中心一开就会把页内画面压成黑底。这里单独记。
   bool _appInBackground = false;
 
-  /// PiP 活跃时是否已停掉页内纹理采样。
+  /// PiP 活跃时是否已把页内视频层压到最小。
   ///
-  /// PiP 原生每帧 `copyPixelBuffer`，页内再挂一个 `Texture` 就是双份拷贝；
-  /// 置真后 [_video] 用黑底占位替代视频层，但播放器和控件都保留。
+  /// 不能彻底摘掉 `Texture`：这个 media_kit fork 的 mpv 渲染回调依赖
+  /// Flutter 侧持续请求纹理，纹理没有消费者后小窗只能回放旧帧。置真后
+  /// [_video] 用黑底 + 2×2 `Texture` 占位，画面不可见但仍按帧取 buffer，
+  /// 也不给整页制造逐帧重绘。
   bool _pipFrameSuppressed = false;
 
   /// 回前台后等原生关闭 PiP 的有界轮询，让页内画面尽快恢复。
@@ -636,6 +638,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 放在 dispose 之后：dispose 会上报最后一次 texture release，先 stop 就
     // 会把这条漏掉，session-summary 的 alive 峰值/收尾数会不准。
     DiagProbe.frontFramePulling = false;
+    DiagProbe.pipFrameKeepAlive = false;
     DiagProbe.stop();
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
@@ -2681,13 +2684,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _lastPipTickMs = 0;
   }
 
-  /// 同一时刻只允许一个消费者从 FlutterTexture 取帧。
+  /// iOS PiP 期间把页内视频层压到最小，但保留一个纹理消费者。
   ///
-  /// 这里选「PiP 活跃期间暂停页内采样」，而不是降低原生 enqueue 频率：
-  /// 后者会让小窗自己变慢，且双份拷贝依然存在。页内换成黑底占位后，mpv
-  /// 仍按渲染回调更新纹理，原生 PiP 每帧从同一纹理拷贝，小窗画面不受
-  /// 影响；PiP 结束（[IOSPipHelper.isActive] 变假）后下一次同步会重建
-  /// 视频层，返回播放页不会黑屏。
+  /// 不能完全摘掉 `Texture`：这个 media_kit fork 的 mpv 渲染回调依赖
+  /// Flutter 侧持续请求纹理，一旦没有任何消费者，`textureFrameAvailable`
+  /// 会长时间不再触发，小窗只能反复回放 hold 的最后一帧。这里改由
+  /// [_video] 挂一个 2×2 的 `Texture`：只多一层极小合成，不做整页逐帧
+  /// 重绘，同时保证纹理仍被按帧拉取。PiP 结束（[IOSPipHelper.isActive]
+  /// 变假）后下一次同步会恢复整块视频层，返回播放页不会黑屏。
   ///
   /// 退后台请求 PiP 的那一段做乐观压制：Dart 在后台可能被挂起，等不到
   /// active 回调；回到前台且 PiP 没起来时会立即恢复。
@@ -2697,6 +2701,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // Android 的 PiP 是整个 Activity 进入小窗，Flutter texture 仍是唯一
       // 画面来源；不能套用 iOS 的停页内采样逻辑，否则小窗会变黑。
       DiagProbe.frontFramePulling = true;
+      DiagProbe.pipFrameKeepAlive = false;
       if (_pipFrameSuppressed) {
         if (mounted) {
           setState(() => _pipFrameSuppressed = false);
@@ -2711,6 +2716,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         pipActive ||
         (_appInBackground && (_pipAutoArmed || _pipStartRequested));
     DiagProbe.frontFramePulling = !wantSuppress;
+    DiagProbe.pipFrameKeepAlive = wantSuppress;
     if (wantSuppress != _pipFrameSuppressed) {
       if (mounted) {
         setState(() => _pipFrameSuppressed = wantSuppress);
@@ -2721,6 +2727,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'mode': wantSuppress ? 'pip-only' : 'inline',
         'pipActive': pipActive,
         'frontFramePull': !wantSuppress,
+        'keepAliveConsumer': wantSuppress,
         'appPaused': _appInBackground,
         'reason': reason,
         'textureId': _player.videoController?.id.value,
@@ -3544,12 +3551,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       ),
     );
-    // PiP 活跃时不再挂 `Texture`：Flutter 停止采样后，原生小窗仍是这条
-    // FlutterTexture 的唯一消费者。mpv 的纹理更新与小窗取帧都不依赖页内
-    // 是否绘制，所以小窗画面不受影响；PiP 结束会 setState 重建 video，
-    // 内嵌画面立即恢复。
+    // PiP 活跃时页内不再显示整块视频，但必须保留一个纹理消费者：完全
+    // 摘掉 `Texture` 后 Flutter 不再按帧取 buffer，mpv 的渲染回调会停，
+    // 小窗只能回放 hold 的旧帧。这里用黑底铺满 + 2×2 `Texture` 占位，
+    // 只让这一小块参与合成与重绘，不构成整页逐帧重绘。PiP 结束后
+    // setState 重建 video，内嵌画面立即恢复。
     final displayVideo = _pipFrameSuppressed
-        ? const ColoredBox(color: Colors.black)
+        ? _pipKeepAliveVideo(controller)
         : video;
     return GestureDetector(
       // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
@@ -3608,6 +3616,39 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           ),
         ),
       ),
+    );
+  }
+
+  /// PiP 期间的最小纹理消费者。
+  ///
+  /// `Texture` 只要还在树上、还参与合成，引擎就会按帧调
+  /// `copyPixelBuffer`，和它在屏幕上的大小无关。尺寸取 2×2 逻辑像素，
+  /// 黑底保证用户看不到这块纹理；`RepaintBoundary` 把这层逐帧重绘
+  /// 限制在 2×2 内，避免扩散到整页。
+  Widget _pipKeepAliveVideo(VideoController controller) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Colors.black),
+        Positioned(
+          left: 0,
+          top: 0,
+          width: 2,
+          height: 2,
+          child: RepaintBoundary(
+            child: ValueListenableBuilder<int?>(
+              valueListenable: controller.id,
+              builder: (context, textureId, _) {
+                if (textureId == null) return const SizedBox.shrink();
+                return Texture(
+                  textureId: textureId,
+                  filterQuality: FilterQuality.none,
+                );
+              },
+            ),
+          ),
+        ),
+      ],
     );
   }
 

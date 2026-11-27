@@ -407,6 +407,20 @@ private final class PipSession: NSObject {
   private var lastTextureCallbackTime: CFTimeInterval = 0
   private var callbackWindowStart: CFTimeInterval = 0
   private var callbackWindowCount = 0
+  /// 供帧健康度窗口：PiP 期间每 5s 一条 `pip-frame-health`。
+  /// 独立 Timer 保证「0 fps」也能记录下来，而不是等下一次回调。
+  private var healthTimer: Timer?
+  private var healthWindowStart: CFTimeInterval = 0
+  private var healthCallbackBaseline = 0
+  private var healthCopyAttemptBaseline = 0
+  private var healthCopyNilBaseline = 0
+  private var healthEnqueuedBaseline = 0
+  private var healthReplayedBaseline = 0
+  /// 累计计数：copyPixelBuffer 尝试 / 返回 nil / hold 旧帧回放。
+  /// 前两个只在主线程读写；回放计数在 frameQueue 上算完再回主线程。
+  private var copyAttemptCount = 0
+  private var copyNilCount = 0
+  private var replayedFrameCount = 0
   /// 画中画 seek 的代数。异步补帧任务只认最新一次 seek，避免连续点
   /// 快进/快退时旧任务在新位置之后又把旧帧拉回来。
   private var seekGeneration = 0
@@ -659,6 +673,7 @@ private final class PipSession: NSObject {
     }
     pendingStart = true
     self.backgroundOnStart = backgroundOnStart
+    startFrameHealthTimer()
     PipTrace.log(
       "requestStart: hasFrame=\(hasFrame) autoEnter=\(autoEnter) "
         + "appState=\(UIApplication.shared.applicationState.rawValue) "
@@ -672,6 +687,7 @@ private final class PipSession: NSObject {
       if self.pendingStart {
         self.pendingStart = false
         self.backgroundOnStart = false
+        self.stopFrameHealthTimer(emitSnapshot: true)
         self.sendEvent("onStateChanged", ["active": false, "error": "PiP is not possible"])
         self.onStop?()
         return
@@ -898,6 +914,9 @@ private final class PipSession: NSObject {
       "pip-surface: replayed held frame texture=\(textureId) size="
         + "\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))"
     )
+    DispatchQueue.main.async { [weak self] in
+      self?.replayedFrameCount += 1
+    }
   }
 
   /// Fallback B: if a rebuild really is needed and takes too long, pause the
@@ -988,6 +1007,7 @@ private final class PipSession: NSObject {
   }
 
   func invalidate() {
+    stopFrameHealthTimer(emitSnapshot: true)
     logSurface("detach", reason: "invalidate")
     cancelSurfaceHold(reason: "invalidate")
     pendingStart = false
@@ -1015,11 +1035,82 @@ private final class PipSession: NSObject {
         + "throttleDrops=\(throttleDropCount) enqueued=\(enqueuedFrameCount) "
         + "shown=\(shownFrameCount) droppedOld=\(droppedOldFrameCount) "
         + "direct=\(directFrameCount) render=\(renderFrameCount) "
+        + "copyAttempts=\(copyAttemptCount) copyNil=\(copyNilCount) "
+        + "replayed=\(replayedFrameCount) "
         + "idleMs=\(Int(Self.idleFrameInterval * 1000))"
     )
     // 同步在 frameQueue 上取快照：tearDown() 随后会把 session 置空，
     // 异步闭包可能已经拿不到统计值。
     frameQueue.sync { writeVerdictIfNeeded() }
+  }
+
+  // MARK: Frame health
+
+  /// 开始 PiP 供帧健康度采样。重复调用只保留第一个窗口。
+  private func startFrameHealthTimer() {
+    guard healthTimer == nil else { return }
+    let now = CACurrentMediaTime()
+    healthWindowStart = now
+    healthCallbackBaseline = textureCallbackCount
+    healthCopyAttemptBaseline = copyAttemptCount
+    healthCopyNilBaseline = copyNilCount
+    healthEnqueuedBaseline = enqueuedFrameCount
+    healthReplayedBaseline = replayedFrameCount
+    healthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) {
+      [weak self] _ in
+      self?.logFrameHealth()
+    }
+    PipTrace.log(
+      "pip-frame-health: timer start texture=\(textureId) "
+        + "callbacks=\(textureCallbackCount)"
+    )
+  }
+
+  /// 停止采样；`emitSnapshot` 为真时先把当前窗口落一行，便于对照起止。
+  private func stopFrameHealthTimer(emitSnapshot: Bool = false) {
+    if emitSnapshot { logFrameHealth() }
+    healthTimer?.invalidate()
+    healthTimer = nil
+    healthWindowStart = 0
+  }
+
+  /// 输出最近一个窗口的帧率与两类「假帧」占比。
+  ///
+  /// - frameAvailablePerSec：原生收到多少次 `textureFrameAvailable`；
+  /// - copyPixelBufferNilRatio：取帧尝试中拿到 nil 的比例；
+  /// - replayedFrameRatio：喂给小窗的帧里 hold 旧帧回放占多少。
+  private func logFrameHealth() {
+    guard healthWindowStart > 0 else { return }
+    let now = CACurrentMediaTime()
+    let elapsed = max(0.001, now - healthWindowStart)
+    let callbacks = textureCallbackCount - healthCallbackBaseline
+    let attempts = copyAttemptCount - healthCopyAttemptBaseline
+    let nils = copyNilCount - healthCopyNilBaseline
+    let fresh = enqueuedFrameCount - healthEnqueuedBaseline
+    let replays = replayedFrameCount - healthReplayedBaseline
+    let fps = Double(callbacks) / elapsed
+    let nilRatio = attempts > 0 ? Double(nils) / Double(attempts) : 0
+    let fed = fresh + replays
+    let replayRatio = fed > 0 ? Double(replays) / Double(fed) : 0
+    PipTrace.log(
+      "pip-frame-health: frameAvailablePerSec="
+        + String(format: "%.1f", fps)
+        + " copyPixelBufferNilRatio="
+        + String(format: "%.2f", nilRatio)
+        + " replayedFrameRatio="
+        + String(format: "%.2f", replayRatio)
+        + " callbacks=\(callbacks) copyAttempts=\(attempts) copyNil=\(nils) "
+        + "freshEnqueued=\(fresh) replayed=\(replays) "
+        + "droppedOld=\(droppedOldFrameCount) enqueuedTotal=\(enqueuedFrameCount) "
+        + "hold=\(surfaceHeld ? "YES" : "NO") "
+        + "pipActive=\(controller.isPictureInPictureActive ? "YES" : "NO")"
+    )
+    healthWindowStart = now
+    healthCallbackBaseline = textureCallbackCount
+    healthCopyAttemptBaseline = copyAttemptCount
+    healthCopyNilBaseline = copyNilCount
+    healthEnqueuedBaseline = enqueuedFrameCount
+    healthReplayedBaseline = replayedFrameCount
   }
 
   // MARK: Frames
@@ -1071,7 +1162,9 @@ private final class PipSession: NSObject {
       pendingFrameRequested = true
       return
     }
+    copyAttemptCount += 1
     guard let source = texture.copyPixelBuffer()?.takeRetainedValue() else {
+      copyNilCount += 1
       PipTrace.log("frameAvailable: copyPixelBuffer returned nil for id=\(textureId)")
       return
     }
@@ -1216,10 +1309,12 @@ private final class PipSession: NSObject {
     // Pull the current texture buffer instead of holding on to the frame that
     // was pending: mpv reuses that buffer, so its contents may already be
     // overwritten by the time the previous frame finishes.
-    guard
-      let texture = TextureTracker.texture(for: textureId),
-      let source = texture.copyPixelBuffer()?.takeRetainedValue()
-    else {
+    guard let texture = TextureTracker.texture(for: textureId) else {
+      return
+    }
+    copyAttemptCount += 1
+    guard let source = texture.copyPixelBuffer()?.takeRetainedValue() else {
+      copyNilCount += 1
       return
     }
     process(source)
@@ -1887,6 +1982,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     throttleDropsAtEnter = throttleDropCount
     stopRequested = false
     restoring = false
+    startFrameHealthTimer()
     PipTrace.log(
       "WILL start: isActive=\(isActive) sourceViewInTree=\(sourceView.superview != nil) "
         + "throttleDrops=\(throttleDropCount)"
@@ -1903,6 +1999,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     // 保证此后 frameAvailable 不再走 idle 节流。
     isActive = true
     pipStartRequested = false
+    startFrameHealthTimer()
     // WillStart 可能在自动进入时被整段跳过，这里再取一次基线，
     // 否则 DidStop 的 throttleDropsDuringPip 会把预热期的丢帧也算进来。
     throttleDropsAtEnter = throttleDropCount
@@ -1937,6 +2034,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     isActive = false
     pipStartRequested = false
     backgroundOnStart = false
+    stopFrameHealthTimer(emitSnapshot: true)
     PipTrace.log("FAILED to start: \(error.localizedDescription)")
     sendEvent("onStateChanged", ["active": false, "error": error.localizedDescription])
     DispatchQueue.main.async { [weak self] in self?.onStop?() }
@@ -1960,6 +2058,7 @@ extension PipSession: AVPictureInPictureControllerDelegate {
     let throttledDuringPip = throttleDropCount - throttleDropsAtEnter
     isActive = false
     pipStartRequested = false
+    stopFrameHealthTimer(emitSnapshot: true)
     cancelSurfaceHold(reason: "pip-stopped")
     // Neither restored nor stopped by the app: closed from the PiP window.
     let closed = !restoring && !stopRequested
