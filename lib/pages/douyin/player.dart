@@ -227,7 +227,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
   Timer? _chromeTimer;
 
-  /// Android PiP 精简布局：只留视频画面和一行标题。
+  /// Android PiP 精简布局：只留视频画面，不渲染标题/文案条。
   /// 只在原生进入/退出回调时 setState 一次，PiP 期间不做逐帧重绘。
   bool _isPipLayout = false;
 
@@ -251,6 +251,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 评论面板顶部的视频文案默认展开，点一下折叠。
   bool _commentCaptionExpanded = true;
+
+  /// 首屏评论缓存：`platform:videoId` -> 已返回的结果。
+  ///
+  /// 评论要走原生离屏网页，通常 5-20 秒。视频一打开就后台预取，面板打开
+  /// 或切回同一视频时直接命中；用页面级静态缓存，页面重建后也不用再开网页。
+  /// 只缓存有结果的页（含确认无评论），网络/风控失败留给面板手动重试。
+  static final Map<String, _CommentPage> _commentCache =
+      <String, _CommentPage>{};
+
+  /// 正在进行的评论请求，按 `platform:videoId` 去重。
+  ///
+  /// 预取和面板打开撞到同一条视频时共享同一个 Future，不开第二个网页。
+  static final Map<String, Future<_CommentPage>> _commentRequests =
+      <String, Future<_CommentPage>>{};
+
+  /// 评论缓存有效期，和 `ShortVideoWeb` 的十分钟缓存保持一致。
+  static const int _commentCacheTtlMs = 10 * 60 * 1000;
+
+  /// 评论缓存条数上限，连播几十条也不让 Map 无限增长。
+  static const int _maxCommentCacheEntries = 24;
+
+  /// 同时进行的评论预取上限：每次都会开一个离屏 WKWebView，快速连播时
+  /// 不能无限叠加和播放抢 CPU。面板手动打开不受这个限制。
+  static const int _maxCommentPrefetchInFlight = 3;
+
+  /// 首屏只取第一页，先让用户看到约 20 条，不再等全量。
+  static const int _commentsFirstPageLimit = 20;
 
   /// 亮度/音量/进度提示只重建这一小块，拖动时不用 setState 整页。
   final ValueNotifier<_GestureHint?> _gestureHint =
@@ -850,6 +877,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         _error = null;
         _resetComments();
       });
+      // 视频一打开就在后台抓评论第一页，和媒体解析并行；不管评论面板
+      // 有没有打开都发起，用户点开时才能直接命中或只等这个在途请求。
+      _prefetchComments(source: source);
       // 评论面板开着时切条，旧结果已经作废，需要按新视频重新抓一次。
       if (_panel == _PlayerPanel.comments) {
         unawaited(_ensureComments());
@@ -3097,35 +3127,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   Widget build(BuildContext context) {
     final entry = _current;
     final viewPadding = MediaQuery.viewPaddingOf(context);
-    // PiP 精简布局：系统小窗只有视频画面和一行标题，不构建底栏/顶栏/
-    // 边缘手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
+    // PiP 精简布局：系统小窗只渲染视频画面，不构建标题/底栏/顶栏/边缘
+    // 手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
     if (_isPipLayout) {
       return Scaffold(
         backgroundColor: Colors.black,
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            Positioned.fill(child: _video()),
-            if (entry.title.isNotEmpty)
-              Positioned(
-                left: 12,
-                right: 12,
-                bottom: viewPadding.bottom + 8,
-                child: Text(
-                  entry.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 12,
-                    shadows: <Shadow>[
-                      Shadow(blurRadius: 4, color: Colors.black54),
-                    ],
-                  ),
-                ),
-              ),
-          ],
-        ),
+        body: _video(),
       );
     }
     // 控件尺寸按窗口宽度分档：6S 紧凑、15PM 舒展、平板/横屏再放大。
@@ -3599,11 +3606,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 displayVideo
               else
                 RotatedBox(quarterTurns: _quarterTurns, child: displayVideo),
-              Obx(
-                () => _player.onlyPlayAudio.value
-                    ? const IgnorePointer(child: _AudioOnlyBadge())
-                    : const SizedBox.shrink(),
-              ),
+              // PiP 精简布局只保留视频画面，不叠加任何文案提示。
+              if (!_isPipLayout)
+                Obx(
+                  () => _player.onlyPlayAudio.value
+                      ? const IgnorePointer(child: _AudioOnlyBadge())
+                      : const SizedBox.shrink(),
+                ),
             ],
           ),
         ),
@@ -3939,6 +3948,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         size: _PlayerUiMetrics.icon,
       ),
       onTap: () => _runAction(action),
+      // 长按旋转键进入镜像面板；单击始终是一键 +90°，不再走两步面板。
+      onLongPress: action == _PlayerAction.rotate
+          ? () => _openPanel(_PlayerPanel.rotateFlip)
+          : null,
       tooltip: _actionTooltip(action),
       width: metrics.hit,
       height: metrics.hit,
@@ -3973,7 +3986,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _PlayerAction.subtitle => '字幕',
       _PlayerAction.audioQuality => '音质',
       _PlayerAction.decode => '解码',
-      _PlayerAction.rotate => '旋转翻转',
+      _PlayerAction.rotate => '旋转 90°（长按镜像）',
       _PlayerAction.cast => '投屏',
       _PlayerAction.audioOnly => '听音频',
     };
@@ -4029,7 +4042,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       case _PlayerAction.subtitle:
         _openPanel(_PlayerPanel.subtitle);
       case _PlayerAction.rotate:
-        _openPanel(_PlayerPanel.rotateFlip);
+        _closePanel();
+        _rotateVideo();
       case _PlayerAction.cast:
         _closePanel();
         _castToDevice();
@@ -4224,15 +4238,97 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _commentCaptionExpanded = true;
   }
 
-  /// 打开评论面板时抓一次评论。同一条视频的加载中/成功结果直接复用，
-  /// 切条后 [_resetComments] 会把 key 清掉，旧请求的回包也会被 session 丢弃。
-  Future<void> _ensureComments({bool force = false}) async {
-    final entry = _current;
-    final video = entry.short;
+  ({ShortVideoPlatform platform, String videoId, String key}) _commentTarget() {
+    final video = _current.short;
     final platform =
         ShortVideoPlatform.fromId(video?.platform) ?? ShortVideoPlatform.douyin;
     final videoId = video?.videoId ?? '';
+    return (
+      platform: platform,
+      videoId: videoId,
+      key: '${platform.id}:$videoId',
+    );
+  }
+
+  /// 视频一打开就在后台抓评论第一页。
+  ///
+  /// 放在 `_open` 里、和媒体解析并行：用户点开面板时要么直接命中缓存，
+  /// 要么只等这个已经在途的请求，不再从零开始等 5-20 秒。
+  /// 预取失败只写诊断，不弹提示、不改变播放状态。
+  void _prefetchComments({required String source}) {
+    if (_disposed || _leaving || !mounted) return;
+    try {
+      _prefetchCommentsInner(source: source);
+    } catch (_) {
+      // 评论预取是旁路：任何异常都不能让 _open 的 try 收尾成播放失败。
+    }
+  }
+
+  void _prefetchCommentsInner({required String source}) {
+    final target = _commentTarget();
+    if (target.videoId.isEmpty) return;
+    final key = target.key;
+    final cached = _commentCache[key];
+    if (cached != null) {
+      if (_commentCacheFresh(cached)) {
+        DiagProbe.event('comments-prefetch', <String, Object?>{
+          'key': key,
+          'hit': true,
+          'elapsedMs': 0,
+          'count': cached.list.length,
+          'state': 'cache-hit',
+          'source': source,
+        });
+        return;
+      }
+      _commentCache.remove(key);
+    }
+    if (_commentRequests.containsKey(key)) {
+      DiagProbe.event('comments-prefetch', <String, Object?>{
+        'key': key,
+        'hit': false,
+        'elapsedMs': 0,
+        'count': null,
+        'state': 'join',
+        'source': source,
+      });
+      return;
+    }
+    if (_commentRequests.length >= _maxCommentPrefetchInFlight) {
+      DiagProbe.event('comments-prefetch', <String, Object?>{
+        'key': key,
+        'hit': false,
+        'elapsedMs': 0,
+        'count': null,
+        'state': 'skip-busy',
+        'source': source,
+        'inFlight': _commentRequests.length,
+      });
+      return;
+    }
+    unawaited(
+      _loadCommentPage(
+        key: key,
+        platform: target.platform,
+        videoId: target.videoId,
+        source: 'prefetch-$source',
+      ),
+    );
+  }
+
+  bool _commentCacheFresh(_CommentPage page) =>
+      DateTime.now().millisecondsSinceEpoch - page.fetchedAtMs <
+      _commentCacheTtlMs;
+
+  /// 打开评论面板时优先消费预取结果。
+  ///
+  /// 命中缓存直接渲染；未命中则显示骨架并等待（或复用）后台预取。
+  /// 切条后 [_resetComments] 会让旧 session 的回包失效，绝不串到下一条。
+  Future<void> _ensureComments({bool force = false}) async {
     if (!mounted) return;
+    final target = _commentTarget();
+    final platform = target.platform;
+    final videoId = target.videoId;
     if (videoId.isEmpty) {
       setState(() {
         _commentsKey = '${platform.id}:';
@@ -4248,13 +4344,29 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       );
       return;
     }
-    final key = '${platform.id}:$videoId';
-    if (!force &&
-        key == _commentsKey &&
-        (_commentsLoading ||
-            _comments.isNotEmpty ||
-            _commentsError.isNotEmpty)) {
-      return;
+    final key = target.key;
+    if (!force) {
+      if (key == _commentsKey &&
+          (_commentsLoading ||
+              _comments.isNotEmpty ||
+              _commentsError.isNotEmpty)) {
+        return;
+      }
+      final cached = _commentCache[key];
+      if (cached != null && _commentCacheFresh(cached)) {
+        _applyCommentPage(key, cached);
+        DiagProbe.event('comments-prefetch', <String, Object?>{
+          'key': key,
+          'hit': true,
+          'elapsedMs': 0,
+          'count': cached.list.length,
+          'state': 'cache-hit',
+          'source': 'panel',
+        });
+        _diagCommentsForPage(cached, platform: platform, videoId: videoId);
+        return;
+      }
+      if (cached != null) _commentCache.remove(key);
     }
     final session = ++_commentsSession;
     setState(() {
@@ -4264,6 +4376,142 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _commentsError = '';
     });
     _diagComments('loading', platform: platform, videoId: videoId);
+    _CommentPage page;
+    try {
+      page = await _loadCommentPage(
+        key: key,
+        platform: platform,
+        videoId: videoId,
+        source: force ? 'retry' : 'panel',
+        force: force,
+      );
+    } catch (error) {
+      page = _CommentPage(
+        list: const <ShortVideoComment>[],
+        error: 'network',
+        detail: '$error',
+        elapsedMs: 0,
+        fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
+      );
+    }
+    if (!mounted || session != _commentsSession) return;
+    _applyCommentPage(key, page);
+    _diagCommentsForPage(page, platform: platform, videoId: videoId);
+  }
+
+  void _applyCommentPage(String key, _CommentPage page) {
+    setState(() {
+      _commentsKey = key;
+      _commentsLoading = false;
+      _comments = page.list;
+      _commentsError = page.error;
+    });
+  }
+
+  void _diagCommentsForPage(
+    _CommentPage page, {
+    required ShortVideoPlatform platform,
+    required String videoId,
+  }) {
+    if (page.list.isNotEmpty) {
+      _diagComments(
+        'success',
+        platform: platform,
+        videoId: videoId,
+        count: page.list.length,
+      );
+    } else if (page.error == 'empty') {
+      _diagComments(
+        'empty',
+        platform: platform,
+        videoId: videoId,
+        reason: page.error,
+      );
+    } else {
+      _diagComments(
+        'error',
+        platform: platform,
+        videoId: videoId,
+        reason: page.error.isEmpty ? 'blocked' : page.error,
+        detail: page.detail,
+      );
+    }
+  }
+
+  /// 按 `platform:videoId` 合并请求。预取与面板打开共享同一个 Future，
+  /// 避免同一视频同时开两个离屏网页。
+  Future<_CommentPage> _loadCommentPage({
+    required String key,
+    required ShortVideoPlatform platform,
+    required String videoId,
+    required String source,
+    bool force = false,
+  }) {
+    if (force) {
+      _commentRequests.remove(key);
+      _commentCache.remove(key);
+    } else {
+      final pending = _commentRequests[key];
+      if (pending != null) {
+        DiagProbe.event('comments-prefetch', <String, Object?>{
+          'key': key,
+          'hit': false,
+          'elapsedMs': 0,
+          'count': null,
+          'state': 'join',
+          'source': source,
+        });
+        return pending;
+      }
+    }
+    final stopwatch = Stopwatch()..start();
+    DiagProbe.event('comments-prefetch', <String, Object?>{
+      'key': key,
+      'hit': false,
+      'elapsedMs': 0,
+      'count': null,
+      'state': 'start',
+      'source': source,
+      'limit': _commentsFirstPageLimit,
+    });
+    late final Future<_CommentPage> tracked;
+    tracked = _fetchCommentPage(
+      platform: platform,
+      videoId: videoId,
+      force: force,
+      stopwatch: stopwatch,
+    ).then((page) {
+      if (identical(_commentRequests[key], tracked)) {
+        if (page.list.isNotEmpty || page.error == 'empty') {
+          _commentCache[key] = page;
+          _trimCommentCache();
+        }
+      }
+      DiagProbe.event('comments-prefetch', <String, Object?>{
+        'key': key,
+        'hit': false,
+        'elapsedMs': page.elapsedMs,
+        'count': page.list.length,
+        'state': page.list.isNotEmpty ? 'done' : 'failed',
+        'source': source,
+        if (page.error.isNotEmpty) 'reason': page.error,
+      });
+      return page;
+    }).whenComplete(() {
+      if (identical(_commentRequests[key], tracked)) {
+        _commentRequests.remove(key);
+      }
+    });
+    _commentRequests[key] = tracked;
+    return tracked;
+  }
+
+  Future<_CommentPage> _fetchCommentPage({
+    required ShortVideoPlatform platform,
+    required String videoId,
+    required bool force,
+    required Stopwatch stopwatch,
+  }) async {
     var list = const <ShortVideoComment>[];
     var reason = '';
     var detail = '';
@@ -4272,6 +4520,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         platformId: platform.id,
         videoId: videoId,
         userAgent: platform.userAgent,
+        limit: _commentsFirstPageLimit,
         force: force,
       );
       if (list.isEmpty) {
@@ -4285,34 +4534,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       reason = 'network';
       detail = '$error';
     }
-    if (!mounted || session != _commentsSession) return;
-    setState(() {
-      _commentsLoading = false;
-      _comments = list;
-      _commentsError = reason;
-    });
-    if (list.isNotEmpty) {
-      _diagComments(
-        'success',
-        platform: platform,
-        videoId: videoId,
-        count: list.length,
-      );
-    } else if (reason == 'empty') {
-      _diagComments(
-        'empty',
-        platform: platform,
-        videoId: videoId,
-        reason: reason,
-      );
-    } else {
-      _diagComments(
-        'error',
-        platform: platform,
-        videoId: videoId,
-        reason: reason,
-        detail: detail,
-      );
+    stopwatch.stop();
+    return _CommentPage(
+      list: list,
+      error: reason,
+      detail: detail,
+      elapsedMs: stopwatch.elapsedMilliseconds,
+      fetchedAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+  }
+
+  void _trimCommentCache() {
+    while (_commentCache.length > _maxCommentCacheEntries) {
+      _commentCache.remove(_commentCache.keys.first);
     }
   }
 
@@ -5099,6 +5333,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             MediaQuery.sizeOf(context).width,
           ))
             _actionSheetTile(action),
+          _sheetTile(
+            icon: Icons.flip,
+            title: '镜像翻转',
+            subtitle: '左右 / 上下 · 长按旋转键也可进入',
+            onTap: () => _openPanel(_PlayerPanel.rotateFlip),
+          ),
           SwitchListTile(
             dense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 16),
@@ -5292,6 +5532,24 @@ enum _PlayerPanel {
   rotateFlip,
   title,
   playMode,
+}
+
+/// 一次评论抓取的结果。缓存与面板共用同一份，避免两边对「空/失败」
+/// 的判断不一致。
+class _CommentPage {
+  const _CommentPage({
+    required this.list,
+    required this.error,
+    required this.elapsedMs,
+    required this.fetchedAtMs,
+    this.detail = '',
+  });
+
+  final List<ShortVideoComment> list;
+  final String error;
+  final String detail;
+  final int elapsedMs;
+  final int fetchedAtMs;
 }
 
 /// 评论加载中的占位行，和真实评论保持同一套间距。
