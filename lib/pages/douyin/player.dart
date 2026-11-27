@@ -5,6 +5,7 @@ import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.da
 import 'package:PiliPlus/models_new/video/video_detail/page.dart' show Part;
 import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
@@ -288,6 +289,31 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   int _autoRecoverCount = 0;
   int _recoverStreak = 0;
 
+  /// 连续拿不到首帧的条目数（跨条目累计）。
+  ///
+  /// 成功看到首帧或用户手动选播时清零；到 [_maxConsecutiveSkip] 就停下
+  /// 并给出可见提示，避免片源整体失效时整页无限乱跳。
+  int _skipStreak = 0;
+
+  /// 已经为哪些 B 站条目重新解析过 playurl。
+  ///
+  /// 按条目 key 只重试一次：随机/循环再转回同一条时不再重试，
+  /// 保证「重试一次」不会变成死循环。
+  final Set<String> _biliPlayurlRetried = <String>{};
+
+  /// B 站首帧超时重开后，是否真正走到了「已起播、等首帧」阶段。
+  ///
+  /// 只给 [_retryBiliWithFreshPlayurl] 判断重开是不是在解析/加载阶段就
+  /// 已经失败；失败时直接跳下一条，不等看门狗。
+  bool _biliRetryOpenSucceeded = false;
+
+  /// 本次 open 是否在解析阶段就没拿到地址。
+  ///
+  /// 跳过链（source=skip）要靠它继续往后跳：这种失败不会起播，也就不会
+  /// 挂首帧看门狗，不能停在错误页上不动。其余失败（共享播放器、释放失败
+  /// 等）不置位，避免把别人的占用误判成片源问题。
+  bool _openMediaMissing = false;
+
   /// 开流初期观察 hwdec-current 的节拍器。首帧出现或超窗就停，
   /// 不让同步 FFI 读属性变成常驻采样。
   Timer? _hwdecProbeTimer;
@@ -331,6 +357,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 首帧看门狗首次检查的时点。常规首帧 ~2s 出，给一点余量在 ~2.8s
   /// 判定；彻底不来时尽早重建恢复画面，不再让用户盯 8 秒黑屏。
   static const int _firstFrameWatchdogMs = 2800;
+
+  /// 连续多少条拿不到首帧就停止自动跳过并提示。
+  static const int _maxConsecutiveSkip = 3;
+
+  /// B 站首帧总预算：6S 这类低内存老机型给 ~12s，其它机型 ~8s。
+  ///
+  /// 实现上仍保留 2800ms 的常规看门狗触发重试；重开后的看门狗按
+  /// 「原始 open 起点 + 本预算」计算剩余时间，所以总耗时落在 8s / 12s
+  /// 左右，而不是两次各等一遍完整预算。
+  static int get _biliFirstFrameBudgetMs =>
+      ShortVideoPerf.lowMemory ? 12000 : 8000;
+
+  /// 重开后的看门狗剩余时间上限，防止预算计算出异常大的值。
+  static const int _maxBiliFirstFrameBudgetMs = 12000;
 
   /// 自动连播每 N 条主动重建一次 player/texture。手动选播 = 完整重建
   /// 能恢复，说明重建有效；这里提前做，防止累积到黑屏才被动救。
@@ -444,6 +484,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _player.textureSource = 'douyin';
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
     _syncFrameConsumer('init');
+    // B 站首帧预算要按机型分档（6S 12s / 其它 8s）；这里只问一次原生内存，
+    // 之后同步读 ShortVideoPerf.lowMemory，不在看门狗路径上 await。
+    unawaited(ShortVideoPerf.ensureProbed());
     _scheduleChromeHide();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
@@ -626,6 +669,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     int index, {
     String source = 'auto',
     bool force = false,
+    bool uncachedResolve = false,
+    int? firstFrameDeadlineMs,
   }) async {
     if (_disposed || _leaving || _queue.isEmpty) {
       _diagSwitchBlocked(
@@ -693,10 +738,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _openStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     _openStartPositionMs = _player.positionInMilliseconds;
     if (source != 'auto-recover') _recoverStreak = 0;
+    // B 站重试也属于失败处理链路，不能把连续失败计数清零。
+    if (source == 'initial' ||
+        source == 'next' ||
+        source == 'previous' ||
+        source == 'playlist-select') {
+      _skipStreak = 0;
+      _biliPlayurlRetried.remove(_queue[target].key);
+    }
     _cancelFirstFrameWatchdog();
     _firstFrameSeen = false;
     _opening = true;
     _completionArmed = false;
+    _openMediaMissing = false;
     // 开关日志：记录点击/自动连播真正进入 open 的瞬间。isBuffering 不是
     // 拦截条件，这里只把它作为证据写下来，方便对比「buffering 时点了也切」。
     DiagProbe.event('switch-now', <String, Object?>{
@@ -788,7 +842,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 时是慢路径）再查缓存，串行下来就是「右下角都显示缓存 281MB 了，还要
       // 等很久」。现在先试离线，命中就直接开播，cookie 完全不碰。
       final resolveSw = Stopwatch()..start();
-      final media = await _resolveMedia(entry);
+      final media = await _resolveMedia(entry, uncached: uncachedResolve);
       resolveSw.stop();
       _diagUiBlock(
         'open',
@@ -801,6 +855,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       if (media == null || media.url.isEmpty) {
         openError = 'no-media';
+        _openMediaMissing = true;
         setState(() => _error = '解析不出播放地址');
         return;
       }
@@ -1010,7 +1065,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         index: target,
         source: source,
         hwdec: hwdec,
+        deadlineMs: firstFrameDeadlineMs,
       );
+      if (source == 'bili-retry') _biliRetryOpenSucceeded = true;
       _pushProgress(force: true);
       DiagProbe.openPhase('played');
       DiagProbe.playItem(key: entry.key);
@@ -1335,6 +1392,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     required int index,
     required String source,
     required String hwdec,
+    int? deadlineMs,
   }) {
     _cancelFirstFrameWatchdog();
     _watchdogSession = session;
@@ -1344,10 +1402,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _watchdogKey = index >= 0 && index < _queue.length
         ? _queue[index].key
         : '';
-    _watchdogStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _watchdogStartedAtMs = now;
     _watchdogOpenBusyRetries = 0;
+    var delayMs = _firstFrameWatchdogMs;
+    if (deadlineMs != null) {
+      final remaining = deadlineMs - now;
+      if (remaining > delayMs) delayMs = remaining;
+      if (delayMs > _maxBiliFirstFrameBudgetMs) {
+        delayMs = _maxBiliFirstFrameBudgetMs;
+      }
+    }
     _firstFrameWatchdog = Timer(
-      const Duration(milliseconds: _firstFrameWatchdogMs),
+      Duration(milliseconds: delayMs),
       () => _onFirstFrameWatchdog(session),
     );
     _armHwdecProbe(hwdec);
@@ -1366,11 +1433,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_disposed || _leaving || session != _openSession) return;
     if (_firstFrameSeen) {
       _recoverStreak = 0;
+      _skipStreak = 0;
       return;
     }
     if (_hasFirstFrameNow()) {
       _firstFrameSeen = true;
       _recoverStreak = 0;
+      _skipStreak = 0;
       DiagProbe.event('first-frame-seen', <String, Object?>{
         'index': _watchdogIndex,
         'source': _watchdogSource,
@@ -1468,6 +1537,38 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'hwdecRequested': _watchdogHwdec,
       'hwdecFallback': canHwdecFallback,
     });
+    // B 站条目先走一次「重取 playurl」兜底：首帧拿不到经常是签名地址过期/
+    // 换 CDN，重开同一条比整实例重建更对症。按 key 只重试一次；重开后的
+    // 看门狗再超时就直接跳下一条，不在这里做第二次重试。
+    final watchdogIndex = _watchdogIndex;
+    final biliEntry = watchdogIndex >= 0 && watchdogIndex < _queue.length
+        ? _queue[watchdogIndex]
+        : null;
+    if (biliEntry != null && biliEntry.isBili) {
+      final key = biliEntry.key;
+      _cancelFirstFrameWatchdog();
+      _completionArmed = false;
+      if (_biliPlayurlRetried.add(key)) {
+        DiagProbe.event('bili-firstframe-retry', <String, Object?>{
+          'index': watchdogIndex,
+          'attempt': 1,
+          'sinceOpenMs': sinceOpenMs,
+          'key': key,
+          'source': _watchdogSource,
+          'hwdec': _watchdogHwdec,
+          'positionMs': _player.positionInMilliseconds,
+          'videoWidth': _mpvVideoWidth(),
+          'textureId': _player.videoController?.id.value,
+          'budgetMs': _biliFirstFrameBudgetMs,
+        });
+        unawaited(
+          _retryBiliWithFreshPlayurl(watchdogIndex, sinceOpenMs),
+        );
+        return;
+      }
+      unawaited(_skipToNext('bili-firstframe-retry-failed'));
+      return;
+    }
     if (canHwdecFallback &&
         _fallbackToAutoCopy(
           reason: 'no-first-frame',
@@ -1531,6 +1632,146 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     });
     unawaited(_open(index, source: 'hwdec-fallback', force: true));
     return true;
+  }
+
+  /// B 站首帧超时的第一层兜底：清掉预热缓存，重新解析 playurl 后重开一次。
+  ///
+  /// 原始 open 已经等过一轮 2800ms，这里不再给完整预算：把「原始 open 起点
+  /// + [_biliFirstFrameBudgetMs]」作为截止时刻传给重开的看门狗，6S 这类
+  /// 老机型总窗口约 12s，其它机型约 8s。重开还失败就跳下一条。
+  Future<void> _retryBiliWithFreshPlayurl(int index, int sinceOpenMs) async {
+    if (_disposed || _leaving || _opening || _recovering) return;
+    if (_pendingOpenIndex != null) return;
+    if (index != _index || index < 0 || index >= _queue.length) return;
+    if (!_queue[index].isBili) return;
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch -
+        sinceOpenMs +
+        _biliFirstFrameBudgetMs;
+    _biliRetryOpenSucceeded = false;
+    // 重开前先停音频；_open 会在 setDataSource 前释放旧 texture，
+    // 避免「画面已经黑了、声音还在播」。
+    try {
+      await _player.pause(notify: false);
+    } catch (_) {}
+    if (!mounted || _disposed || _leaving) return;
+    // 停音频的 await 期间用户可能已经点了别的条目/触发了自愈；此时让路，
+    // 不能用 force 把用户的选择顶掉。
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    await _open(
+      index,
+      source: 'bili-retry',
+      force: true,
+      uncachedResolve: true,
+      firstFrameDeadlineMs: deadlineMs,
+    );
+    if (!mounted || _disposed || _leaving) return;
+    // 用户在这期间点了别的条目，优先听用户的，不要把它跳掉。
+    // `_opening` 为 true 说明 finally 补跳的 pending open 已经接手。
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    if (_index != index) return;
+    if (!_biliRetryOpenSucceeded) {
+      await _skipToNext('bili-retry-open-failed');
+    }
+  }
+
+  /// 统一的「这条救不回来，跳下一条」出口。
+  ///
+  /// 与 [_advance] 共用 [_nextIndex]：随机模式沿用牌堆/已播去重，顺序与
+  /// 循环模式照旧。切之前先停音频，再交给 [_open] 释放旧 texture，
+  /// 不会出现「画面切黑、声音还在播」。
+  Future<bool> _skipToNext(String reason) async {
+    if (_disposed || _leaving || _queue.isEmpty) return false;
+    if (_shuffle) await _shuffleRestore;
+    if (!mounted || _disposed || _leaving) return false;
+    // 等待牌堆恢复期间用户可能已经发起了新的 open；此时让用户的选择优先，
+    // 不要再排一个 skip 把 pending 覆盖掉。
+    if (_opening || _recovering || _pendingOpenIndex != null) return false;
+    if (_skipStreak + 1 >= _maxConsecutiveSkip) {
+      _skipStreak = _maxConsecutiveSkip;
+      _haltAfterSkipLimit(reason);
+      return false;
+    }
+    final fromIndex = _index;
+    final mode = _shuffle ? 'shuffle' : _repeat.name;
+    final next = _nextIndex(auto: true);
+    final attempt = _skipStreak + 1;
+    if (next == null || next == _index) {
+      DiagProbe.event('item-skip', <String, Object?>{
+        'reason': reason,
+        'fromIndex': fromIndex,
+        'toIndex': null,
+        'mode': mode,
+        'attempt': attempt,
+        'result': _queue.length <= 1 ? 'single-item' : 'no-next',
+      });
+      if (mounted) {
+        setState(
+          () => _error = _queue.length <= 1
+              ? '没有可播放的下一条'
+              : '当前播放模式下没有下一条',
+        );
+      }
+      return false;
+    }
+    _skipStreak++;
+    _cancelFirstFrameWatchdog();
+    _completionArmed = false;
+    DiagProbe.event('item-skip', <String, Object?>{
+      'reason': reason,
+      'fromIndex': fromIndex,
+      'toIndex': next,
+      'mode': mode,
+      'attempt': attempt,
+      'key': _queue[fromIndex].key,
+      'nextKey': _queue[next].key,
+    });
+    try {
+      await _player.pause(notify: false);
+    } catch (_) {}
+    if (!mounted || _disposed || _leaving) return false;
+    if (_opening || _recovering || _pendingOpenIndex != null) return false;
+    await _open(next, source: 'skip');
+    if (!mounted || _disposed || _leaving) return false;
+    if (_index != next || _opening || _recovering || _pendingOpenIndex != null) {
+      return true;
+    }
+    // 跳过后的这条连地址都没解析出来：接着跳，计数与停在 3 条的约束
+    // 由 [_skipToNext] 自身保证。
+    if (_openMediaMissing && _error != null) {
+      return _skipToNext('skip-resolve-failed');
+    }
+    return true;
+  }
+
+  /// 连续 [_maxConsecutiveSkip] 条都失败：停下、停音频并给可见提示。
+  void _haltAfterSkipLimit(String reason) {
+    _cancelFirstFrameWatchdog();
+    _completionArmed = false;
+    final mode = _shuffle ? 'shuffle' : _repeat.name;
+    DiagProbe.event('item-skip', <String, Object?>{
+      'reason': reason,
+      'fromIndex': _index,
+      'toIndex': null,
+      'mode': mode,
+      'attempt': _skipStreak,
+      'result': 'stop-after-$_maxConsecutiveSkip',
+    });
+    DiagProbe.event('item-skip-stop', <String, Object?>{
+      'reason': reason,
+      'index': _index,
+      'streak': _skipStreak,
+      'mode': mode,
+    });
+    unawaited(() async {
+      try {
+        await _player.pause(notify: false);
+      } catch (_) {}
+    }());
+    if (!mounted) return;
+    final message = '连续 $_maxConsecutiveSkip 条视频播放失败，已停止自动跳过';
+    setState(() => _error = message);
+    SmartDialog.showToast(message);
   }
 
   /// 整实例重建：dispose 当前 player/texture，重新 getInstance 并挂监听，
@@ -1708,7 +1949,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 解析某一条的播放地址。命中预热结果时直接复用，自动连播不再从零开始
   /// 取 cookie + 解析。
-  Future<QueueMedia?> _resolveMedia(QueueEntry entry) async {
+  Future<QueueMedia?> _resolveMedia(
+    QueueEntry entry, {
+    bool uncached = false,
+  }) async {
+    if (uncached) {
+      // 首帧失败重取时，预热里那条地址可能已经过期，必须清掉再走完整
+      // 解析（B 站会重新请求一次 playurl），不能命中旧的 prefetch。
+      _prefetchKey = null;
+      _prefetchFuture = null;
+      return _resolveMediaUncached(entry);
+    }
     if (_prefetchKey == entry.key) {
       final future = _prefetchFuture;
       _prefetchKey = null;
