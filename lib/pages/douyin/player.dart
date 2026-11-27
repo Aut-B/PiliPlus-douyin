@@ -723,23 +723,22 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
       // 是新纹理，无法判断「换了纹理但没画面」。
       final oldTextureId = _player.videoController?.id.value;
-      // 画中画活跃时绝不能拆纹理，也绝不能复用同一实例换源：原生 PiP 还
-      // 绑着这条 FlutterTexture，换源会让小窗立即黑屏/退出；而共享实例
-      // 换源会连带改掉 B站/PiP 正在用的播放器。直接中止本次切条并留证。
-      if (IOSPipHelper.isActive) {
-        openError = 'pip-active';
-        DiagProbe.event('switch-blocked', <String, Object?>{
-          'source': source,
-          'reason': 'pip-active',
-          'targetIndex': target,
-          'curIndex': fromIndex,
+      // PiP 活跃时不再硬阻断切条：原生 PipSession 会把小窗 surface 留在旧
+      // texture 的最后一帧上（surfaceHold），新实例注册 FlutterTexture 后
+      // 自动 retarget，新首帧到达再解除 hold。唯一前提仍是独占本播放器
+      // 实例——共享单例被别处持有时不能拆，交给下面的检查中止。
+      final pipActive = IOSPipHelper.isActive;
+      if (pipActive) {
+        final allow = _player.canReleaseSolo;
+        DiagProbe.event('pip-switch', <String, Object?>{
+          'allow': allow,
+          'reason': allow ? 'pip-retarget' : 'shared-player',
+          'fromIndex': fromIndex,
+          'toIndex': target,
           'oldTextureId': oldTextureId,
-          'pipEntered': _pipEntered,
+          'pipActive': pipActive,
+          'playerCount': PlPlayerController.playerCount,
         });
-        if (mounted) {
-          setState(() => _error = '画中画使用中，请先关闭小窗再切换');
-        }
-        return;
       }
       // 共享单例被 B站/PiP 持有时不能拆：那会把别人的画面一起换掉。在改
       // _index 之前就判，直接中止本次切换并留证，避免「标题已是下一条、
