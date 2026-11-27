@@ -1260,7 +1260,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Scaffold(
+    // 外层 MainLayout 已用布局 Padding 给整页补过状态栏高度；这里再把页内
+    // MediaQuery 的顶部安全区去掉，避免 Scaffold/AppBar 重复计入一次状态栏
+    // 高度，在 tab 工具栏和状态行之间留下一条 ~状态栏高的空白。
+    return MediaQuery.removePadding(
+      context: context,
+      removeTop: true,
+      child: Scaffold(
       extendBody: true,
       appBar: AppBar(
         // 外层 MainLayout 已按状态栏高度给 body 补过 padding，
@@ -1378,6 +1384,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       // 滑到悬浮导航栏下面，看起来像被压住、点不到。
       // 底栏自己补系统安全区与主界面导航栏高度。
       bottomNavigationBar: _videos.isEmpty ? null : _bottomBar(theme),
+      ),
     );
   }
 
