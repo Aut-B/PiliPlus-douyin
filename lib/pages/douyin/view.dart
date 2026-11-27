@@ -159,6 +159,13 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   bool _syncing = false;
   String _status = '';
 
+  /// 最近一次 WebDAV 同步的平台分布与增量明细。只有当前状态仍是这次同步
+  /// 写下的 [_syncStatusText] 时才展示这两行，避免后续操作覆盖状态后
+  /// 状态区还停在旧的同步结果上。
+  String? _syncChipText;
+  String? _syncDetailText;
+  String? _syncStatusText;
+
   /// 原生一共回传了多少段响应（不等于视频条数）。
   int _rawCount = 0;
 
@@ -246,6 +253,18 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     if (mainBarOffset != null && mainBarOffset.value != 0) {
       mainBarOffset.value = 0;
     }
+  }
+
+  /// 主界面悬浮底栏的收起比例：0 = 完全展开，1 = 完全收起。
+  /// 没有接入主界面（barOffset 为 null）时按展开处理。
+  double _mainBarHiddenFraction() {
+    final mainBarOffset = _mainBarOffset;
+    if (mainBarOffset == null) return 0;
+    return clampDouble(
+      mainBarOffset.value / Style.topBarHeight,
+      0.0,
+      1.0,
+    );
   }
 
   @override
@@ -374,7 +393,15 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
       } else if (_videos.isNotEmpty) {
         text = '$text；本页 ${_videos.length} 条';
       }
-      setState(() => _status = text);
+      final remoteText = result.remote < 0 ? '远端无文件' : '远端 ${result.remote}';
+      setState(() {
+        _status = text;
+        _syncStatusText = text;
+        _syncChipText = '抖音 ${result.douyin} / TikTok ${result.tiktok}';
+        _syncDetailText =
+            '$remoteText · new ${result.added} / skipped ${result.skipped}'
+            ' / deleted ${result.deleted}';
+      });
       if (!silent) SmartDialog.showToast(text);
     } catch (e) {
       if (!mounted) return;
@@ -1468,83 +1495,113 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 同步/缓存状态 chip：允许两行，长文案（远端条数、失败原因）不截断。
+  /// 同步/缓存状态区：第一行是带底色的 chip（平台分布或当前状态），
+  /// 第二行是同步增量明细 + 独立的清缓存按钮。窄屏（6S）下两行各自
+  /// 换行，按钮不再和明细挤在同一行。
   Widget _statusBar(ThemeData theme) {
     final scheme = theme.colorScheme;
     final busy = _syncing || _caching || _addingLink;
     final text = _status.trim().isEmpty ? '就绪' : _status.trim();
+    final hasSyncDetail = _syncStatusText == text && _syncDetailText != null;
+    final chipText = hasSyncDetail ? _syncChipText! : text;
+    final detailText = hasSyncDetail ? _syncDetailText : null;
+    final showDetailRow =
+        detailText != null || (_caching && _cacheTotal > 0) || _cacheBytes > 0;
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 4, 10, 0),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
-        decoration: BoxDecoration(
-          color: scheme.secondaryContainer.withValues(alpha: 0.6),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: scheme.outlineVariant.withValues(alpha: 0.6),
-          ),
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (busy)
-              SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.8,
-                  color: scheme.primary,
-                ),
-              )
-            else
-              Icon(
-                Icons.info_outline,
-                size: 14,
-                color: scheme.onSecondaryContainer,
-              ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: Text(
-                text,
-                maxLines: 2,
-                overflow: TextOverflow.clip,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: scheme.onSecondaryContainer,
-                  height: 1.3,
-                ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: scheme.outlineVariant.withValues(alpha: 0.6),
               ),
             ),
-            if (_caching && _cacheTotal > 0)
-              Padding(
-                padding: const EdgeInsets.only(right: 6),
-                child: Text(
-                  '$_cacheDone/$_cacheTotal',
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: scheme.primary,
-                    fontWeight: FontWeight.w600,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (busy)
+                  SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.8,
+                      color: scheme.primary,
+                    ),
+                  )
+                else
+                  Icon(
+                    Icons.info_outline,
+                    size: 14,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    chipText,
+                    maxLines: 2,
+                    overflow: TextOverflow.clip,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      height: 1.3,
+                    ),
                   ),
                 ),
-              ),
-            if (_cacheBytes > 0)
-              TextButton(
-                onPressed: _caching ? null : _clearCache,
-                style: TextButton.styleFrom(
-                  visualDensity: VisualDensity.compact,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  minimumSize: const Size(0, 22),
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                ),
-                child: Text(
-                  '清缓存 ${_fmtBytes(_cacheBytes)}',
-                  maxLines: 1,
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: scheme.primary,
+              ],
+            ),
+          ),
+          if (showDetailRow) ...[
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    detailText ?? '',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      height: 1.3,
+                    ),
                   ),
                 ),
-              ),
+                if (_caching && _cacheTotal > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Text(
+                      '$_cacheDone/$_cacheTotal',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: scheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                if (_cacheBytes > 0)
+                  TextButton(
+                    onPressed: _caching ? null : _clearCache,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      minimumSize: const Size(0, 22),
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                    ),
+                    child: Text(
+                      '清缓存 ${_fmtBytes(_cacheBytes)}',
+                      maxLines: 1,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: scheme.primary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ],
-        ),
+        ],
       ),
     );
   }
@@ -1596,6 +1653,16 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   Widget _empty(ThemeData theme) {
     final scheme = theme.colorScheme;
     final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
+    return Obx(
+      () => _emptyBody(
+        theme,
+        scheme,
+        safeBottom + _mainBottomNavHeight * (1 - _mainBarHiddenFraction()) + 16,
+      ),
+    );
+  }
+
+  Widget _emptyBody(ThemeData theme, ColorScheme scheme, double bottomPadding) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final minHeight = constraints.maxHeight > 32
@@ -1608,7 +1675,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             20,
             16,
             20,
-            safeBottom + _mainBottomNavHeight + 16,
+            bottomPadding,
           ),
           child: ConstrainedBox(
             constraints: BoxConstraints(minHeight: minHeight),
@@ -2145,13 +2212,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           ),
         ),
       ),
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(
-          12,
-          6,
-          12,
-          safeBottom + _mainBottomNavHeight + 2,
-        ),
+      child: _bottomBarPadding(
+        safeBottom: safeBottom,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
@@ -2269,6 +2331,29 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ],
           ],
         ),
+      ),
+    );
+  }
+
+  /// 操作条底部留白跟随主界面悬浮底栏的收起进度：展开时留满
+  /// [_mainBottomNavHeight]，收起时只留安全区 + 2，列表可以贴到底。
+  Widget _bottomBarPadding({
+    required double safeBottom,
+    required Widget child,
+  }) {
+    return Obx(
+      () => AnimatedPadding(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+        padding: EdgeInsets.fromLTRB(
+          12,
+          6,
+          12,
+          safeBottom +
+              _mainBottomNavHeight * (1 - _mainBarHiddenFraction()) +
+              2,
+        ),
+        child: child,
       ),
     );
   }
