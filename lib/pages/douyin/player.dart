@@ -275,6 +275,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   int _watchdogSession = -1;
   int _watchdogIndex = -1;
   String _watchdogSource = 'auto';
+  /// 这次 open 实际请求的 hwdec，供看门狗判断还能不能回滚 auto-copy。
+  String _watchdogHwdec = _hwdec;
+  /// 这次看门狗对应的条目 key；回滚只认当前这一条。
+  String _watchdogKey = '';
   int _watchdogStartedAtMs = 0;
   bool _watchdogGraceUsed = false;
   int _watchdogOpenBusyRetries = 0;
@@ -283,6 +287,23 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   bool _recovering = false;
   int _autoRecoverCount = 0;
   int _recoverStreak = 0;
+
+  /// 开流初期观察 hwdec-current 的节拍器。首帧出现或超窗就停，
+  /// 不让同步 FFI 读属性变成常驻采样。
+  Timer? _hwdecProbeTimer;
+  int _hwdecProbeStartedAtMs = 0;
+  int _hwdecNoSinceMs = 0;
+
+  /// 已经回滚成 auto-copy 的条目 key。
+  ///
+  /// 按条目 sticky：同一条只回滚一次（含后续自愈重建、再次播到同一条），
+  /// 换到别的条目仍从直通 auto 起，绝不会在 auto / auto-copy 之间来回循环。
+  /// 用户在播放列表里手动重选该条会清掉标记，允许重新尝试直通。
+  final Set<String> _hwdecFallbackKeys = <String>{};
+
+  /// 回滚标记上限：连播几百条也不让这个 Set 无限长；超了淘汰最早的一条，
+  /// 被淘汰的条目下次播到会重新尝试一次 auto（仍只回滚一次，不会循环）。
+  static const int _maxHwdecFallbackKeys = 200;
 
   /// 自动连播（复用同一 texture）累计条数；每 [_autoRebuildInterval] 条
   /// 主动整实例重建一次，避免 texture/解码器长期复用累积劣化。
@@ -315,17 +336,26 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 能恢复，说明重建有效；这里提前做，防止累积到黑屏才被动救。
   static const int _autoRebuildInterval = 20;
 
-  /// 抖音 / TikTok 短视频显式走 VideoToolbox（auto-copy）。
+  /// 抖音 / TikTok 短视频默认走直通硬解（auto → VideoToolbox 零拷贝）。
   ///
-  /// 全局硬解开关被用户关掉时也不能退化成软解：6S 上软解这些缓存视频一样卡，
-  /// 表现和「网络慢」几乎一样。B 站播放页不传这个覆盖，行为保持不变。
+  /// 之前写死 auto-copy（硬解带 CPU 拷贝），6S 上实测 p10 只有 0.16x，
+  /// 表现和「网络慢」几乎一样；B 站播放页传的就是 auto，这里对齐。
+  /// 个别片源/机型直通解不出画面时由 [_hwdecFallback] 兜底，不在这里写死。
+  static const String _hwdec = 'auto';
+
+  /// 直通硬解的保底：回到原来的「硬解 + CPU 拷贝」。
   ///
-  /// 不改成 `videotoolbox`：那是「只用 VT、失败就报错」，个别 10bit / 不常见
-  /// pixfmt 的 TikTok 会直接放不出来；auto-copy 调到的仍是 VT，失败时还能
-  /// 回落软解保画面。diag 里 hwdec-current=videotoolbox 占绝大多数，掉到 no
-  /// 的样本集中在同一个 texture 连播多条的时段，说明问题在纹理/解码器复用，
-  /// 不在解码器选择本身。
-  static const String _hwdec = 'auto-copy';
+  /// 只在首帧看门狗超时，或 hwdec-current 提前掉到 `no`（回落软解）并持续
+  /// 超过 [_hwdecNoFallbackMs] 时，对同一条 open 回滚一次。回滚后行为与
+  /// 改前版本一致：`videotoolbox` 解不出来时还能回落软解保画面。
+  static const String _hwdecFallback = 'auto-copy';
+
+  /// 开流初期读 hwdec-current 的节拍与观察窗口。
+  static const int _hwdecProbeIntervalMs = 600;
+  static const int _hwdecProbeWindowMs = 12000;
+
+  /// `hwdec-current` 连续为 `no` 这么久才回滚，避开解码器初始化的一两拍。
+  static const int _hwdecNoFallbackMs = 1200;
 
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
@@ -450,6 +480,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _chromeTimer?.cancel();
     _commentsSession++;
     _firstFrameWatchdog?.cancel();
+    _cancelHwdecProbe();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
     // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
@@ -665,6 +696,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     var beganOpen = false;
     try {
       final entry = _queue[target];
+      // 同一条如果已经因硬解失败回滚过，后续 open（含自愈重建）沿用
+      // auto-copy；换到别的条目仍从直通 auto 起。
+      final hwdec = _effectiveHwdecFor(entry.key);
       // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
       // 是新纹理，无法判断「换了纹理但没画面」。
       final oldTextureId = _player.videoController?.id.value;
@@ -709,6 +743,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         key: entry.key,
         oldTextureId: oldTextureId,
         source: source,
+        hwdecRequested: hwdec,
       );
       beganOpen = true;
       DiagProbe.openPhase('resolve');
@@ -757,7 +792,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'key': entry.key,
         'local': media.isLocal,
         'host': Uri.tryParse(media.url)?.host,
-        'hwdecRequested': _hwdec,
+        'hwdecRequested': hwdec,
       });
       // 切条必须在开新流前把旧 Player 连同 FlutterTexture 一起拆掉。
       //
@@ -891,9 +926,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         autoplay: true,
         isVertical: true,
         isLocalFile: media.isLocal,
-        // 6S 上这些短视频靠 VideoToolbox 才能顺畅；本地缓存同样要解码，
-        // 所以显式打开，不再依赖全局硬解开关。
-        hwdecOverride: _hwdec,
+        // 抖音 / TikTok 默认走直通硬解（auto），只有已回滚过的条目才用
+        // auto-copy；本地缓存同样要解码，显式打开，不依赖全局硬解开关。
+        hwdecOverride: hwdec,
         enableHardwareAcceleration: true,
         // 本地文件时长已知，直接告诉播放器，省掉一次探测。
         duration: media.isLocal && entry.durationMs > 0
@@ -954,6 +989,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         session: session,
         index: target,
         source: source,
+        hwdec: hwdec,
       );
       _pushProgress(force: true);
       DiagProbe.openPhase('played');
@@ -1159,29 +1195,142 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 首帧判定：起播位置在走，且 mpv 已经识别出视频轨。
   ///
-  /// 会做一次同步 FFI 读取，只允许在看门狗（低频）里调用，不能放进
-  /// 每秒多次的 position 回调。
+  /// 会做一次同步 FFI 读取，只允许在看门狗和短窗口 hwdec 探针（低频）里
+  /// 调用，不能放进每秒多次的 position 回调。
   bool _hasFirstFrameNow() {
     if (_player.dataStatus.value != DataStatus.loaded) return false;
     if (_player.positionInMilliseconds <= 0) return false;
     return (_mpvVideoWidth() ?? 0) > 0;
   }
 
+  /// 当前条目实际应该请求的 hwdec。
+  ///
+  /// 只有「这一条已经回滚过」时才用 auto-copy；其余一律直通 auto。
+  String _effectiveHwdecFor(String key) {
+    if (key.isEmpty) return _hwdec;
+    return _hwdecFallbackKeys.contains(key) ? _hwdecFallback : _hwdec;
+  }
+
+  String? _readHwdecCurrent() {
+    try {
+      final raw = _player.videoPlayerController?.getProperty('hwdec-current');
+      if (raw == null || raw.isEmpty) return null;
+      return raw;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 起播后短窗口内观察 hwdec-current；已经请求 auto-copy 的 open 不再观察。
+  void _armHwdecProbe(String hwdec) {
+    _cancelHwdecProbe();
+    if (hwdec == _hwdecFallback) return;
+    _hwdecProbeStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _hwdecProbeTimer = Timer.periodic(
+      const Duration(milliseconds: _hwdecProbeIntervalMs),
+      (_) => _pollHwdecCurrent(),
+    );
+  }
+
+  void _cancelHwdecProbe() {
+    _hwdecProbeTimer?.cancel();
+    _hwdecProbeTimer = null;
+    _hwdecProbeStartedAtMs = 0;
+    _hwdecNoSinceMs = 0;
+  }
+
+  /// hwdec-current 掉到 `no` 且持续超过 [_hwdecNoFallbackMs] 就回滚一次。
+  ///
+  /// 探针只在两种情况下收工：读到真实硬件解码器（videotoolbox / \*-copy），
+  /// 或 [_hwdecProbeWindowMs] 观察窗口到期。首帧出现不算数——直通失败但
+  /// mpv 回落软解时画面照样能出，这正是要回滚 auto-copy 的场景。
+  /// 暂停 / 后台 / PiP / buffering 一律放过，避免把用户主动暂停或小窗正在
+  /// 用的纹理拆掉。
+  void _pollHwdecCurrent() {
+    if (_disposed || _leaving) {
+      _cancelHwdecProbe();
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_hwdecProbeStartedAtMs == 0 ||
+        now - _hwdecProbeStartedAtMs > _hwdecProbeWindowMs) {
+      _cancelHwdecProbe();
+      return;
+    }
+    if (_opening || _recovering || _pendingOpenIndex != null) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_appPaused || IOSPipHelper.isActive || _player.isBuffering.value) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    // 用户主动暂停在首帧之前不是解码问题；和看门狗一样让路，
+    // 恢复播放后 _togglePlay 会重新挂看门狗与探针。
+    if (!_player.playerStatus.isPlaying) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_player.dataStatus.value != DataStatus.loaded) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    final current = _readHwdecCurrent();
+    // 落到真实硬件解码器就说明直通成功，停掉探针，别给主 isolate 添读操作。
+    if (_isHwdecHardware(current)) {
+      _cancelHwdecProbe();
+      return;
+    }
+    // 还没定下来（null / auto 之类的请求名）就继续等。
+    if (current != 'no') {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_hwdecNoSinceMs == 0) {
+      _hwdecNoSinceMs = now;
+      return;
+    }
+    if (now - _hwdecNoSinceMs < _hwdecNoFallbackMs) return;
+    _fallbackToAutoCopy(
+      reason: 'hwdec-current-no',
+      index: _watchdogIndex,
+      source: _watchdogSource,
+      elapsedMs: now - _hwdecProbeStartedAtMs,
+      elapsedFrom: 'hwdec-probe',
+    );
+  }
+
+  /// hwdec-current 是否已经是真实硬件解码器。
+  ///
+  /// mpv 在解码器定下来之前可能回 `auto` / `auto-safe` 这类请求名，这些
+  /// 都不算成功，继续观察；`no` 是回落软解，交给回滚逻辑。
+  static bool _isHwdecHardware(String? current) {
+    if (current == null || current.isEmpty) return false;
+    if (current == 'no' || current.startsWith('auto')) return false;
+    return true;
+  }
+
   void _armFirstFrameWatchdog({
     required int session,
     required int index,
     required String source,
+    required String hwdec,
   }) {
     _cancelFirstFrameWatchdog();
     _watchdogSession = session;
     _watchdogIndex = index;
     _watchdogSource = source;
+    _watchdogHwdec = hwdec;
+    _watchdogKey = index >= 0 && index < _queue.length
+        ? _queue[index].key
+        : '';
     _watchdogStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     _watchdogOpenBusyRetries = 0;
     _firstFrameWatchdog = Timer(
       const Duration(milliseconds: _firstFrameWatchdogMs),
       () => _onFirstFrameWatchdog(session),
     );
+    _armHwdecProbe(hwdec);
   }
 
   void _cancelFirstFrameWatchdog() {
@@ -1189,6 +1338,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _firstFrameWatchdog = null;
     _watchdogGraceUsed = false;
     _watchdogOpenBusyRetries = 0;
+    _cancelHwdecProbe();
   }
 
   void _onFirstFrameWatchdog(int session) {
@@ -1279,6 +1429,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       return;
     }
     final width = _player.videoPlayerController?.state.width ?? 0;
+    // 直通硬解首帧超时：先回滚 auto-copy 重开同一条一次，仍不行才走原来
+    // 的整实例自愈。回滚按条目 key 只做一次，不会在两种模式间循环。
+    final canHwdecFallback =
+        _watchdogHwdec != _hwdecFallback && _watchdogKey.isNotEmpty;
     DiagProbe.event('first-frame-watchdog-timeout', <String, Object?>{
       'index': _watchdogIndex,
       'source': _watchdogSource,
@@ -1290,13 +1444,73 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'isBuffering': _player.isBuffering.value,
       'dataStatus': _player.dataStatus.value.name,
       'textureId': _player.videoController?.id.value,
+      'hwdec': _readHwdecCurrent(),
+      'hwdecRequested': _watchdogHwdec,
+      'hwdecFallback': canHwdecFallback,
     });
+    if (canHwdecFallback &&
+        _fallbackToAutoCopy(
+          reason: 'no-first-frame',
+          index: _watchdogIndex,
+          source: _watchdogSource,
+          elapsedMs: sinceOpenMs,
+          elapsedFrom: 'watchdog-open',
+        )) {
+      return;
+    }
     unawaited(
       _recoverNoFirstFrame(
         sinceOpenMs: sinceOpenMs,
         source: _watchdogSource,
       ),
     );
+  }
+
+  /// 把当前这一条用 auto-copy 重开一次；返回 true 表示已经发起回滚 open。
+  ///
+  /// 这是唯一一次回滚：[_hwdecFallbackKeys] 记下条目 key 之后，后续任何
+  /// open（含首帧自愈重建）都直接沿用 auto-copy，不会再来回切换。
+  bool _fallbackToAutoCopy({
+    required String reason,
+    required int index,
+    required String source,
+    required int elapsedMs,
+    required String elapsedFrom,
+  }) {
+    if (_disposed || _leaving || _opening || _recovering) return false;
+    if (_pendingOpenIndex != null) return false;
+    if (IOSPipHelper.isActive) return false;
+    // 单例被 B站/PiP 持有时 _open 会在 pre-release 阶段中止；先判掉，
+    // 免得留下一条「并未真正发生」的回滚日志、还把该条永久降级。
+    if (!_player.canReleaseSolo) return false;
+    if (index < 0 || index >= _queue.length || index != _index) return false;
+    final key = _queue[index].key;
+    if (key.isEmpty) return false;
+    final from = _effectiveHwdecFor(key);
+    if (from == _hwdecFallback) return false;
+    if (_hwdecFallbackKeys.length >= _maxHwdecFallbackKeys) {
+      _hwdecFallbackKeys.remove(_hwdecFallbackKeys.first);
+    }
+    _hwdecFallbackKeys.add(key);
+    _cancelFirstFrameWatchdog();
+    // 同一条要整实例重开，连播计数从 0 重新算。
+    _autoPlaysSinceRebuild = 0;
+    DiagProbe.event('hwdec-fallback', <String, Object?>{
+      'reason': reason,
+      'from': from,
+      'to': _hwdecFallback,
+      'elapsedMs': elapsedMs,
+      'elapsedFrom': elapsedFrom,
+      'index': index,
+      'key': key,
+      'source': source,
+      'hwdecCurrent': _readHwdecCurrent(),
+      'firstFrameSeen': _firstFrameSeen,
+      'positionMs': _player.positionInMilliseconds,
+      'textureId': _player.videoController?.id.value,
+    });
+    unawaited(_open(index, source: 'hwdec-fallback', force: true));
+    return true;
   }
 
   /// 整实例重建：dispose 当前 player/texture，重新 getInstance 并挂监听，
@@ -1831,6 +2045,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         targetIndex: target,
       );
       if (!healthy && !_opening && !_recovering) {
+        // 用户手动点这一条救场：清掉之前的回滚标记，重新从直通 auto 起。
+        _hwdecFallbackKeys.remove(key);
         _recoverStreak = 0;
         unawaited(
           _recoverNoFirstFrame(sinceOpenMs: 0, source: 'playlist-select'),
@@ -1838,6 +2054,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       return;
     }
+    // 用户手动重选这一条，视为重新尝试直通硬解：一次网络抖动导致的
+    // 看门狗超时不应把该条永久降级。
+    _hwdecFallbackKeys.remove(key);
     // 正在解析/加载上一条时也不能丢弃这次点击。_open 会把目标排队，并把
     // 在途会话作废；列表页已经关了，用户点了就必须最终切过去。
     unawaited(_open(target, source: 'playlist-select'));
@@ -1861,6 +2080,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         session: _watchdogSession,
         index: _watchdogIndex,
         source: _watchdogSource,
+        hwdec: _watchdogHwdec,
       );
     }
     _pushProgress(force: true);
@@ -4035,7 +4255,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           _sheetTile(
             icon: Icons.settings_suggest_outlined,
             title: '请求解码器',
-            subtitle: _hwdec,
+            subtitle: _queue.isEmpty ? _hwdec : _effectiveHwdecFor(_current.key),
           ),
           _sheetTile(
             icon: Icons.memory_outlined,

@@ -528,6 +528,9 @@ abstract final class DiagProbe {
     required String key,
     int? oldTextureId,
     String source = 'auto',
+    // 这次 open 实际请求的 hwdec（auto / auto-copy），写进 open 事件，
+    // 方便对比直通与回滚前后。
+    String? hwdecRequested,
   }) {
     if (!kDiagEnabled) return;
     final sw = Stopwatch()..start();
@@ -559,6 +562,7 @@ abstract final class DiagProbe {
       oldTextureId: oldTextureId,
       startPositionMs: _asInt(snap['positionMs']),
       dropBaseline: null,
+      hwdecRequested: hwdecRequested,
     );
     _tracker = tracker;
     _append('open-start', <String, Object?>{
@@ -569,6 +573,7 @@ abstract final class DiagProbe {
       'oldTextureId': oldTextureId,
       'positionMs': snap['positionMs'],
       'dataStatus': snap['dataStatus'],
+      'hwdecRequested': hwdecRequested,
     });
     _passiveUiBlock('beginOpen', sw);
     _rearmOpenTimer(_openFastPollMs);
@@ -857,6 +862,7 @@ abstract final class DiagProbe {
           'videoParamsW': firstWidth,
           'videoCodec': firstCodec,
           'hwdec': firstHwdec,
+          'hwdecRequested': tracker.hwdecRequested,
         });
       }
       final elapsed = now - tracker.startedAt;
@@ -885,6 +891,8 @@ abstract final class DiagProbe {
             'positionMs': position,
             'videoParamsW': liveWidth,
             'textureId': textureId,
+            'hwdec': _readLiveKey(player, 'hwdec-current').$1,
+            'hwdecRequested': tracker.hwdecRequested,
           });
         } else if (playingConfirmed) {
           // 正在播却读不到画面参数，才是真正的「有声音没画面」。
@@ -1257,6 +1265,7 @@ final class _OpenTracker {
     required this.oldTextureId,
     required this.startPositionMs,
     required this.dropBaseline,
+    this.hwdecRequested,
   });
 
   final int seq;
@@ -1266,6 +1275,7 @@ final class _OpenTracker {
   final int startedAt;
   final int? oldTextureId;
   final int? startPositionMs;
+  final String? hwdecRequested;
   int? dropBaseline;
 
   int? newTextureId;
