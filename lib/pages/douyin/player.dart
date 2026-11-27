@@ -227,6 +227,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
   Timer? _chromeTimer;
 
+  /// Android PiP 精简布局：只留视频画面和一行标题。
+  /// 只在原生进入/退出回调时 setState 一次，PiP 期间不做逐帧重绘。
+  bool _isPipLayout = false;
+
+  /// 进入 PiP 前的控件可见状态，退出时原样恢复。
+  bool _chromeVisibleBeforePip = true;
+
+  /// 上次下发的 PiP 遥控键状态签名，避免同一状态重复走 JNI。
+  int? _pipActionSig;
+
   /// 播放页内嵌面板。评论 / 画质 / 更多都走这一层，不再开 Navigator 路由：
   /// 这条页面是 `Get.to` 推进来的，`showModalBottomSheet` / `PopupMenuButton`
   /// 生成的 overlay 在 iOS 真机上点开看不到（表现为「按钮按不动」）。
@@ -485,6 +495,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
     _player.textureSource = 'douyin';
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.setPictureInPictureModeListener(
+        _onAndroidPipModeChanged,
+      );
+      // 页面若是在小窗里重建的，第一次 build 就要用精简布局。
+      _isPipLayout = PiliAndroidHelper.isPipMode;
+    }
     _syncFrameConsumer('init');
     // B 站首帧预算要按机型分档（6S 12s / 其它 8s）；这里只问一次原生内存，
     // 之后同步读 ShortVideoPerf.lowMemory，不在看门狗路径上 await。
@@ -582,6 +599,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _disarmPipAutoEnter('shutdown');
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
+    }
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.clearPictureInPictureModeListener(
+        _onAndroidPipModeChanged,
+      );
     }
     _stopPipTicker();
     _prefetchKey = null;
@@ -2042,6 +2064,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pushProgress(force: true);
     _publishPipState();
     _publishBackgroundState(status: status);
+    _syncAndroidPipActions();
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
       if (_player.dataStatus.value != DataStatus.loaded) return;
@@ -2359,6 +2382,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pushProgress(force: true);
     _publishPipState();
     _publishBackgroundState();
+    _syncAndroidPipActions();
     if (_player.playerStatus.isPlaying) {
       _armPipAutoEnter('toggle-play');
     } else {
@@ -2403,6 +2427,59 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     unawaited(_pushPipLiteMode());
     // 显式带上 position：进入 PiP 必须强制下发一次，不能命中「状态未变」跳过。
     _publishPipState(_player.positionInMilliseconds);
+  }
+
+  /// 原生 PiP 进入/退出回调：只切换一次布局，并同步小窗遥控键。
+  void _onAndroidPipModeChanged() {
+    if (!mounted || _disposed) return;
+    final isPip = PiliAndroidHelper.isPipMode;
+    if (isPip == _isPipLayout) return;
+    if (isPip) {
+      _chromeVisibleBeforePip = _chromeVisible;
+      _chromeTimer?.cancel();
+      _chromeTimer = null;
+      setState(() => _isPipLayout = true);
+      _syncAndroidPipActions(force: true);
+    } else {
+      final restoreChrome = _chromeVisibleBeforePip;
+      setState(() {
+        _isPipLayout = false;
+        _chromeVisible = restoreChrome;
+      });
+      _pipActionSig = null;
+      if (restoreChrome) _scheduleChromeHide();
+    }
+    DiagProbe.event('android-pip-layout', <String, Object?>{
+      'pip': isPip,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'textureId': _player.videoController?.id.value,
+    });
+  }
+
+  /// 小窗里的播放/暂停/快进键要和真实播放状态一致。
+  /// 只在 PiP 中、签名变化或显式 force 时下发，避免重复 JNI。
+  void _syncAndroidPipActions({bool force = false}) {
+    if (!Platform.isAndroid || !_isPipLayout) return;
+    final isLive = _player.isLive;
+    final isPlaying = _player.playerStatus.isPlaying;
+    final sig = Object.hash(isLive, isPlaying);
+    if (!force && sig == _pipActionSig) return;
+    _pipActionSig = sig;
+    try {
+      PiliAndroidHelper.updatePipActions(
+        isLive: isLive,
+        isPlaying: isPlaying,
+      );
+      DiagProbe.event('android-pip-actions', <String, Object?>{
+        'isLive': isLive,
+        'isPlaying': isPlaying,
+      });
+    } catch (error) {
+      DiagProbe.event('android-pip-actions', <String, Object?>{
+        'ok': false,
+        'error': '$error',
+      });
+    }
   }
 
   Future<void> _syncPipTickerAfterEnter() async {
@@ -3020,6 +3097,37 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   Widget build(BuildContext context) {
     final entry = _current;
     final viewPadding = MediaQuery.viewPaddingOf(context);
+    // PiP 精简布局：系统小窗只有视频画面和一行标题，不构建底栏/顶栏/
+    // 边缘手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
+    if (_isPipLayout) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(child: _video()),
+            if (entry.title.isNotEmpty)
+              Positioned(
+                left: 12,
+                right: 12,
+                bottom: viewPadding.bottom + 8,
+                child: Text(
+                  entry.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    shadows: <Shadow>[
+                      Shadow(blurRadius: 4, color: Colors.black54),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+    }
     // 收紧后的栏高只留刚够用的空间；系统字号放大到 1.6 时标题和时间行
     // 会变高，这里按比例补回一点，避免底栏按钮被挤出屏幕。
     final double textScale = MediaQuery.textScalerOf(context).scale(1.0);
@@ -3976,12 +4084,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 只挂在视频层的 onTap 上。视频层和控件条在几何上不重叠，所以点按钮
   /// 不会顺带把控件收起来（B 站播放页那套是整屏一层手势，这里刻意不这么写）。
   void _toggleChrome() {
+    if (_isPipLayout) return;
     setState(() => _chromeVisible = !_chromeVisible);
     _scheduleChromeHide();
   }
 
   /// 控件显示后 4 秒自动收起。用户又点一下可以立刻再收。
   void _scheduleChromeHide() {
+    if (_isPipLayout) return;
     _chromeTimer?.cancel();
     if (!_chromeVisible) return;
     _chromeTimer = Timer(const Duration(seconds: 4), () {

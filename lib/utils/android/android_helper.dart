@@ -11,6 +11,10 @@ import 'package:jni/jni.dart';
 abstract final class PiliAndroidHelper {
   static final isPipAvailable = AndroidHelper.isPipAvailable;
 
+  /// 原生 PiP 状态。MainActivity 在回调里先写静态字段再通知 Dart，
+  /// 所以这里读到的一定是本次回调对应的值。
+  static bool get isPipMode => Platform.isAndroid && AndroidHelper.isPipMode;
+
   static void biliSendCommAntifraud(
     int action,
     int oid,
@@ -87,6 +91,68 @@ abstract final class PiliAndroidHelper {
   @pragma('vm:prefer-inline')
   static void disableAutoEnterPip() =>
       AndroidHelper.disableAutoEnterPip(PlatformDispatcher.instance.engineId!);
+
+  /// 播放/暂停状态变化后同步 PiP 小窗的遥控按键（暂停/播放、快进）。
+  /// 只在已进入 PiP 时由调用方触发，且调用方会按状态签名去重。
+  static void updatePipActions({
+    required bool isLive,
+    required bool isPlaying,
+  }) {
+    if (!Platform.isAndroid || DeviceUtils.sdkInt < 26) return;
+    AndroidHelper.updatePipActions(
+      PlatformDispatcher.instance.engineId!,
+      isLive,
+      isPlaying,
+    );
+  }
+
+  // `onPictureInPictureModeChanged` 是在 bindings.g.dart 生成之后才加的字段，
+  // 生成文件不在本批范围内，这里用 JNI 动态查一次字段并缓存。
+  static JClass? _toDartClass;
+  static JStaticFieldId? _pipModeChangedField;
+  static void Function()? _pipModeListener;
+
+  static JStaticFieldId? _pipModeChangedFieldId() {
+    try {
+      final cls = _toDartClass ??= JClass.forName(
+        r'com/example/piliplus/AndroidHelper$ToDart',
+      );
+      return _pipModeChangedField ??= cls.staticFieldId(
+        'onPictureInPictureModeChanged',
+        r'Ljava/lang/Runnable;',
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 注册/注销原生 PiP 进入退出回调；传 null 注销。
+  ///
+  /// Java 静态字段自己持有 Runnable 引用，注册后即可释放 Dart 句柄，
+  /// 和 controller 里 onUserLeaveHint 的写法保持一致。
+  static void setPictureInPictureModeListener(void Function()? listener) {
+    if (!Platform.isAndroid || DeviceUtils.sdkInt < 26) return;
+    _pipModeListener = listener;
+    final field = _pipModeChangedFieldId();
+    final cls = _toDartClass;
+    if (field == null || cls == null) return;
+    if (listener == null) {
+      field.set(cls, Runnable.type, null);
+      return;
+    }
+    final func = Runnable.implement($Runnable(run: listener));
+    try {
+      field.set(cls, Runnable.type, func);
+    } finally {
+      func.release();
+    }
+  }
+
+  /// 只有当前注册者仍是 [listener] 时才注销，避免旧页面把新页面的监听摘掉。
+  static void clearPictureInPictureModeListener(void Function() listener) {
+    if (!identical(_pipModeListener, listener)) return;
+    setPictureInPictureModeListener(null);
+  }
 
   static (int, int)? maxScreenSize() {
     final jIArr = AndroidHelper.maxScreenSize();
