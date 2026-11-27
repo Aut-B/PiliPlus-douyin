@@ -3372,6 +3372,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _openPanel(_PlayerPanel.playMode);
   }
 
+  /// 播放模式按钮的循环顺序：随机 → 列表循环 → 顺序 → 单曲。
+  ///
+  /// 这里只做入口转发，真正落盘、清牌堆、预取仍在 [_selectPlayMode]，
+  /// 不另写一套播放逻辑。长按按钮仍可打开六项面板，保留「播完暂停 /
+  /// 自动连播」这类低频模式。
+  static const List<PlayRepeat?> _playModeCycle = <PlayRepeat?>[
+    null,
+    PlayRepeat.listCycle,
+    PlayRepeat.listOrder,
+    PlayRepeat.singleCycle,
+  ];
+
+  void _cyclePlayMode() {
+    final current = _shuffle ? 0 : _playModeCycle.indexOf(_repeat);
+    final next = (current < 0 ? 1 : current + 1) % _playModeCycle.length;
+    _selectPlayMode(_playModeCycle[next]);
+  }
+
   /// 直接应用选中的播放模式并落盘。`null` 表示随机播放。
   void _selectPlayMode(PlayRepeat? repeat) {
     _prefetchKey = null;
@@ -4087,12 +4105,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 顶栏只放两组：左端返回，右端动作组 + 更多。
+  /// 顶栏只放返回、标题、播放模式和「更多」。
   ///
-  /// 动作组不铺满整行，而是按宽度和优先级挑出放得下的图标；放不下的
-  /// 收进「更多」面板，窄屏不会把图标压小，也不会出现横向滚动条。
+  /// 播放模式按宽度断点换位置：宽屏留在顶栏，窄屏（6S/375）移到
+  /// 底栏操作行，避免和标题、更多挤在一起。其余动作固定在底栏或
+  /// 「更多」，不再参与顶栏的宽度竞争。
   Widget _topBar(QueueEntry entry, _PlayerUiMetrics metrics) {
-    final inline = _inlineActions(MediaQuery.sizeOf(context).width);
+    final playModeHere = _playModeInTopBar(
+      MediaQuery.sizeOf(context).width,
+    );
     return _controls(
       Center(
         child: PlayerBar(
@@ -4148,8 +4169,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           right: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              for (final action in inline) ...[
-                _actionButton(action, metrics),
+              if (playModeHere) ...[
+                _playModeButton(metrics),
                 SizedBox(width: metrics.gap),
               ],
               ComBtn(
@@ -4171,11 +4192,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 底栏只保留进度条和时间，不再挂第二排动作图标。
+  /// 底栏：进度行 + 常驻操作行。
+  ///
+  /// 操作行只保留最常用的播放组（上一条 / 播放暂停 / 下一条）和四个
+  /// 动作（评论、画质、旋转、投屏）。窄屏把播放模式也放这里，宽屏则
+  /// 留在顶栏；其余低频项全部从「更多」进入，功能不丢失。
   ///
   /// 内容贴安全区底部，由外层至少 8% 屏高的渐变蒙层托底；position 回调
   /// 只重建 `_progress` 这一小块，不刷新整页。
   Widget _bottomBar(_PlayerUiMetrics metrics) {
+    final playModeHere = !_playModeInTopBar(
+      MediaQuery.sizeOf(context).width,
+    );
     return _controls(
       Align(
         alignment: Alignment.bottomCenter,
@@ -4229,6 +4257,53 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 );
               },
             ),
+            const SizedBox(height: 2),
+            Row(
+              children: [
+                _bottomPlayButton(
+                  Icons.skip_previous,
+                  '上一条',
+                  () => unawaited(_previous()),
+                  metrics,
+                ),
+                SizedBox(width: metrics.gap),
+                ValueListenableBuilder<bool>(
+                  valueListenable: _isPlaying,
+                  builder: (context, playing, _) => _bottomPlayButton(
+                    playing ? Icons.pause : Icons.play_arrow,
+                    '暂停/继续',
+                    () => unawaited(_togglePlay()),
+                    metrics,
+                  ),
+                ),
+                SizedBox(width: metrics.gap),
+                _bottomPlayButton(
+                  Icons.skip_next,
+                  '下一条',
+                  () => unawaited(_next(source: 'next')),
+                  metrics,
+                ),
+                if (playModeHere) ...[
+                  SizedBox(width: metrics.gap),
+                  _playModeButton(metrics),
+                ],
+                SizedBox(width: metrics.gap),
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (var i = 0; i < _primaryActions.length; i++) ...[
+                          if (i > 0) SizedBox(width: metrics.gap),
+                          _actionButton(_primaryActions[i], metrics),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
       ),
@@ -4236,37 +4311,60 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     );
   }
 
-  /// 按宽度挑动作：从高优先级开始累加，直到放不下或到达本档上限。
-  ///
-  /// 始终为返回和「更多」留位置，标题至少保留 `_titleMinWidth`，所以
-  /// 右端分组不会把标题挤没，也不会触发 PlayerBar 的等比压缩。
-  List<_PlayerAction> _inlineActions(double width) {
-    final metrics = _PlayerUiMetrics.ofWidth(width);
-    final double available =
-        width -
-        metrics.edge * 2 -
-        metrics.hit * 2 -
-        metrics.gap -
-        _titleMinWidth;
-    final result = <_PlayerAction>[];
-    double used = 0;
-    for (final action in _PlayerAction.values) {
-      if (result.length >= metrics.inlineCap) break;
-      final double cost = result.isEmpty
-          ? metrics.hit
-          : metrics.hit + metrics.gap;
-      if (used + cost > available) break;
-      used += cost;
-      result.add(action);
-    }
-    return result;
+  /// 底栏常驻动作。其余动作只从「更多」进入。
+  static const List<_PlayerAction> _primaryActions = <_PlayerAction>[
+    _PlayerAction.comments,
+    _PlayerAction.quality,
+    _PlayerAction.rotate,
+    _PlayerAction.cast,
+  ];
+
+  /// 6S(375) 的紧凑档把播放模式放底栏；15PM(430) 起放顶栏。
+  static bool _playModeInTopBar(double width) => width >= 400;
+
+  /// 已经在顶栏或底栏常驻的动作不再重复进「更多」，其余全部保留。
+  List<_PlayerAction> _overflowActions() {
+    final visible = <_PlayerAction>{
+      ..._primaryActions,
+      _PlayerAction.playMode,
+    };
+    return _PlayerAction.values
+        .where((action) => !visible.contains(action))
+        .toList(growable: false);
   }
 
-  List<_PlayerAction> _overflowActions(double width) {
-    final inline = _inlineActions(width);
-    return _PlayerAction.values
-        .where((action) => !inline.contains(action))
-        .toList(growable: false);
+  Widget _playModeButton(_PlayerUiMetrics metrics) {
+    return ComBtn(
+      icon: Icon(
+        _playModeIcon,
+        color: _playModeColor,
+        size: _PlayerUiMetrics.icon,
+      ),
+      onTap: _cyclePlayMode,
+      onLongPress: _openPlayModePanel,
+      tooltip: '播放模式：$_playModeLabel（点击切换，长按选择）',
+      width: metrics.hit,
+      height: metrics.hit,
+    );
+  }
+
+  Widget _bottomPlayButton(
+    IconData icon,
+    String tooltip,
+    VoidCallback onTap,
+    _PlayerUiMetrics metrics,
+  ) {
+    return ComBtn(
+      icon: Icon(
+        icon,
+        color: Colors.white,
+        size: _PlayerUiMetrics.icon + 4,
+      ),
+      onTap: onTap,
+      tooltip: tooltip,
+      width: metrics.hit,
+      height: metrics.hit,
+    );
   }
 
   Widget _actionButton(_PlayerAction action, _PlayerUiMetrics metrics) {
@@ -4404,9 +4502,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       onTap: () => _runAction(action),
     );
   }
-
-  /// 标题在顶栏至少保留的宽度。
-  static const double _titleMinWidth = 96;
 
   /// 投屏：把当前已经起播的直链交给 DLNA 页。没有地址时明确提示，
   /// 不做「按了没反应」。
@@ -5664,25 +5759,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 更多设置面板。
   ///
   /// 倍速和音量入口已按用户要求移除：音量用视频区上下滑动调节，
-  /// 倍速不再在播放页暴露。顶栏放不下的动作（画质/音质/解码/字幕等）
-  /// 收在这里，和顶栏图标走同一个动作入口。
+  /// 倍速不再在播放页暴露。低频动作（播放列表/画中画/字幕/音质/解码/
+  /// 听音频）收在这里，和常驻按钮走同一个动作入口。
   Widget _morePanelBody() {
     return SingleChildScrollView(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           _sheetHeader('更多设置'),
-          // 顶栏放不下的动作按同一优先级收在这里，不另起一套入口。
-          for (final action in _overflowActions(
-            MediaQuery.sizeOf(context).width,
-          ))
-            _actionSheetTile(action),
-          _sheetTile(
-            icon: Icons.flip,
-            title: '镜像翻转',
-            subtitle: '左右 / 上下 · 长按旋转键也可进入',
-            onTap: () => _openPanel(_PlayerPanel.rotateFlip),
-          ),
+          // 低频动作收在这里，不另起一套入口。
+          for (final action in _overflowActions()) _actionSheetTile(action),
           SwitchListTile(
             dense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 16),
@@ -5788,7 +5874,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
 enum _SwipeTarget { brightness, volume }
 
-/// 播放页动作项。顺序即窄屏优先级：越靠前越先留在顶栏，其余收进「更多」。
+/// 播放页动作项。常驻项由 `_primaryActions` / 播放模式按钮决定，
+/// 这里只保留「更多」面板里的排列顺序。
 ///
 /// 只包含 105 版那套控件，不提供倍速、音量、默认按钮——音量/亮度用
 /// 上下滑，进度用左右滑。
@@ -5817,7 +5904,6 @@ class _PlayerUiMetrics {
     required this.edge,
     required this.topBarHeight,
     required this.bottomBarHeight,
-    required this.inlineCap,
   });
 
   final double hit;
@@ -5826,9 +5912,6 @@ class _PlayerUiMetrics {
   final double topBarHeight;
   final double bottomBarHeight;
 
-  /// 顶栏最多内联几个动作，剩下的进「更多」，不让图标铺满整行。
-  final int inlineCap;
-
   static const double icon = 20;
 
   static const _PlayerUiMetrics _compact = _PlayerUiMetrics(
@@ -5836,8 +5919,7 @@ class _PlayerUiMetrics {
     gap: 10,
     edge: 12,
     topBarHeight: 48,
-    bottomBarHeight: 52,
-    inlineCap: 3,
+    bottomBarHeight: 64,
   );
 
   static const _PlayerUiMetrics _regular = _PlayerUiMetrics(
@@ -5845,8 +5927,7 @@ class _PlayerUiMetrics {
     gap: 16,
     edge: 16,
     topBarHeight: 52,
-    bottomBarHeight: 56,
-    inlineCap: 5,
+    bottomBarHeight: 68,
   );
 
   static const _PlayerUiMetrics _wide = _PlayerUiMetrics(
@@ -5854,8 +5935,7 @@ class _PlayerUiMetrics {
     gap: 16,
     edge: 16,
     topBarHeight: 56,
-    bottomBarHeight: 60,
-    inlineCap: 7,
+    bottomBarHeight: 72,
   );
 
   static _PlayerUiMetrics ofWidth(double width) {
