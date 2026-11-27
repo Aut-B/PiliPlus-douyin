@@ -227,7 +227,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
   Timer? _chromeTimer;
 
-  /// Android PiP 精简布局：只留视频画面和一行标题。
+  /// Android PiP 精简布局：只留视频画面，不渲染标题/文案条。
   /// 只在原生进入/退出回调时 setState 一次，PiP 期间不做逐帧重绘。
   bool _isPipLayout = false;
 
@@ -3097,35 +3097,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   Widget build(BuildContext context) {
     final entry = _current;
     final viewPadding = MediaQuery.viewPaddingOf(context);
-    // PiP 精简布局：系统小窗只有视频画面和一行标题，不构建底栏/顶栏/
-    // 边缘手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
+    // PiP 精简布局：系统小窗只渲染视频画面，不构建标题/底栏/顶栏/边缘
+    // 手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
     if (_isPipLayout) {
       return Scaffold(
         backgroundColor: Colors.black,
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            Positioned.fill(child: _video()),
-            if (entry.title.isNotEmpty)
-              Positioned(
-                left: 12,
-                right: 12,
-                bottom: viewPadding.bottom + 8,
-                child: Text(
-                  entry.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 12,
-                    shadows: <Shadow>[
-                      Shadow(blurRadius: 4, color: Colors.black54),
-                    ],
-                  ),
-                ),
-              ),
-          ],
-        ),
+        body: _video(),
       );
     }
     // 控件尺寸按窗口宽度分档：6S 紧凑、15PM 舒展、平板/横屏再放大。
@@ -3599,11 +3576,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 displayVideo
               else
                 RotatedBox(quarterTurns: _quarterTurns, child: displayVideo),
-              Obx(
-                () => _player.onlyPlayAudio.value
-                    ? const IgnorePointer(child: _AudioOnlyBadge())
-                    : const SizedBox.shrink(),
-              ),
+              // PiP 精简布局只保留视频画面，不叠加任何文案提示。
+              if (!_isPipLayout)
+                Obx(
+                  () => _player.onlyPlayAudio.value
+                      ? const IgnorePointer(child: _AudioOnlyBadge())
+                      : const SizedBox.shrink(),
+                ),
             ],
           ),
         ),
@@ -3939,6 +3918,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         size: _PlayerUiMetrics.icon,
       ),
       onTap: () => _runAction(action),
+      // 长按旋转键进入镜像面板；单击始终是一键 +90°，不再走两步面板。
+      onLongPress: action == _PlayerAction.rotate
+          ? () => _openPanel(_PlayerPanel.rotateFlip)
+          : null,
       tooltip: _actionTooltip(action),
       width: metrics.hit,
       height: metrics.hit,
@@ -3973,7 +3956,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _PlayerAction.subtitle => '字幕',
       _PlayerAction.audioQuality => '音质',
       _PlayerAction.decode => '解码',
-      _PlayerAction.rotate => '旋转翻转',
+      _PlayerAction.rotate => '旋转 90°（长按镜像）',
       _PlayerAction.cast => '投屏',
       _PlayerAction.audioOnly => '听音频',
     };
@@ -4029,7 +4012,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       case _PlayerAction.subtitle:
         _openPanel(_PlayerPanel.subtitle);
       case _PlayerAction.rotate:
-        _openPanel(_PlayerPanel.rotateFlip);
+        _closePanel();
+        _rotateVideo();
       case _PlayerAction.cast:
         _closePanel();
         _castToDevice();
@@ -5099,6 +5083,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             MediaQuery.sizeOf(context).width,
           ))
             _actionSheetTile(action),
+          _sheetTile(
+            icon: Icons.flip,
+            title: '镜像翻转',
+            subtitle: '左右 / 上下 · 长按旋转键也可进入',
+            onTap: () => _openPanel(_PlayerPanel.rotateFlip),
+          ),
           SwitchListTile(
             dense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 16),
