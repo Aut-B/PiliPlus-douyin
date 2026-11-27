@@ -3128,16 +3128,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       );
     }
-    // 收紧后的栏高只留刚够用的空间；系统字号放大到 1.6 时标题和时间行
-    // 会变高，这里按比例补回一点，避免底栏按钮被挤出屏幕。
+    // 控件尺寸按窗口宽度分档：6S 紧凑、15PM 舒展、平板/横屏再放大。
+    // 只缩放命中区和间距，图标始终 20px，避免窄屏被压成小点。
+    final size = MediaQuery.sizeOf(context);
+    final metrics = _PlayerUiMetrics.ofWidth(size.width);
     final double textScale = MediaQuery.textScalerOf(context).scale(1.0);
     final double extra = (textScale - 1.0).clamp(0.0, 0.6).toDouble();
-    final double topBarHeight = _topBarHeight + extra * 8;
-    final double bottomBarHeight = _bottomBarHeight + extra * 20;
+    final double topBarHeight = metrics.topBarHeight + extra * 8;
+    final double bottomBarHeight = metrics.bottomBarHeight + extra * 8;
     final topInset = _chromeVisible ? viewPadding.top + topBarHeight : 0.0;
     final bottomInset = _chromeVisible
         ? viewPadding.bottom + bottomBarHeight
         : 0.0;
+    // 底部蒙层至少占屏幕高度 8%；控件仍贴在安全区底部，不再像旧版
+    // 那样整条栏高全涂黑、在控件下方留一块空黑边。
+    final double bottomBackdropHeight =
+        viewPadding.bottom + bottomBarHeight > size.height * 0.08
+        ? viewPadding.bottom + bottomBarHeight
+        : size.height * 0.08;
     return PopScope(
       // 系统返回手势 / 安卓返回键也要走收尾。注意这里是同步触发，
       // 不阻塞 pop，避免手势退出时同样被原生回调拖住。
@@ -3216,7 +3224,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                     left: false,
                     right: false,
                     minimum: EdgeInsets.zero,
-                    child: _topBar(entry),
+                    child: _topBar(entry, metrics),
                   ),
                 ),
               ),
@@ -3225,7 +3233,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 left: 0,
                 right: 0,
                 bottom: 0,
-                height: viewPadding.bottom + bottomBarHeight,
+                height: bottomBackdropHeight,
                 child: _chromeBackdrop(
                   bottom: true,
                   child: SafeArea(
@@ -3234,7 +3242,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                     left: false,
                     right: false,
                     minimum: EdgeInsets.zero,
-                    child: _bottomBar(),
+                    child: _bottomBar(metrics),
                   ),
                 ),
               ),
@@ -3267,15 +3275,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       child: child,
     );
   }
-
-  /// 顶部控件条高度（不含状态栏）：一行 36pt 按钮 + 上下各 2pt 内边距。
-  /// 视频层已铺满，这个高度只用于定位顶栏，不再给视频留黑边。
-  static const double _topBarHeight = 44;
-
-  /// 底部控件条高度（不含底部安全区）：进度行 + 间隔 + 34pt 操作行 +
-  /// 上下内边距，合计约 60pt；留到 64pt 兼容不同字体的行高。
-  /// 15PM 的底部安全区会再吃掉 34pt，由上面的 Positioned 高度单独叠加。
-  static const double _bottomBarHeight = 64;
 
   /// 左边缘滑返回的响应宽度。和 iOS 系统侧滑手势的识别区宽度接近，
   /// 足够手指起手，又不会伸到中间的按钮区域去抢事件。
@@ -3640,9 +3639,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             // 盖住。只做提示，不接管触摸（外层 IgnorePointer），上下滑
             // 亮度/音量、横滑 seek 都不受影响。
             final topInset = MediaQuery.viewPaddingOf(context).top;
+            final metrics = _PlayerUiMetrics.ofWidth(
+              MediaQuery.sizeOf(context).width,
+            );
             return SafeArea(
               minimum: EdgeInsets.only(
-                top: topInset + _topBarHeight + 6,
+                top: topInset + metrics.topBarHeight + 6,
                 left: 24,
                 right: 24,
               ),
@@ -3724,19 +3726,20 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   ///
   /// 不需要任何拦截：控件层是 Stack 里位于视频层之上的独立 Positioned，
   /// 本来就会吃掉自己区域内的触摸，命中测试按 Stack 逆序走，先到控件层。
-  Widget _controls(Widget child) {
+  Widget _controls(Widget child, _PlayerUiMetrics metrics) {
     return Padding(
-      // 上下只留 2pt：栏高已经收紧，多余空白都还给视频区。左右两侧
-      // 统一 10pt，顶栏右下工具组和底栏右侧工具组落在同一条竖线上。
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      // 上下只留 2pt，把多余高度还给视频区；左右留白随宽度分档。
+      padding: EdgeInsets.symmetric(horizontal: metrics.edge, vertical: 2),
       child: child,
     );
   }
 
-  Widget _topBar(QueueEntry entry) {
-    // 左右图标统一 36×36 命中区、22px 图标，视觉等距；标题包一层点击，
-    // 打开页内「完整文案」，避免长标题被省略号吃掉后没法看全。
-    const double buttonSize = 36;
+  /// 顶栏只放两组：左端返回，右端动作组 + 更多。
+  ///
+  /// 动作组不铺满整行，而是按宽度和优先级挑出放得下的图标；放不下的
+  /// 收进「更多」面板，窄屏不会把图标压小，也不会出现横向滚动条。
+  Widget _topBar(QueueEntry entry, _PlayerUiMetrics metrics) {
+    final inline = _inlineActions(MediaQuery.sizeOf(context).width);
     return _controls(
       Center(
         child: PlayerBar(
@@ -3747,15 +3750,15 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 icon: const Icon(
                   Icons.keyboard_arrow_down,
                   color: Colors.white,
-                  size: 26,
+                  size: _PlayerUiMetrics.icon,
                 ),
                 // 返回必须永远可用，不能等收尾完成才响应——收尾里如果等原生
                 // 关小窗卡住，用户看到的就是「点了没反应」。_leave 是同步的，
                 // 收尾在它内部以 unawaited 方式启动。
                 onTap: _leave,
                 tooltip: '返回',
-                width: buttonSize,
-                height: buttonSize,
+                width: metrics.hit,
+                height: metrics.hit,
               ),
             ],
           ),
@@ -3792,234 +3795,260 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           right: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              for (final action in inline) ...[
+                _actionButton(action, metrics),
+                SizedBox(width: metrics.gap),
+              ],
               ComBtn(
                 icon: const Icon(
-                  Icons.queue_music,
+                  Icons.more_horiz,
                   color: Colors.white,
-                  size: 22,
-                ),
-                onTap: () => unawaited(_openPlaylist()),
-                tooltip: '播放列表',
-                width: buttonSize,
-                height: buttonSize,
-              ),
-              ComBtn(
-                icon: const Icon(
-                  Icons.picture_in_picture_alt,
-                  color: Colors.white,
-                  size: 22,
-                ),
-                onTap: () => unawaited(_enterPip()),
-                tooltip: '画中画',
-                width: buttonSize,
-                height: buttonSize,
-              ),
-              ComBtn(
-                icon: const Icon(
-                  Icons.more_vert_outlined,
-                  color: Colors.white,
-                  size: 22,
+                  size: _PlayerUiMetrics.icon,
                 ),
                 onTap: () => _openPanel(_PlayerPanel.more),
                 tooltip: '更多设置',
-                width: buttonSize,
-                height: buttonSize,
+                width: metrics.hit,
+                height: metrics.hit,
               ),
             ],
           ),
         ),
       ),
+      metrics,
     );
   }
 
-  Widget _bottomBar() {
-    // playerStatus 是普通字段，不是 Rx；暂停/播放图标由 `_isPlaying` 单独
-    // 驱动，只重建这一个按钮。进度/缓冲/时长由 `_progress` 驱动，只重建
-    // 进度条和时间文本，不跟着 position 回调刷新整页。
-    //
-    // 布局分两行：
-    // * 进度行：当前时间 + 进度条（带拖动圆点）+ 总时长，三者同一行
-    //   基线对齐，时间不会和进度条错位；
-    // * 操作行：左侧「上一条 / 暂停 / 下一条」播放组，右侧横向滚动的
-    //   动作组（评论、画质、音质、解码、循环、字幕、旋转翻转、投屏、听音频）。
+  /// 底栏只保留进度条和时间，不再挂第二排动作图标。
+  ///
+  /// 内容贴安全区底部，由外层至少 8% 屏高的渐变蒙层托底；position 回调
+  /// 只重建 `_progress` 这一小块，不刷新整页。
+  Widget _bottomBar(_PlayerUiMetrics metrics) {
     return _controls(
-      Column(
-        mainAxisAlignment: MainAxisAlignment.end,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ValueListenableBuilder<_PlaybackProgress>(
-            valueListenable: _progress,
-            builder: (context, progress, _) {
-              return Row(
-                children: [
-                  _timeText(progress.position, Colors.white),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: ProgressBar(
-                      progress: progress.position,
-                      buffered: progress.buffered,
-                      total: progress.duration,
-                      // 已播 / 缓冲 / 未播三段颜色拉开，4px 轨道在深色画面上
-                      // 也能看清；拖动时只画纯色圆点，不做柔光/阴影。
-                      baseBarColor: const Color(0x3DFFFFFF),
-                      progressBarColor: Colors.white,
-                      bufferedBarColor: const Color(0x8AFFFFFF),
-                      thumbColor: Colors.white,
-                      // 柔光半径等于手柄半径时不会绘制，颜色仅为满足必填参数。
-                      thumbGlowColor: Colors.transparent,
-                      barHeight: 4,
-                      thumbRadius: 6,
-                      thumbGlowRadius: 6,
-                      // RenderProgressBar 只有 onDragStart/onHover 非空时才参与
-                      // 命中测试，否则整条进度条点不动。空回调只为了可拖。
-                      onDragStart: (_) {},
-                      onSeek: (milliseconds) {
-                        _player.position.value = milliseconds ~/ 1000;
-                        unawaited(
-                          _player.seekTo(Duration(milliseconds: milliseconds)),
-                        );
-                        _pushProgress(force: true);
-                        _publishPipState(milliseconds);
-                        _publishBackgroundState(positionMs: milliseconds);
-                      },
+      Align(
+        alignment: Alignment.bottomCenter,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ValueListenableBuilder<_PlaybackProgress>(
+              valueListenable: _progress,
+              builder: (context, progress, _) {
+                return Row(
+                  children: [
+                    _timeText(progress.position, Colors.white),
+                    SizedBox(width: metrics.gap),
+                    Expanded(
+                      child: ProgressBar(
+                        progress: progress.position,
+                        buffered: progress.buffered,
+                        total: progress.duration,
+                        // 已播 / 缓冲 / 未播三段颜色拉开，4px 轨道在深色
+                        // 画面上也能看清；拖动时只画纯色圆点。
+                        baseBarColor: const Color(0x3DFFFFFF),
+                        progressBarColor: Colors.white,
+                        bufferedBarColor: const Color(0x8AFFFFFF),
+                        thumbColor: Colors.white,
+                        // 柔光半径等于手柄半径时不会绘制，颜色仅为满足
+                        // 必填参数。
+                        thumbGlowColor: Colors.transparent,
+                        barHeight: 4,
+                        thumbRadius: 6,
+                        thumbGlowRadius: 6,
+                        // RenderProgressBar 只有 onDragStart/onHover 非空时
+                        // 才参与命中测试，否则整条进度条点不动。空回调只为
+                        // 了可拖。
+                        onDragStart: (_) {},
+                        onSeek: (milliseconds) {
+                          _player.position.value = milliseconds ~/ 1000;
+                          unawaited(
+                            _player.seekTo(
+                              Duration(milliseconds: milliseconds),
+                            ),
+                          );
+                          _pushProgress(force: true);
+                          _publishPipState(milliseconds);
+                          _publishBackgroundState(positionMs: milliseconds);
+                        },
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  _timeText(progress.duration, Colors.white70),
-                ],
-              );
-            },
-          ),
-          const SizedBox(height: 2),
-          Row(
-            children: [
-              ComBtn(
-                icon: const Icon(
-                  Icons.skip_previous,
-                  color: Colors.white,
-                  size: 24,
-                ),
-                onTap: () => unawaited(_previous()),
-                tooltip: '上一条',
-                width: _bottomButtonSize,
-                height: _bottomButtonSize,
-              ),
-              ValueListenableBuilder<bool>(
-                valueListenable: _isPlaying,
-                builder: (context, playing, child) => ComBtn(
-                  icon: Icon(
-                    playing ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                    size: 26,
-                  ),
-                  onTap: () => unawaited(_togglePlay()),
-                  tooltip: '暂停/继续',
-                  width: _bottomButtonSize,
-                  height: _bottomButtonSize,
-                ),
-              ),
-              ComBtn(
-                icon: const Icon(
-                  Icons.skip_next,
-                  color: Colors.white,
-                  size: 24,
-                ),
-                onTap: () => unawaited(_next(source: 'next')),
-                tooltip: '下一条',
-                width: _bottomButtonSize,
-                height: _bottomButtonSize,
-              ),
-              const SizedBox(width: 4),
-              // 动作组和 B 站播放页对齐：弹幕/评论、画质、音质、解码、
-              // 循环、字幕、旋转翻转、投屏、听音频。窄屏（6S/SE）上横向
-              // 滚动，不做等比缩小——缩小后 34pt 命中区会掉到手指点不准。
-              Expanded(
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _barAction(
-                        icon: Icons.chat_bubble_outline,
-                        tooltip: '弹幕 / 评论',
-                        onTap: () => _openPanel(_PlayerPanel.comments),
-                      ),
-                      _barAction(
-                        icon: Icons.high_quality_outlined,
-                        tooltip: '画质',
-                        onTap: () => _openPanel(_PlayerPanel.quality),
-                      ),
-                      _barAction(
-                        icon: Icons.album_outlined,
-                        tooltip: '音质',
-                        onTap: () => _openPanel(_PlayerPanel.audioQuality),
-                      ),
-                      _barAction(
-                        icon: Icons.memory_outlined,
-                        tooltip: '解码',
-                        onTap: () => _openPanel(_PlayerPanel.decode),
-                      ),
-                      _barAction(
-                        icon: _playModeIcon,
-                        color: _playModeColor,
-                        tooltip: '循环 / $_playModeLabel',
-                        onTap: _openPlayModePanel,
-                      ),
-                      _barAction(
-                        icon: Icons.closed_caption_off_outlined,
-                        tooltip: '字幕',
-                        onTap: () => _openPanel(_PlayerPanel.subtitle),
-                      ),
-                      _barAction(
-                        icon: Icons.screen_rotation_alt,
-                        tooltip: '旋转翻转',
-                        onTap: () => _openPanel(_PlayerPanel.rotateFlip),
-                      ),
-                      _barAction(
-                        icon: Icons.cast,
-                        tooltip: '投屏',
-                        onTap: _castToDevice,
-                      ),
-                      Obx(
-                        () => _barAction(
-                          icon: _player.onlyPlayAudio.value
-                              ? Icons.headphones
-                              : Icons.headphones_outlined,
-                          color: _player.onlyPlayAudio.value
-                              ? Colors.lightBlueAccent
-                              : Colors.white,
-                          tooltip: '听音频',
-                          onTap: _toggleOnlyAudio,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
+                    SizedBox(width: metrics.gap),
+                    _timeText(progress.duration, Colors.white70),
+                  ],
+                );
+              },
+            ),
+          ],
+        ),
       ),
+      metrics,
     );
   }
 
-  /// 底部按钮统一命中区，图标大小在按钮内单独控制。
-  static const double _bottomButtonSize = 34;
+  /// 按宽度挑动作：从高优先级开始累加，直到放不下或到达本档上限。
+  ///
+  /// 始终为返回和「更多」留位置，标题至少保留 `_titleMinWidth`，所以
+  /// 右端分组不会把标题挤没，也不会触发 PlayerBar 的等比压缩。
+  List<_PlayerAction> _inlineActions(double width) {
+    final metrics = _PlayerUiMetrics.ofWidth(width);
+    final double available =
+        width -
+        metrics.edge * 2 -
+        metrics.hit * 2 -
+        metrics.gap -
+        _titleMinWidth;
+    final result = <_PlayerAction>[];
+    double used = 0;
+    for (final action in _PlayerAction.values) {
+      if (result.length >= metrics.inlineCap) break;
+      final double cost = result.isEmpty
+          ? metrics.hit
+          : metrics.hit + metrics.gap;
+      if (used + cost > available) break;
+      used += cost;
+      result.add(action);
+    }
+    return result;
+  }
 
-  Widget _barAction({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onTap,
-    Color color = Colors.white,
-  }) {
+  List<_PlayerAction> _overflowActions(double width) {
+    final inline = _inlineActions(width);
+    return _PlayerAction.values
+        .where((action) => !inline.contains(action))
+        .toList(growable: false);
+  }
+
+  Widget _actionButton(_PlayerAction action, _PlayerUiMetrics metrics) {
+    if (action == _PlayerAction.audioOnly) {
+      // 听音频状态由 Rx 驱动，单独包一层 Obx，失败不会连带整条顶栏重建。
+      return Obx(() => _actionButtonBody(action, metrics));
+    }
+    return _actionButtonBody(action, metrics);
+  }
+
+  Widget _actionButtonBody(_PlayerAction action, _PlayerUiMetrics metrics) {
+    final color = switch (action) {
+      _PlayerAction.playMode => _playModeColor,
+      _PlayerAction.audioOnly => _player.onlyPlayAudio.value
+          ? Colors.lightBlueAccent
+          : Colors.white,
+      _ => Colors.white,
+    };
     return ComBtn(
-      icon: Icon(icon, color: color, size: 21),
-      onTap: onTap,
-      tooltip: tooltip,
-      width: _bottomButtonSize,
-      height: _bottomButtonSize,
+      icon: Icon(
+        _actionIcon(action),
+        color: color,
+        size: _PlayerUiMetrics.icon,
+      ),
+      onTap: () => _runAction(action),
+      tooltip: _actionTooltip(action),
+      width: metrics.hit,
+      height: metrics.hit,
     );
   }
+
+  IconData _actionIcon(_PlayerAction action) {
+    return switch (action) {
+      _PlayerAction.playlist => Icons.queue_music,
+      _PlayerAction.comments => Icons.chat_bubble_outline,
+      _PlayerAction.pip => Icons.picture_in_picture_alt_outlined,
+      _PlayerAction.quality => Icons.high_quality_outlined,
+      _PlayerAction.playMode => _playModeIcon,
+      _PlayerAction.subtitle => Icons.subtitles_outlined,
+      _PlayerAction.audioQuality => Icons.album_outlined,
+      _PlayerAction.decode => Icons.memory_outlined,
+      _PlayerAction.rotate => Icons.screen_rotation_alt_outlined,
+      _PlayerAction.cast => Icons.cast,
+      _PlayerAction.audioOnly => _player.onlyPlayAudio.value
+          ? Icons.headphones
+          : Icons.headphones_outlined,
+    };
+  }
+
+  String _actionTooltip(_PlayerAction action) {
+    return switch (action) {
+      _PlayerAction.playlist => '播放列表',
+      _PlayerAction.comments => '弹幕 / 评论',
+      _PlayerAction.pip => '画中画',
+      _PlayerAction.quality => '画质',
+      _PlayerAction.playMode => '循环 / $_playModeLabel',
+      _PlayerAction.subtitle => '字幕',
+      _PlayerAction.audioQuality => '音质',
+      _PlayerAction.decode => '解码',
+      _PlayerAction.rotate => '旋转翻转',
+      _PlayerAction.cast => '投屏',
+      _PlayerAction.audioOnly => '听音频',
+    };
+  }
+
+  String _actionTitle(_PlayerAction action) {
+    return switch (action) {
+      _PlayerAction.playlist => '播放列表',
+      _PlayerAction.comments => '弹幕 / 评论',
+      _PlayerAction.pip => '画中画',
+      _PlayerAction.quality => '画质',
+      _PlayerAction.playMode => '播放模式',
+      _PlayerAction.subtitle => '字幕',
+      _PlayerAction.audioQuality => '音质',
+      _PlayerAction.decode => '解码',
+      _PlayerAction.rotate => '画面旋转',
+      _PlayerAction.cast => '投屏',
+      _PlayerAction.audioOnly => '听音频',
+    };
+  }
+
+  String? _actionSubtitle(_PlayerAction action) {
+    return switch (action) {
+      _PlayerAction.quality => '接口未提供分辨率档位',
+      _PlayerAction.playMode => '当前：$_playModeLabel',
+      _PlayerAction.rotate => '${_quarterTurns * 90}°',
+      _PlayerAction.audioOnly => _player.onlyPlayAudio.value
+          ? '已开启 · 只保留声音'
+          : '关闭画面，只保留声音',
+      _ => null,
+    };
+  }
+
+  /// 顶栏图标和「更多」里的收纳项走同一个动作入口。
+  void _runAction(_PlayerAction action) {
+    switch (action) {
+      case _PlayerAction.playlist:
+        _closePanel();
+        unawaited(_openPlaylist());
+      case _PlayerAction.comments:
+        _openPanel(_PlayerPanel.comments);
+      case _PlayerAction.pip:
+        _closePanel();
+        unawaited(_enterPip());
+      case _PlayerAction.quality:
+        _openPanel(_PlayerPanel.quality);
+      case _PlayerAction.audioQuality:
+        _openPanel(_PlayerPanel.audioQuality);
+      case _PlayerAction.decode:
+        _openPanel(_PlayerPanel.decode);
+      case _PlayerAction.playMode:
+        _openPlayModePanel();
+      case _PlayerAction.subtitle:
+        _openPanel(_PlayerPanel.subtitle);
+      case _PlayerAction.rotate:
+        _openPanel(_PlayerPanel.rotateFlip);
+      case _PlayerAction.cast:
+        _closePanel();
+        _castToDevice();
+      case _PlayerAction.audioOnly:
+        _toggleOnlyAudio();
+    }
+  }
+
+  Widget _actionSheetTile(_PlayerAction action) {
+    return _sheetTile(
+      icon: _actionIcon(action),
+      title: _actionTitle(action),
+      subtitle: _actionSubtitle(action),
+      onTap: () => _runAction(action),
+    );
+  }
+
+  /// 标题在顶栏至少保留的宽度。
+  static const double _titleMinWidth = 96;
 
   /// 投屏：把当前已经起播的直链交给 DLNA 页。没有地址时明确提示，
   /// 不做「按了没反应」。
@@ -4272,7 +4301,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
               child: Material(
                 color: const Color(0xFF1A1A1A),
                 borderRadius: const BorderRadius.vertical(
-                  top: Radius.circular(14),
+                  top: Radius.circular(12),
                 ),
                 clipBehavior: Clip.antiAlias,
                 child: SafeArea(top: false, child: body),
@@ -4906,39 +4935,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 更多设置面板。
   ///
   /// 倍速和音量入口已按用户要求移除：音量用视频区上下滑动调节，
-  /// 倍速不再在播放页暴露。画质项改为可点，打开同一套页内画质说明。
+  /// 倍速不再在播放页暴露。顶栏放不下的动作（画质/音质/解码/字幕等）
+  /// 收在这里，和顶栏图标走同一个动作入口。
   Widget _morePanelBody() {
     return SingleChildScrollView(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           _sheetHeader('更多设置'),
-          _sheetTile(
-            icon: Icons.high_quality_outlined,
-            title: '画质',
-            subtitle: '接口未提供分辨率档位',
-            onTap: () => _openPanel(_PlayerPanel.quality),
-          ),
-          _sheetTile(
-            icon: Icons.screen_rotation_alt,
-            title: '画面旋转',
-            subtitle: '${_quarterTurns * 90}°',
-            onTap: _rotateVideo,
-          ),
-          _sheetTile(
-            icon: _playModeIcon,
-            title: '播放模式',
-            subtitle: '当前：$_playModeLabel',
-            onTap: _openPlayModePanel,
-          ),
-          _sheetTile(
-            icon: Icons.picture_in_picture_alt_outlined,
-            title: '画中画',
-            onTap: () {
-              _closePanel();
-              unawaited(_enterPip());
-            },
-          ),
+          // 顶栏放不下的动作按同一优先级收在这里，不另起一套入口。
+          for (final action in _overflowActions(
+            MediaQuery.sizeOf(context).width,
+          ))
+            _actionSheetTile(action),
           SwitchListTile(
             dense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 16),
@@ -5043,6 +5052,83 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 }
 
 enum _SwipeTarget { brightness, volume }
+
+/// 播放页动作项。顺序即窄屏优先级：越靠前越先留在顶栏，其余收进「更多」。
+///
+/// 只包含 105 版那套控件，不提供倍速、音量、默认按钮——音量/亮度用
+/// 上下滑，进度用左右滑。
+enum _PlayerAction {
+  comments,
+  pip,
+  quality,
+  playMode,
+  subtitle,
+  rotate,
+  audioOnly,
+  cast,
+  audioQuality,
+  decode,
+  playlist,
+}
+
+/// 播放页控件的宽度断点。
+///
+/// 只缩放命中区和间距，图标固定 20px：6S(375) 紧凑，15PM(430) 舒展，
+/// 平板/横屏(>500) 再放大一档。
+class _PlayerUiMetrics {
+  const _PlayerUiMetrics({
+    required this.hit,
+    required this.gap,
+    required this.edge,
+    required this.topBarHeight,
+    required this.bottomBarHeight,
+    required this.inlineCap,
+  });
+
+  final double hit;
+  final double gap;
+  final double edge;
+  final double topBarHeight;
+  final double bottomBarHeight;
+
+  /// 顶栏最多内联几个动作，剩下的进「更多」，不让图标铺满整行。
+  final int inlineCap;
+
+  static const double icon = 20;
+
+  static const _PlayerUiMetrics _compact = _PlayerUiMetrics(
+    hit: 32,
+    gap: 10,
+    edge: 12,
+    topBarHeight: 48,
+    bottomBarHeight: 52,
+    inlineCap: 3,
+  );
+
+  static const _PlayerUiMetrics _regular = _PlayerUiMetrics(
+    hit: 36,
+    gap: 16,
+    edge: 16,
+    topBarHeight: 52,
+    bottomBarHeight: 56,
+    inlineCap: 5,
+  );
+
+  static const _PlayerUiMetrics _wide = _PlayerUiMetrics(
+    hit: 40,
+    gap: 16,
+    edge: 16,
+    topBarHeight: 56,
+    bottomBarHeight: 60,
+    inlineCap: 7,
+  );
+
+  static _PlayerUiMetrics ofWidth(double width) {
+    if (width < 400) return _compact;
+    if (width <= 500) return _regular;
+    return _wide;
+  }
+}
 
 /// 播放页内嵌面板的类型。
 enum _PlayerPanel {
