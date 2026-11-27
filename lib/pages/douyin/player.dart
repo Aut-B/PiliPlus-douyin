@@ -5,6 +5,7 @@ import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.da
 import 'package:PiliPlus/models_new/video/video_detail/page.dart' show Part;
 import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/pages/douyin/models.dart';
+import 'package:PiliPlus/pages/douyin/perf.dart';
 import 'package:PiliPlus/pages/douyin/player_bridge.dart';
 import 'package:PiliPlus/pages/douyin/playlist.dart';
 import 'package:PiliPlus/pages/douyin/queue.dart';
@@ -275,6 +276,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   int _watchdogSession = -1;
   int _watchdogIndex = -1;
   String _watchdogSource = 'auto';
+  /// 这次 open 实际请求的 hwdec，供看门狗判断还能不能回滚 auto-copy。
+  String _watchdogHwdec = _hwdec;
+  /// 这次看门狗对应的条目 key；回滚只认当前这一条。
+  String _watchdogKey = '';
   int _watchdogStartedAtMs = 0;
   bool _watchdogGraceUsed = false;
   int _watchdogOpenBusyRetries = 0;
@@ -283,6 +288,48 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   bool _recovering = false;
   int _autoRecoverCount = 0;
   int _recoverStreak = 0;
+
+  /// 连续拿不到首帧的条目数（跨条目累计）。
+  ///
+  /// 成功看到首帧或用户手动选播时清零；到 [_maxConsecutiveSkip] 就停下
+  /// 并给出可见提示，避免片源整体失效时整页无限乱跳。
+  int _skipStreak = 0;
+
+  /// 已经为哪些 B 站条目重新解析过 playurl。
+  ///
+  /// 按条目 key 只重试一次：随机/循环再转回同一条时不再重试，
+  /// 保证「重试一次」不会变成死循环。
+  final Set<String> _biliPlayurlRetried = <String>{};
+
+  /// B 站首帧超时重开后，是否真正走到了「已起播、等首帧」阶段。
+  ///
+  /// 只给 [_retryBiliWithFreshPlayurl] 判断重开是不是在解析/加载阶段就
+  /// 已经失败；失败时直接跳下一条，不等看门狗。
+  bool _biliRetryOpenSucceeded = false;
+
+  /// 本次 open 是否在解析阶段就没拿到地址。
+  ///
+  /// 跳过链（source=skip）要靠它继续往后跳：这种失败不会起播，也就不会
+  /// 挂首帧看门狗，不能停在错误页上不动。其余失败（共享播放器、释放失败
+  /// 等）不置位，避免把别人的占用误判成片源问题。
+  bool _openMediaMissing = false;
+
+  /// 开流初期观察 hwdec-current 的节拍器。首帧出现或超窗就停，
+  /// 不让同步 FFI 读属性变成常驻采样。
+  Timer? _hwdecProbeTimer;
+  int _hwdecProbeStartedAtMs = 0;
+  int _hwdecNoSinceMs = 0;
+
+  /// 已经回滚成 auto-copy 的条目 key。
+  ///
+  /// 按条目 sticky：同一条只回滚一次（含后续自愈重建、再次播到同一条），
+  /// 换到别的条目仍从直通 auto 起，绝不会在 auto / auto-copy 之间来回循环。
+  /// 用户在播放列表里手动重选该条会清掉标记，允许重新尝试直通。
+  final Set<String> _hwdecFallbackKeys = <String>{};
+
+  /// 回滚标记上限：连播几百条也不让这个 Set 无限长；超了淘汰最早的一条，
+  /// 被淘汰的条目下次播到会重新尝试一次 auto（仍只回滚一次，不会循环）。
+  static const int _maxHwdecFallbackKeys = 200;
 
   /// 自动连播（复用同一 texture）累计条数；每 [_autoRebuildInterval] 条
   /// 主动整实例重建一次，避免 texture/解码器长期复用累积劣化。
@@ -311,24 +358,62 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 判定；彻底不来时尽早重建恢复画面，不再让用户盯 8 秒黑屏。
   static const int _firstFrameWatchdogMs = 2800;
 
+  /// 连续多少条拿不到首帧就停止自动跳过并提示。
+  static const int _maxConsecutiveSkip = 3;
+
+  /// B 站首帧总预算：6S 这类低内存老机型给 ~12s，其它机型 ~8s。
+  ///
+  /// 实现上仍保留 2800ms 的常规看门狗触发重试；重开后的看门狗按
+  /// 「原始 open 起点 + 本预算」计算剩余时间，所以总耗时落在 8s / 12s
+  /// 左右，而不是两次各等一遍完整预算。
+  static int get _biliFirstFrameBudgetMs =>
+      ShortVideoPerf.lowMemory ? 12000 : 8000;
+
+  /// 重开后的看门狗剩余时间上限，防止预算计算出异常大的值。
+  static const int _maxBiliFirstFrameBudgetMs = 12000;
+
   /// 自动连播每 N 条主动重建一次 player/texture。手动选播 = 完整重建
   /// 能恢复，说明重建有效；这里提前做，防止累积到黑屏才被动救。
   static const int _autoRebuildInterval = 20;
 
-  /// 抖音 / TikTok 短视频显式走 VideoToolbox（auto-copy）。
+  /// 抖音 / TikTok 短视频默认走直通硬解（auto → VideoToolbox 零拷贝）。
   ///
-  /// 全局硬解开关被用户关掉时也不能退化成软解：6S 上软解这些缓存视频一样卡，
-  /// 表现和「网络慢」几乎一样。B 站播放页不传这个覆盖，行为保持不变。
+  /// 之前写死 auto-copy（硬解带 CPU 拷贝），6S 上实测 p10 只有 0.16x，
+  /// 表现和「网络慢」几乎一样；B 站播放页传的就是 auto，这里对齐。
+  /// 个别片源/机型直通解不出画面时由 [_hwdecFallback] 兜底，不在这里写死。
+  static const String _hwdec = 'auto';
+
+  /// 直通硬解的保底：回到原来的「硬解 + CPU 拷贝」。
   ///
-  /// 不改成 `videotoolbox`：那是「只用 VT、失败就报错」，个别 10bit / 不常见
-  /// pixfmt 的 TikTok 会直接放不出来；auto-copy 调到的仍是 VT，失败时还能
-  /// 回落软解保画面。diag 里 hwdec-current=videotoolbox 占绝大多数，掉到 no
-  /// 的样本集中在同一个 texture 连播多条的时段，说明问题在纹理/解码器复用，
-  /// 不在解码器选择本身。
-  static const String _hwdec = 'auto-copy';
+  /// 只在首帧看门狗超时，或 hwdec-current 提前掉到 `no`（回落软解）并持续
+  /// 超过 [_hwdecNoFallbackMs] 时，对同一条 open 回滚一次。回滚后行为与
+  /// 改前版本一致：`videotoolbox` 解不出来时还能回落软解保画面。
+  static const String _hwdecFallback = 'auto-copy';
+
+  /// 开流初期读 hwdec-current 的节拍与观察窗口。
+  static const int _hwdecProbeIntervalMs = 600;
+  static const int _hwdecProbeWindowMs = 12000;
+
+  /// `hwdec-current` 连续为 `no` 这么久才回滚，避开解码器初始化的一两拍。
+  static const int _hwdecNoFallbackMs = 1200;
 
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
+
+  /// App 是否真的退到了后台（paused / hidden）。
+  ///
+  /// `_appPaused` 还包含 inactive（下拉控制中心），不能拿它判定「PiP 即将
+  /// 接管画面」；否则控制中心一开就会把页内画面压成黑底。这里单独记。
+  bool _appInBackground = false;
+
+  /// PiP 活跃时是否已停掉页内纹理采样。
+  ///
+  /// PiP 原生每帧 `copyPixelBuffer`，页内再挂一个 `Texture` 就是双份拷贝；
+  /// 置真后 [_video] 用黑底占位替代视频层，但播放器和控件都保留。
+  bool _pipFrameSuppressed = false;
+
+  /// 回前台后等原生关闭 PiP 的有界轮询，让页内画面尽快恢复。
+  Timer? _pipFrameWatch;
 
   /// `ui-block` 事件按 stage/step 限流，避免持续卡顿把日志刷爆。
   final Map<String, int> _uiBlockLoggedAt = <String, int>{};
@@ -398,6 +483,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
     _player.textureSource = 'douyin';
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
+    _syncFrameConsumer('init');
+    // B 站首帧预算要按机型分档（6S 12s / 其它 8s）；这里只问一次原生内存，
+    // 之后同步读 ShortVideoPerf.lowMemory，不在看门狗路径上 await。
+    unawaited(ShortVideoPerf.ensureProbed());
     _scheduleChromeHide();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
@@ -447,9 +536,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _stopPipTicker();
+    _pipFrameWatch?.cancel();
+    _pipFrameWatch = null;
     _chromeTimer?.cancel();
     _commentsSession++;
     _firstFrameWatchdog?.cancel();
+    _cancelHwdecProbe();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
     // 一个「以为自己在播」的实例，画面/声音错位，小窗也留在后台。
@@ -483,6 +575,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    _pipFrameWatch?.cancel();
+    _pipFrameWatch = null;
     _disarmPipAutoEnter('shutdown');
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
@@ -517,6 +611,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     // 放在 dispose 之后：dispose 会上报最后一次 texture release，先 stop 就
     // 会把这条漏掉，session-summary 的 alive 峰值/收尾数会不准。
+    DiagProbe.frontFramePulling = false;
     DiagProbe.stop();
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
@@ -574,6 +669,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     int index, {
     String source = 'auto',
     bool force = false,
+    bool uncachedResolve = false,
+    int? firstFrameDeadlineMs,
   }) async {
     if (_disposed || _leaving || _queue.isEmpty) {
       _diagSwitchBlocked(
@@ -641,10 +738,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _openStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     _openStartPositionMs = _player.positionInMilliseconds;
     if (source != 'auto-recover') _recoverStreak = 0;
+    // B 站重试也属于失败处理链路，不能把连续失败计数清零。
+    if (source == 'initial' ||
+        source == 'next' ||
+        source == 'previous' ||
+        source == 'playlist-select') {
+      _skipStreak = 0;
+      _biliPlayurlRetried.remove(_queue[target].key);
+    }
     _cancelFirstFrameWatchdog();
     _firstFrameSeen = false;
     _opening = true;
     _completionArmed = false;
+    _openMediaMissing = false;
     // 开关日志：记录点击/自动连播真正进入 open 的瞬间。isBuffering 不是
     // 拦截条件，这里只把它作为证据写下来，方便对比「buffering 时点了也切」。
     DiagProbe.event('switch-now', <String, Object?>{
@@ -665,26 +771,28 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     var beganOpen = false;
     try {
       final entry = _queue[target];
+      // 同一条如果已经因硬解失败回滚过，后续 open（含自愈重建）沿用
+      // auto-copy；换到别的条目仍从直通 auto 起。
+      final hwdec = _effectiveHwdecFor(entry.key);
       // 切条探针：旧 textureId 必须在 setDataSource 前取，否则拿到的已经
       // 是新纹理，无法判断「换了纹理但没画面」。
       final oldTextureId = _player.videoController?.id.value;
-      // 画中画活跃时绝不能拆纹理，也绝不能复用同一实例换源：原生 PiP 还
-      // 绑着这条 FlutterTexture，换源会让小窗立即黑屏/退出；而共享实例
-      // 换源会连带改掉 B站/PiP 正在用的播放器。直接中止本次切条并留证。
-      if (IOSPipHelper.isActive) {
-        openError = 'pip-active';
-        DiagProbe.event('switch-blocked', <String, Object?>{
-          'source': source,
-          'reason': 'pip-active',
-          'targetIndex': target,
-          'curIndex': fromIndex,
+      // PiP 活跃时不再硬阻断切条：原生 PipSession 会把小窗 surface 留在旧
+      // texture 的最后一帧上（surfaceHold），新实例注册 FlutterTexture 后
+      // 自动 retarget，新首帧到达再解除 hold。唯一前提仍是独占本播放器
+      // 实例——共享单例被别处持有时不能拆，交给下面的检查中止。
+      final pipActive = IOSPipHelper.isActive;
+      if (pipActive) {
+        final allow = _player.canReleaseSolo;
+        DiagProbe.event('pip-switch', <String, Object?>{
+          'allow': allow,
+          'reason': allow ? 'pip-retarget' : 'shared-player',
+          'fromIndex': fromIndex,
+          'toIndex': target,
           'oldTextureId': oldTextureId,
-          'pipEntered': _pipEntered,
+          'pipActive': pipActive,
+          'playerCount': PlPlayerController.playerCount,
         });
-        if (mounted) {
-          setState(() => _error = '画中画使用中，请先关闭小窗再切换');
-        }
-        return;
       }
       // 共享单例被 B站/PiP 持有时不能拆：那会把别人的画面一起换掉。在改
       // _index 之前就判，直接中止本次切换并留证，避免「标题已是下一条、
@@ -709,6 +817,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         key: entry.key,
         oldTextureId: oldTextureId,
         source: source,
+        hwdecRequested: hwdec,
       );
       beganOpen = true;
       DiagProbe.openPhase('resolve');
@@ -733,7 +842,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // 时是慢路径）再查缓存，串行下来就是「右下角都显示缓存 281MB 了，还要
       // 等很久」。现在先试离线，命中就直接开播，cookie 完全不碰。
       final resolveSw = Stopwatch()..start();
-      final media = await _resolveMedia(entry);
+      final media = await _resolveMedia(entry, uncached: uncachedResolve);
       resolveSw.stop();
       _diagUiBlock(
         'open',
@@ -746,6 +855,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       if (media == null || media.url.isEmpty) {
         openError = 'no-media';
+        _openMediaMissing = true;
         setState(() => _error = '解析不出播放地址');
         return;
       }
@@ -757,7 +867,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'key': entry.key,
         'local': media.isLocal,
         'host': Uri.tryParse(media.url)?.host,
-        'hwdecRequested': _hwdec,
+        'hwdecRequested': hwdec,
       });
       // 切条必须在开新流前把旧 Player 连同 FlutterTexture 一起拆掉。
       //
@@ -891,9 +1001,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         autoplay: true,
         isVertical: true,
         isLocalFile: media.isLocal,
-        // 6S 上这些短视频靠 VideoToolbox 才能顺畅；本地缓存同样要解码，
-        // 所以显式打开，不再依赖全局硬解开关。
-        hwdecOverride: _hwdec,
+        // 抖音 / TikTok 默认走直通硬解（auto），只有已回滚过的条目才用
+        // auto-copy；本地缓存同样要解码，显式打开，不依赖全局硬解开关。
+        hwdecOverride: hwdec,
         enableHardwareAcceleration: true,
         // 本地文件时长已知，直接告诉播放器，省掉一次探测。
         duration: media.isLocal && entry.durationMs > 0
@@ -954,7 +1064,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         session: session,
         index: target,
         source: source,
+        hwdec: hwdec,
+        deadlineMs: firstFrameDeadlineMs,
       );
+      if (source == 'bili-retry') _biliRetryOpenSucceeded = true;
       _pushProgress(force: true);
       DiagProbe.openPhase('played');
       DiagProbe.playItem(key: entry.key);
@@ -1159,29 +1272,152 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 首帧判定：起播位置在走，且 mpv 已经识别出视频轨。
   ///
-  /// 会做一次同步 FFI 读取，只允许在看门狗（低频）里调用，不能放进
-  /// 每秒多次的 position 回调。
+  /// 会做一次同步 FFI 读取，只允许在看门狗和短窗口 hwdec 探针（低频）里
+  /// 调用，不能放进每秒多次的 position 回调。
   bool _hasFirstFrameNow() {
     if (_player.dataStatus.value != DataStatus.loaded) return false;
     if (_player.positionInMilliseconds <= 0) return false;
     return (_mpvVideoWidth() ?? 0) > 0;
   }
 
+  /// 当前条目实际应该请求的 hwdec。
+  ///
+  /// 只有「这一条已经回滚过」时才用 auto-copy；其余一律直通 auto。
+  String _effectiveHwdecFor(String key) {
+    if (key.isEmpty) return _hwdec;
+    return _hwdecFallbackKeys.contains(key) ? _hwdecFallback : _hwdec;
+  }
+
+  String? _readHwdecCurrent() {
+    try {
+      final raw = _player.videoPlayerController?.getProperty('hwdec-current');
+      if (raw == null || raw.isEmpty) return null;
+      return raw;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 起播后短窗口内观察 hwdec-current；已经请求 auto-copy 的 open 不再观察。
+  void _armHwdecProbe(String hwdec) {
+    _cancelHwdecProbe();
+    if (hwdec == _hwdecFallback) return;
+    _hwdecProbeStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _hwdecProbeTimer = Timer.periodic(
+      const Duration(milliseconds: _hwdecProbeIntervalMs),
+      (_) => _pollHwdecCurrent(),
+    );
+  }
+
+  void _cancelHwdecProbe() {
+    _hwdecProbeTimer?.cancel();
+    _hwdecProbeTimer = null;
+    _hwdecProbeStartedAtMs = 0;
+    _hwdecNoSinceMs = 0;
+  }
+
+  /// hwdec-current 掉到 `no` 且持续超过 [_hwdecNoFallbackMs] 就回滚一次。
+  ///
+  /// 探针只在两种情况下收工：读到真实硬件解码器（videotoolbox / \*-copy），
+  /// 或 [_hwdecProbeWindowMs] 观察窗口到期。首帧出现不算数——直通失败但
+  /// mpv 回落软解时画面照样能出，这正是要回滚 auto-copy 的场景。
+  /// 暂停 / 后台 / PiP / buffering 一律放过，避免把用户主动暂停或小窗正在
+  /// 用的纹理拆掉。
+  void _pollHwdecCurrent() {
+    if (_disposed || _leaving) {
+      _cancelHwdecProbe();
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_hwdecProbeStartedAtMs == 0 ||
+        now - _hwdecProbeStartedAtMs > _hwdecProbeWindowMs) {
+      _cancelHwdecProbe();
+      return;
+    }
+    if (_opening || _recovering || _pendingOpenIndex != null) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_appPaused || IOSPipHelper.isActive || _player.isBuffering.value) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    // 用户主动暂停在首帧之前不是解码问题；和看门狗一样让路，
+    // 恢复播放后 _togglePlay 会重新挂看门狗与探针。
+    if (!_player.playerStatus.isPlaying) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_player.dataStatus.value != DataStatus.loaded) {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    final current = _readHwdecCurrent();
+    // 落到真实硬件解码器就说明直通成功，停掉探针，别给主 isolate 添读操作。
+    if (_isHwdecHardware(current)) {
+      _cancelHwdecProbe();
+      return;
+    }
+    // 还没定下来（null / auto 之类的请求名）就继续等。
+    if (current != 'no') {
+      _hwdecNoSinceMs = 0;
+      return;
+    }
+    if (_hwdecNoSinceMs == 0) {
+      _hwdecNoSinceMs = now;
+      return;
+    }
+    if (now - _hwdecNoSinceMs < _hwdecNoFallbackMs) return;
+    _fallbackToAutoCopy(
+      reason: 'hwdec-current-no',
+      index: _watchdogIndex,
+      source: _watchdogSource,
+      elapsedMs: now - _hwdecProbeStartedAtMs,
+      elapsedFrom: 'hwdec-probe',
+    );
+  }
+
+  /// hwdec-current 是否已经是真实硬件解码器。
+  ///
+  /// mpv 在解码器定下来之前可能回 `auto` / `auto-safe` 这类请求名，这些
+  /// 都不算成功，继续观察；`no` 是回落软解，交给回滚逻辑。
+  static bool _isHwdecHardware(String? current) {
+    if (current == null || current.isEmpty) return false;
+    if (current == 'no' || current.startsWith('auto')) return false;
+    return true;
+  }
+
   void _armFirstFrameWatchdog({
     required int session,
     required int index,
     required String source,
+    required String hwdec,
+    int? deadlineMs,
   }) {
     _cancelFirstFrameWatchdog();
     _watchdogSession = session;
     _watchdogIndex = index;
     _watchdogSource = source;
-    _watchdogStartedAtMs = DateTime.now().millisecondsSinceEpoch;
+    _watchdogHwdec = hwdec;
+    _watchdogKey = index >= 0 && index < _queue.length
+        ? _queue[index].key
+        : '';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _watchdogStartedAtMs = now;
     _watchdogOpenBusyRetries = 0;
+    var delayMs = _firstFrameWatchdogMs;
+    if (deadlineMs != null) {
+      final remaining = deadlineMs - now;
+      if (remaining > delayMs) delayMs = remaining;
+      if (delayMs > _maxBiliFirstFrameBudgetMs) {
+        delayMs = _maxBiliFirstFrameBudgetMs;
+      }
+    }
     _firstFrameWatchdog = Timer(
-      const Duration(milliseconds: _firstFrameWatchdogMs),
+      Duration(milliseconds: delayMs),
       () => _onFirstFrameWatchdog(session),
     );
+    _armHwdecProbe(hwdec);
   }
 
   void _cancelFirstFrameWatchdog() {
@@ -1189,6 +1425,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _firstFrameWatchdog = null;
     _watchdogGraceUsed = false;
     _watchdogOpenBusyRetries = 0;
+    _cancelHwdecProbe();
   }
 
   void _onFirstFrameWatchdog(int session) {
@@ -1196,11 +1433,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_disposed || _leaving || session != _openSession) return;
     if (_firstFrameSeen) {
       _recoverStreak = 0;
+      _skipStreak = 0;
       return;
     }
     if (_hasFirstFrameNow()) {
       _firstFrameSeen = true;
       _recoverStreak = 0;
+      _skipStreak = 0;
       DiagProbe.event('first-frame-seen', <String, Object?>{
         'index': _watchdogIndex,
         'source': _watchdogSource,
@@ -1279,6 +1518,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       return;
     }
     final width = _player.videoPlayerController?.state.width ?? 0;
+    // 直通硬解首帧超时：先回滚 auto-copy 重开同一条一次，仍不行才走原来
+    // 的整实例自愈。回滚按条目 key 只做一次，不会在两种模式间循环。
+    final canHwdecFallback =
+        _watchdogHwdec != _hwdecFallback && _watchdogKey.isNotEmpty;
     DiagProbe.event('first-frame-watchdog-timeout', <String, Object?>{
       'index': _watchdogIndex,
       'source': _watchdogSource,
@@ -1290,13 +1533,245 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'isBuffering': _player.isBuffering.value,
       'dataStatus': _player.dataStatus.value.name,
       'textureId': _player.videoController?.id.value,
+      'hwdec': _readHwdecCurrent(),
+      'hwdecRequested': _watchdogHwdec,
+      'hwdecFallback': canHwdecFallback,
     });
+    // B 站条目先走一次「重取 playurl」兜底：首帧拿不到经常是签名地址过期/
+    // 换 CDN，重开同一条比整实例重建更对症。按 key 只重试一次；重开后的
+    // 看门狗再超时就直接跳下一条，不在这里做第二次重试。
+    final watchdogIndex = _watchdogIndex;
+    final biliEntry = watchdogIndex >= 0 && watchdogIndex < _queue.length
+        ? _queue[watchdogIndex]
+        : null;
+    if (biliEntry != null && biliEntry.isBili) {
+      final key = biliEntry.key;
+      _cancelFirstFrameWatchdog();
+      _completionArmed = false;
+      if (_biliPlayurlRetried.add(key)) {
+        DiagProbe.event('bili-firstframe-retry', <String, Object?>{
+          'index': watchdogIndex,
+          'attempt': 1,
+          'sinceOpenMs': sinceOpenMs,
+          'key': key,
+          'source': _watchdogSource,
+          'hwdec': _watchdogHwdec,
+          'positionMs': _player.positionInMilliseconds,
+          'videoWidth': _mpvVideoWidth(),
+          'textureId': _player.videoController?.id.value,
+          'budgetMs': _biliFirstFrameBudgetMs,
+        });
+        unawaited(
+          _retryBiliWithFreshPlayurl(watchdogIndex, sinceOpenMs),
+        );
+        return;
+      }
+      unawaited(_skipToNext('bili-firstframe-retry-failed'));
+      return;
+    }
+    if (canHwdecFallback &&
+        _fallbackToAutoCopy(
+          reason: 'no-first-frame',
+          index: _watchdogIndex,
+          source: _watchdogSource,
+          elapsedMs: sinceOpenMs,
+          elapsedFrom: 'watchdog-open',
+        )) {
+      return;
+    }
     unawaited(
       _recoverNoFirstFrame(
         sinceOpenMs: sinceOpenMs,
         source: _watchdogSource,
       ),
     );
+  }
+
+  /// 把当前这一条用 auto-copy 重开一次；返回 true 表示已经发起回滚 open。
+  ///
+  /// 这是唯一一次回滚：[_hwdecFallbackKeys] 记下条目 key 之后，后续任何
+  /// open（含首帧自愈重建）都直接沿用 auto-copy，不会再来回切换。
+  bool _fallbackToAutoCopy({
+    required String reason,
+    required int index,
+    required String source,
+    required int elapsedMs,
+    required String elapsedFrom,
+  }) {
+    if (_disposed || _leaving || _opening || _recovering) return false;
+    if (_pendingOpenIndex != null) return false;
+    if (IOSPipHelper.isActive) return false;
+    // 单例被 B站/PiP 持有时 _open 会在 pre-release 阶段中止；先判掉，
+    // 免得留下一条「并未真正发生」的回滚日志、还把该条永久降级。
+    if (!_player.canReleaseSolo) return false;
+    if (index < 0 || index >= _queue.length || index != _index) return false;
+    final key = _queue[index].key;
+    if (key.isEmpty) return false;
+    final from = _effectiveHwdecFor(key);
+    if (from == _hwdecFallback) return false;
+    if (_hwdecFallbackKeys.length >= _maxHwdecFallbackKeys) {
+      _hwdecFallbackKeys.remove(_hwdecFallbackKeys.first);
+    }
+    _hwdecFallbackKeys.add(key);
+    _cancelFirstFrameWatchdog();
+    // 同一条要整实例重开，连播计数从 0 重新算。
+    _autoPlaysSinceRebuild = 0;
+    DiagProbe.event('hwdec-fallback', <String, Object?>{
+      'reason': reason,
+      'from': from,
+      'to': _hwdecFallback,
+      'elapsedMs': elapsedMs,
+      'elapsedFrom': elapsedFrom,
+      'index': index,
+      'key': key,
+      'source': source,
+      'hwdecCurrent': _readHwdecCurrent(),
+      'firstFrameSeen': _firstFrameSeen,
+      'positionMs': _player.positionInMilliseconds,
+      'textureId': _player.videoController?.id.value,
+    });
+    unawaited(_open(index, source: 'hwdec-fallback', force: true));
+    return true;
+  }
+
+  /// B 站首帧超时的第一层兜底：清掉预热缓存，重新解析 playurl 后重开一次。
+  ///
+  /// 原始 open 已经等过一轮 2800ms，这里不再给完整预算：把「原始 open 起点
+  /// + [_biliFirstFrameBudgetMs]」作为截止时刻传给重开的看门狗，6S 这类
+  /// 老机型总窗口约 12s，其它机型约 8s。重开还失败就跳下一条。
+  Future<void> _retryBiliWithFreshPlayurl(int index, int sinceOpenMs) async {
+    if (_disposed || _leaving || _opening || _recovering) return;
+    if (_pendingOpenIndex != null) return;
+    if (index != _index || index < 0 || index >= _queue.length) return;
+    if (!_queue[index].isBili) return;
+    final deadlineMs =
+        DateTime.now().millisecondsSinceEpoch -
+        sinceOpenMs +
+        _biliFirstFrameBudgetMs;
+    _biliRetryOpenSucceeded = false;
+    // 重开前先停音频；_open 会在 setDataSource 前释放旧 texture，
+    // 避免「画面已经黑了、声音还在播」。
+    try {
+      await _player.pause(notify: false);
+    } catch (_) {}
+    if (!mounted || _disposed || _leaving) return;
+    // 停音频的 await 期间用户可能已经点了别的条目/触发了自愈；此时让路，
+    // 不能用 force 把用户的选择顶掉。
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    await _open(
+      index,
+      source: 'bili-retry',
+      force: true,
+      uncachedResolve: true,
+      firstFrameDeadlineMs: deadlineMs,
+    );
+    if (!mounted || _disposed || _leaving) return;
+    // 用户在这期间点了别的条目，优先听用户的，不要把它跳掉。
+    // `_opening` 为 true 说明 finally 补跳的 pending open 已经接手。
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    if (_index != index) return;
+    if (!_biliRetryOpenSucceeded) {
+      await _skipToNext('bili-retry-open-failed');
+    }
+  }
+
+  /// 统一的「这条救不回来，跳下一条」出口。
+  ///
+  /// 与 [_advance] 共用 [_nextIndex]：随机模式沿用牌堆/已播去重，顺序与
+  /// 循环模式照旧。切之前先停音频，再交给 [_open] 释放旧 texture，
+  /// 不会出现「画面切黑、声音还在播」。
+  Future<bool> _skipToNext(String reason) async {
+    if (_disposed || _leaving || _queue.isEmpty) return false;
+    if (_shuffle) await _shuffleRestore;
+    if (!mounted || _disposed || _leaving) return false;
+    // 等待牌堆恢复期间用户可能已经发起了新的 open；此时让用户的选择优先，
+    // 不要再排一个 skip 把 pending 覆盖掉。
+    if (_opening || _recovering || _pendingOpenIndex != null) return false;
+    if (_skipStreak + 1 >= _maxConsecutiveSkip) {
+      _skipStreak = _maxConsecutiveSkip;
+      _haltAfterSkipLimit(reason);
+      return false;
+    }
+    final fromIndex = _index;
+    final mode = _shuffle ? 'shuffle' : _repeat.name;
+    final next = _nextIndex(auto: true);
+    final attempt = _skipStreak + 1;
+    if (next == null || next == _index) {
+      DiagProbe.event('item-skip', <String, Object?>{
+        'reason': reason,
+        'fromIndex': fromIndex,
+        'toIndex': null,
+        'mode': mode,
+        'attempt': attempt,
+        'result': _queue.length <= 1 ? 'single-item' : 'no-next',
+      });
+      if (mounted) {
+        setState(
+          () => _error = _queue.length <= 1
+              ? '没有可播放的下一条'
+              : '当前播放模式下没有下一条',
+        );
+      }
+      return false;
+    }
+    _skipStreak++;
+    _cancelFirstFrameWatchdog();
+    _completionArmed = false;
+    DiagProbe.event('item-skip', <String, Object?>{
+      'reason': reason,
+      'fromIndex': fromIndex,
+      'toIndex': next,
+      'mode': mode,
+      'attempt': attempt,
+      'key': _queue[fromIndex].key,
+      'nextKey': _queue[next].key,
+    });
+    try {
+      await _player.pause(notify: false);
+    } catch (_) {}
+    if (!mounted || _disposed || _leaving) return false;
+    if (_opening || _recovering || _pendingOpenIndex != null) return false;
+    await _open(next, source: 'skip');
+    if (!mounted || _disposed || _leaving) return false;
+    if (_index != next || _opening || _recovering || _pendingOpenIndex != null) {
+      return true;
+    }
+    // 跳过后的这条连地址都没解析出来：接着跳，计数与停在 3 条的约束
+    // 由 [_skipToNext] 自身保证。
+    if (_openMediaMissing && _error != null) {
+      return _skipToNext('skip-resolve-failed');
+    }
+    return true;
+  }
+
+  /// 连续 [_maxConsecutiveSkip] 条都失败：停下、停音频并给可见提示。
+  void _haltAfterSkipLimit(String reason) {
+    _cancelFirstFrameWatchdog();
+    _completionArmed = false;
+    final mode = _shuffle ? 'shuffle' : _repeat.name;
+    DiagProbe.event('item-skip', <String, Object?>{
+      'reason': reason,
+      'fromIndex': _index,
+      'toIndex': null,
+      'mode': mode,
+      'attempt': _skipStreak,
+      'result': 'stop-after-$_maxConsecutiveSkip',
+    });
+    DiagProbe.event('item-skip-stop', <String, Object?>{
+      'reason': reason,
+      'index': _index,
+      'streak': _skipStreak,
+      'mode': mode,
+    });
+    unawaited(() async {
+      try {
+        await _player.pause(notify: false);
+      } catch (_) {}
+    }());
+    if (!mounted) return;
+    final message = '连续 $_maxConsecutiveSkip 条视频播放失败，已停止自动跳过';
+    setState(() => _error = message);
+    SmartDialog.showToast(message);
   }
 
   /// 整实例重建：dispose 当前 player/texture，重新 getInstance 并挂监听，
@@ -1474,7 +1949,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 解析某一条的播放地址。命中预热结果时直接复用，自动连播不再从零开始
   /// 取 cookie + 解析。
-  Future<QueueMedia?> _resolveMedia(QueueEntry entry) async {
+  Future<QueueMedia?> _resolveMedia(
+    QueueEntry entry, {
+    bool uncached = false,
+  }) async {
+    if (uncached) {
+      // 首帧失败重取时，预热里那条地址可能已经过期，必须清掉再走完整
+      // 解析（B 站会重新请求一次 playurl），不能命中旧的 prefetch。
+      _prefetchKey = null;
+      _prefetchFuture = null;
+      return _resolveMediaUncached(entry);
+    }
     if (_prefetchKey == entry.key) {
       final future = _prefetchFuture;
       _prefetchKey = null;
@@ -1831,6 +2316,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         targetIndex: target,
       );
       if (!healthy && !_opening && !_recovering) {
+        // 用户手动点这一条救场：清掉之前的回滚标记，重新从直通 auto 起。
+        _hwdecFallbackKeys.remove(key);
         _recoverStreak = 0;
         unawaited(
           _recoverNoFirstFrame(sinceOpenMs: 0, source: 'playlist-select'),
@@ -1838,6 +2325,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       return;
     }
+    // 用户手动重选这一条，视为重新尝试直通硬解：一次网络抖动导致的
+    // 看门狗超时不应把该条永久降级。
+    _hwdecFallbackKeys.remove(key);
     // 正在解析/加载上一条时也不能丢弃这次点击。_open 会把目标排队，并把
     // 在途会话作废；列表页已经关了，用户点了就必须最终切过去。
     unawaited(_open(target, source: 'playlist-select'));
@@ -1861,6 +2351,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         session: _watchdogSession,
         index: _watchdogIndex,
         source: _watchdogSource,
+        hwdec: _watchdogHwdec,
       );
     }
     _pushProgress(force: true);
@@ -1900,6 +2391,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       await Future<void>.delayed(const Duration(milliseconds: 400));
       if (_disposed || _leaving) return;
       _syncPipTicker();
+      _syncFrameConsumer('pip-enter-poll');
       if (IOSPipHelper.isActive) return;
     }
   }
@@ -1915,6 +2407,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipStartRequested = false;
     _player.enterPip(autoEnter: true);
     _syncPipTicker();
+    _syncFrameConsumer('pip-arm');
     // arm 后原生要先拿到当前状态；显式 position 绕过状态签名去重。
     _publishPipState(_player.positionInMilliseconds);
     DiagProbe.event('pip-auto-arm', <String, Object?>{
@@ -1937,6 +2430,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipStartRequested = false;
     IOSPipHelper.disableAutoEnter();
     _syncPipTicker();
+    _syncFrameConsumer('pip-disarm');
     DiagProbe.event('pip-auto-arm', <String, Object?>{
       'armed': false,
       'reason': reason,
@@ -1950,6 +2444,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_disposed) return;
     _pipStartRequested = false;
     _syncPipTicker();
+    _syncFrameConsumer('pip-auto-enter');
     DiagProbe.event('pip-auto-enter', <String, Object?>{
       'textureId': _player.videoController?.id.value,
       'isPlaying': _player.playerStatus.isPlaying,
@@ -2015,6 +2510,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   void _startPipTicker() {
     _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _syncFrameConsumer('pip-tick');
       // 原生小窗可能在页面不知情时结束：发现不再需要就自行停掉。
       if (!_pipShouldTick) {
         _stopPipTicker();
@@ -2039,6 +2535,68 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipTicker?.cancel();
     _pipTicker = null;
     _lastPipTickMs = 0;
+  }
+
+  /// 同一时刻只允许一个消费者从 FlutterTexture 取帧。
+  ///
+  /// 这里选「PiP 活跃期间暂停页内采样」，而不是降低原生 enqueue 频率：
+  /// 后者会让小窗自己变慢，且双份拷贝依然存在。页内换成黑底占位后，mpv
+  /// 仍按渲染回调更新纹理，原生 PiP 每帧从同一纹理拷贝，小窗画面不受
+  /// 影响；PiP 结束（[IOSPipHelper.isActive] 变假）后下一次同步会重建
+  /// 视频层，返回播放页不会黑屏。
+  ///
+  /// 退后台请求 PiP 的那一段做乐观压制：Dart 在后台可能被挂起，等不到
+  /// active 回调；回到前台且 PiP 没起来时会立即恢复。
+  void _syncFrameConsumer(String reason) {
+    if (_disposed) return;
+    final pipActive = IOSPipHelper.isActive;
+    final wantSuppress =
+        pipActive ||
+        (_appInBackground && (_pipAutoArmed || _pipStartRequested));
+    DiagProbe.frontFramePulling = !wantSuppress;
+    if (wantSuppress != _pipFrameSuppressed) {
+      if (mounted) {
+        setState(() => _pipFrameSuppressed = wantSuppress);
+      } else {
+        _pipFrameSuppressed = wantSuppress;
+      }
+      DiagProbe.event('frame-consumer', <String, Object?>{
+        'mode': wantSuppress ? 'pip-only' : 'inline',
+        'pipActive': pipActive,
+        'frontFramePull': !wantSuppress,
+        'appPaused': _appInBackground,
+        'reason': reason,
+        'textureId': _player.videoController?.id.value,
+        'isPlaying': _player.playerStatus.isPlaying,
+      });
+    }
+    if (!wantSuppress) {
+      _pipFrameWatch?.cancel();
+      _pipFrameWatch = null;
+    } else if (pipActive && !_appInBackground) {
+      _watchPipFrameConsumer();
+    }
+  }
+
+  /// 原生要等 `didActivate` 才真正关掉小窗；只靠 500ms 的 PiP ticker 最坏
+  /// 会让返回播放页黑 0.5s。这里用 120ms 的有界轮询，active 一变假立即
+  /// 恢复内嵌视频层，最多跑 3s。
+  void _watchPipFrameConsumer() {
+    if (_pipFrameWatch != null) return;
+    var ticks = 0;
+    _pipFrameWatch = Timer.periodic(const Duration(milliseconds: 120), (timer) {
+      if (_disposed || _leaving) {
+        timer.cancel();
+        _pipFrameWatch = null;
+        return;
+      }
+      ticks += 1;
+      _syncFrameConsumer('pip-stop-watch');
+      if (!IOSPipHelper.isActive || ticks >= 25) {
+        timer.cancel();
+        _pipFrameWatch = null;
+      }
+    });
   }
 
   /// 字段形状与 pl_player 的 `_iosPipState()` 对齐；position/duration 用毫秒。
@@ -2262,6 +2820,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.inactive;
+    _appInBackground =
+        state == AppLifecycleState.paused || state == AppLifecycleState.hidden;
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _bgTextureId = textureId;
@@ -2306,6 +2866,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       _bgTextureId = null;
     }
+    _syncFrameConsumer('lifecycle-${state.name}');
   }
 
   /// 打开播放模式选择面板。六种模式一次列全，点哪项切哪项；
@@ -2796,6 +3357,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       ),
     );
+    // PiP 活跃时不再挂 `Texture`：Flutter 停止采样后，原生小窗仍是这条
+    // FlutterTexture 的唯一消费者。mpv 的纹理更新与小窗取帧都不依赖页内
+    // 是否绘制，所以小窗画面不受影响；PiP 结束会 setState 重建 video，
+    // 内嵌画面立即恢复。
+    final displayVideo = _pipFrameSuppressed
+        ? const ColoredBox(color: Colors.black)
+        : video;
     return GestureDetector(
       // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
       //
@@ -2841,9 +3409,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             fit: StackFit.expand,
             children: [
               if (_pipLite && _quarterTurns == 0)
-                video
+                displayVideo
               else
-                RotatedBox(quarterTurns: _quarterTurns, child: video),
+                RotatedBox(quarterTurns: _quarterTurns, child: displayVideo),
               Obx(
                 () => _player.onlyPlayAudio.value
                     ? const IgnorePointer(child: _AudioOnlyBadge())
@@ -4035,7 +4603,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           _sheetTile(
             icon: Icons.settings_suggest_outlined,
             title: '请求解码器',
-            subtitle: _hwdec,
+            subtitle: _queue.isEmpty ? _hwdec : _effectiveHwdecFor(_current.key),
           ),
           _sheetTile(
             icon: Icons.memory_outlined,
