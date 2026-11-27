@@ -1841,14 +1841,20 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   }
 
   Widget _list(ThemeData theme, double bottomInset) {
+    final layout = _FavoritesLayout.forWidth(MediaQuery.sizeOf(context).width);
     return ListView.builder(
-      padding: EdgeInsets.fromLTRB(10, 0, 10, bottomInset + 6),
+      padding: EdgeInsets.fromLTRB(
+        layout.edge,
+        0,
+        layout.edge,
+        bottomInset + layout.gap,
+      ),
       itemCount: _videos.length,
       itemBuilder: (context, index) {
         final video = _videos[index];
         final checked = widget.selected.containsKey(video.key);
         return Padding(
-          padding: const EdgeInsets.only(bottom: 6),
+          padding: EdgeInsets.only(bottom: layout.gap),
           child: Material(
             color: _selecting && checked
                 ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
@@ -1873,11 +1879,11 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _videoCover(theme, video, checked),
+                    _videoCover(theme, video, checked, layout),
                     const SizedBox(width: 10),
                     Expanded(
                       child: SizedBox(
-                        height: 128,
+                        height: layout.coverHeight,
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
@@ -1886,6 +1892,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                               style: theme.textTheme.titleSmall?.copyWith(
+                                fontSize: layout.titleSize,
                                 fontWeight: FontWeight.w600,
                                 height: 1.25,
                               ),
@@ -1925,22 +1932,37 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
                                     ),
                                   ),
                                 ),
-                                const SizedBox(width: 6),
-                                Icon(
-                                  Icons.schedule_rounded,
-                                  size: 12,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                                const SizedBox(width: 2),
-                                Flexible(
-                                  child: Text(
-                                    video.durationText,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: theme.textTheme.labelSmall?.copyWith(
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                      height: 1.2,
-                                    ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.end,
+                                    children: [
+                                      Icon(
+                                        Icons.schedule_rounded,
+                                        size: 12,
+                                        color:
+                                            theme.colorScheme.onSurfaceVariant,
+                                      ),
+                                      const SizedBox(width: 2),
+                                      Flexible(
+                                        child: Text(
+                                          video.durationText,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: theme.textTheme.labelSmall
+                                              ?.copyWith(
+                                                color: theme
+                                                    .colorScheme
+                                                    .onSurfaceVariant,
+                                                height: 1.2,
+                                              ),
+                                        ),
+                                      ),
+                                      if (_cachedKeys.contains(video.key)) ...[
+                                        const SizedBox(width: 8),
+                                        _cachedBadge(theme),
+                                      ],
+                                    ],
                                   ),
                                 ),
                               ],
@@ -2074,7 +2096,12 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  Widget _videoCover(ThemeData theme, ShortVideo video, bool checked) {
+  Widget _videoCover(
+    ThemeData theme,
+    ShortVideo video,
+    bool checked,
+    _FavoritesLayout layout,
+  ) {
     final scheme = theme.colorScheme;
     final progress = _cacheProgress[video.key];
     Widget placeholder() => DecoratedBox(
@@ -2100,8 +2127,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: SizedBox(
-        width: 96,
-        height: 128,
+        width: layout.coverWidth,
+        height: layout.coverHeight,
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -2117,40 +2144,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             if (_selecting && checked)
               ColoredBox(
                 color: scheme.primary.withValues(alpha: 0.14),
-              ),
-            if (_cachedKeys.contains(video.key))
-              Positioned(
-                left: 5,
-                top: 5,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 5,
-                    vertical: 2,
-                  ),
-                  decoration: BoxDecoration(
-                    color: scheme.primary.withValues(alpha: 0.92),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.download_done_rounded,
-                        size: 10,
-                        color: scheme.onPrimary,
-                      ),
-                      const SizedBox(width: 2),
-                      Text(
-                        '已缓存',
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: scheme.onPrimary,
-                          fontSize: 9,
-                          height: 1.1,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
               ),
             if (progress != null && progress < 1)
               Positioned(
@@ -2185,6 +2178,37 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 列表卡片底行的「已缓存」徽标，和时长同一行、整组贴右。
+  Widget _cachedBadge(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: scheme.primary.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.download_done_rounded,
+            size: 11,
+            color: scheme.primary,
+          ),
+          const SizedBox(width: 2),
+          Text(
+            '已缓存',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: scheme.primary,
+              fontWeight: FontWeight.w600,
+              height: 1.2,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -2355,6 +2379,49 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         ),
         child: child,
       ),
+    );
+  }
+}
+
+/// 收藏列表的宽度断点。
+///
+/// iPhone 15 Pro Max 的 Flutter 逻辑宽是 430（1290px/3），所以大屏阈值
+/// 取 420，不能等到 >500；375 的 6S 仍走紧凑档，575 及以上的平板/横屏
+/// 自然落大屏，中间没有断档。
+class _FavoritesLayout {
+  const _FavoritesLayout({
+    required this.edge,
+    required this.gap,
+    required this.coverWidth,
+    required this.coverHeight,
+    required this.titleSize,
+  });
+
+  final double edge;
+  final double gap;
+  final double coverWidth;
+  final double coverHeight;
+
+  /// null 表示沿用主题的 titleSmall，375 档保持改动前的字号不变。
+  final double? titleSize;
+
+  static const _FavoritesLayout _compact = _FavoritesLayout(
+    edge: 10,
+    gap: 6,
+    coverWidth: 96,
+    coverHeight: 128,
+    titleSize: null,
+  );
+
+  static _FavoritesLayout forWidth(double width) {
+    if (width < 420) return _compact;
+    final coverWidth = width * 0.4;
+    return _FavoritesLayout(
+      edge: 20,
+      gap: 12,
+      coverWidth: coverWidth,
+      coverHeight: coverWidth * 4 / 3,
+      titleSize: 15,
     );
   }
 }
