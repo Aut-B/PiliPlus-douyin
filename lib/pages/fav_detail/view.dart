@@ -133,7 +133,7 @@ class _FavDetailPageState extends State<FavDetailPage>
 
   Widget _buildHeader(bool enableMultiSelect, ThemeData theme) {
     return SliverAppBar.medium(
-      leadingWidth: enableMultiSelect ? 125 : null,
+      leadingWidth: enableMultiSelect ? 116 : null,
       leading: enableMultiSelect
           ? Row(
               mainAxisSize: .min,
@@ -145,9 +145,13 @@ class _FavDetailPageState extends State<FavDetailPage>
                 ),
                 Obx(
                   () {
-                    return Text(
-                      '已选: ${controller.checkedCount}',
-                      style: const TextStyle(fontSize: 15),
+                    return Flexible(
+                      child: Text(
+                        '已选: ${controller.checkedCount}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 15),
+                      ),
                     );
                   },
                 ),
@@ -178,6 +182,16 @@ class _FavDetailPageState extends State<FavDetailPage>
 
   List<Widget> _actions(ThemeData theme) {
     return [
+      TextButton(
+        onPressed: () => controller.enableMultiSelect.value = true,
+        style: TextButton.styleFrom(
+          visualDensity: VisualDensity.compact,
+          minimumSize: Size.zero,
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        child: const Text('多选'),
+      ),
       IconButton(
         tooltip: '搜索',
         onPressed: () {
@@ -325,45 +339,44 @@ class _FavDetailPageState extends State<FavDetailPage>
         onPressed: () => controller.handleSelect(checked: true),
         child: const Text('全选'),
       ),
-      IconButton(
-        tooltip: '加入播放列表',
-        iconSize: 20,
-        padding: EdgeInsets.zero,
-        constraints: const BoxConstraints.tightFor(width: 36, height: 36),
-        visualDensity: VisualDensity.compact,
+      TextButton.icon(
+        style: btnStyle,
         onPressed: controller.addCheckedToPlaylist,
-        icon: const Icon(Icons.playlist_add),
+        icon: const Icon(Icons.playlist_add, size: 18),
+        label: const Text('加入播放列表'),
       ),
-      TextButton(
-        style: btnStyle,
-        onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
-          context: context,
-          isCopy: true,
-          ctr: controller,
-          mediaId: controller.mediaId,
-          mid: controller.account.mid,
+      if (controller.isOwner) ...[
+        TextButton(
+          style: btnStyle,
+          onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
+            context: context,
+            isCopy: true,
+            ctr: controller,
+            mediaId: controller.mediaId,
+            mid: controller.account.mid,
+          ),
+          child: Text('复制', style: textStyle),
         ),
-        child: Text('复制', style: textStyle),
-      ),
-      TextButton(
-        style: btnStyle,
-        onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
-          context: context,
-          isCopy: false,
-          ctr: controller,
-          mediaId: controller.mediaId,
-          mid: controller.account.mid,
+        TextButton(
+          style: btnStyle,
+          onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
+            context: context,
+            isCopy: false,
+            ctr: controller,
+            mediaId: controller.mediaId,
+            mid: controller.account.mid,
+          ),
+          child: Text('移动', style: textStyle),
         ),
-        child: Text('移动', style: textStyle),
-      ),
-      TextButton(
-        style: btnStyle,
-        onPressed: controller.onRemove,
-        child: Text(
-          '删除',
-          style: TextStyle(color: theme.colorScheme.error),
+        TextButton(
+          style: btnStyle,
+          onPressed: controller.onRemove,
+          child: Text(
+            '删除',
+            style: TextStyle(color: theme.colorScheme.error),
+          ),
         ),
-      ),
+      ],
       const SizedBox(width: 10),
     ];
   }

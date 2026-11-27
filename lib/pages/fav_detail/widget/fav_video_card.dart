@@ -123,22 +123,56 @@ class FavVideoCardH extends StatelessWidget {
                           const PBadge(
                             text: '音频',
                             top: 6.0,
-                            right: 6.0,
+                            left: 6.0,
                             type: PBadgeType.gray,
                           )
                         else
                           PBadge(
                             text: item.ogv?.typeName,
                             top: 6.0,
-                            right: 6.0,
+                            left: 6.0,
                             bottom: null,
-                            left: null,
                           ),
                         if (!isSort)
                           Positioned.fill(
-                            child: selectMask(
-                              colorScheme,
-                              item.checked,
+                            child: IgnorePointer(
+                              ignoring: !enableMultiSelect,
+                              child: selectMask(
+                                colorScheme,
+                                item.checked,
+                              ),
+                            ),
+                          ),
+                        if (!isSort)
+                          Positioned(
+                            top: 6,
+                            right: 6,
+                            child: IgnorePointer(
+                              ignoring: !enableMultiSelect,
+                              child: Material(
+                                color: colorScheme.surface.withValues(
+                                  alpha: 0.9,
+                                ),
+                                shape: const CircleBorder(),
+                                elevation: 1,
+                                child: InkWell(
+                                  customBorder: const CircleBorder(),
+                                  onTap: () => ctr!.onSelect(item),
+                                  child: SizedBox(
+                                    width: 26,
+                                    height: 26,
+                                    child: Icon(
+                                      item.checked
+                                          ? Icons.check_circle_rounded
+                                          : Icons.circle_outlined,
+                                      size: 20,
+                                      color: item.checked
+                                          ? colorScheme.primary
+                                          : colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
                       ],
