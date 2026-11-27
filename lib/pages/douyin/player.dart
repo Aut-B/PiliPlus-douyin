@@ -1625,6 +1625,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     required String hwdec,
   }) {
     _cancelThroughputWatchdog();
+    // 140 回归修复：该吞吐看门狗在 6S(低内存) 上，只要「在播但 positionRatio<0.5
+    // 或 fps 偏低」，就会调 _fallbackToAutoCopy 把这条重新开流、hwdec 从 auto 直通
+    // 降成 auto-copy(videotoolbox-copy，GPU↔CPU 逐帧拷贝，比 auto 更慢)，并把 key
+    // 记入 _hwdecFallbackKeys 后持续走 copy，形成「越判越卡」的自伤正反馈——这是
+    // 124→139 唯一多出来的前台回归。故只在 verbose 诊断包启用，正式包不再运行；
+    // P1「首帧丢失才回退 auto-copy」是另一条链路(见 _armHwdecProbe/_onFirstFrameWatchdog)，保留不动。
+    if (!kDiagVerbose) return;
     _throughputIndex = index;
     _throughputSource = source;
     _throughputKey = index >= 0 && index < _queue.length
