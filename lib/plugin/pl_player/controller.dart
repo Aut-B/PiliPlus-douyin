@@ -388,7 +388,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   static bool _isVideoPage(String routeName) {
-    return routeName == '/videoV' || routeName == '/liveRoom';
+    return routeName == '/videoV' ||
+        routeName == '/liveRoom' ||
+        // 抖音页只在 Android 接入自动 PiP，保持 iOS 原有路由判定不变。
+        (Platform.isAndroid && routeName == '/shortVideoPlayer');
   }
 
   void enterPip({bool autoEnter = false}) {

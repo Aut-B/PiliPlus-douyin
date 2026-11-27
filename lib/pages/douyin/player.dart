@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
@@ -19,6 +20,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/services/service_locator.dart';
+import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/storage.dart';
@@ -2365,6 +2367,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   Future<void> _enterPip() async {
+    if (Platform.isAndroid) {
+      final allow = PiliAndroidHelper.isPipAvailable;
+      DiagProbe.event('android-pip-enter', <String, Object?>{
+        'allow': allow,
+        'reason': allow ? 'manual' : 'unsupported',
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      if (!allow) {
+        SmartDialog.showToast('这台设备不支持画中画');
+        return;
+      }
+      _pipEntered = true;
+      // Android 的 PiP 由 controller 分派到 PageUtils/PiliAndroidHelper，
+      // 这里与 B 站播放页的手动入口保持一致，直接请求进入小窗。
+      _player.enterPip(autoEnter: false);
+      return;
+    }
     if (!IOSPipHelper.isAvailable) {
       SmartDialog.showToast('这台设备不支持画中画');
       return;
@@ -2400,6 +2421,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// `canStartPictureInPictureAutomaticallyFromInline = true`，按 Home 退后台即起小窗。
   void _armPipAutoEnter(String reason) {
     if (_disposed || _leaving || !mounted || _appPaused) return;
+    if (Platform.isAndroid) {
+      if (_pipAutoArmed) return;
+      final allow = PiliAndroidHelper.isPipAvailable;
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': allow,
+        'reason': reason,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      if (!allow) return;
+      _pipAutoArmed = true;
+      _pipStartRequested = false;
+      // SDK >= 31 由原生设置 autoEnterEnabled；更老的版本在真正退后台时
+      // 再由 _requestPipAutoEnterOnBackground 显式请求进入。
+      _player.enterPip(autoEnter: true);
+      return;
+    }
     if (_pipAutoArmed || !IOSPipHelper.isAvailable) return;
     final textureId = _player.videoController?.id.value;
     if (textureId == null) return;
@@ -2428,6 +2467,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _pipAutoArmed = false;
     _pipStartRequested = false;
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.disableAutoEnterPip();
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': true,
+        'armed': false,
+        'reason': reason,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+      });
+      return;
+    }
     IOSPipHelper.disableAutoEnter();
     _syncPipTicker();
     _syncFrameConsumer('pip-disarm');
@@ -2461,8 +2511,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _requestPipAutoEnterOnBackground(String reason) {
     if (_disposed || _leaving || !mounted) return;
     if (!_pipAutoArmed || _pipStartRequested) return;
-    if (IOSPipHelper.isActive || !IOSPipHelper.isAvailable) return;
     if (!_player.playerStatus.isPlaying) return;
+    if (Platform.isAndroid) {
+      if (!PiliAndroidHelper.isPipAvailable) return;
+      _pipStartRequested = true;
+      // 已经离开前台，直接用 autoEnter:false 请求系统进入小窗；SDK < 31
+      // 的原生 autoEnter 不支持，但 enterPictureInPictureMode 仍可用。
+      _player.enterPip(autoEnter: false);
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': true,
+        'reason': reason,
+        'action': 'start',
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      return;
+    }
+    if (IOSPipHelper.isActive || !IOSPipHelper.isAvailable) return;
     _pipStartRequested = true;
     IOSPipHelper.requestStart();
     DiagProbe.event('pip-auto-start', <String, Object?>{
@@ -2497,7 +2563,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// PiP 活跃时每 500ms 推一次 position，原生 timebase 才会前进；只在进入
   /// 画中画时推一次的话，老机型依旧会卡帧。非活跃时 [_publishPipState]
   /// 只在状态变化时真正下发，不再每 500ms 走一次 method channel。
-  bool get _pipShouldTick => _pipAutoArmed || IOSPipHelper.isActive;
+  bool get _pipShouldTick =>
+      !Platform.isAndroid && (_pipAutoArmed || IOSPipHelper.isActive);
 
   /// 只在 PiP armed / active 时跑 ticker，正常前台播放不产生 500ms 定时器。
   void _syncPipTicker() {
@@ -2549,6 +2616,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// active 回调；回到前台且 PiP 没起来时会立即恢复。
   void _syncFrameConsumer(String reason) {
     if (_disposed) return;
+    if (Platform.isAndroid) {
+      // Android 的 PiP 是整个 Activity 进入小窗，Flutter texture 仍是唯一
+      // 画面来源；不能套用 iOS 的停页内采样逻辑，否则小窗会变黑。
+      DiagProbe.frontFramePulling = true;
+      if (_pipFrameSuppressed) {
+        if (mounted) {
+          setState(() => _pipFrameSuppressed = false);
+        } else {
+          _pipFrameSuppressed = false;
+        }
+      }
+      return;
+    }
     final pipActive = IOSPipHelper.isActive;
     final wantSuppress =
         pipActive ||
