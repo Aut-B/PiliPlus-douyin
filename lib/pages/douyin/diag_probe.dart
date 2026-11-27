@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'package:PiliPlus/pages/douyin/rootscan.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
+import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
@@ -187,6 +188,13 @@ abstract final class DiagProbe {
   static Future<Directory> _docDir() =>
       _documentsDir ??= getApplicationDocumentsDirectory();
 
+  /// 抖音页当前是否在逐帧采样 FlutterTexture。
+  ///
+  /// PiP 活跃时页面会把内嵌视频层换成占位，避免和原生小窗同时从同一纹理
+  /// 取帧。这里由 player 页维护，只用于诊断：每条日志都带上该值，配合
+  /// [IOSPipHelper.isActive] 即可证明同一时刻只有一个消费者。
+  static bool frontFramePulling = false;
+
   /// 诊断：PiP 轻量模式。默认开启；关闭后回到源分辨率渲染路径，便于 A/B。
   static bool get pipLiteMode {
     try {
@@ -324,6 +332,8 @@ abstract final class DiagProbe {
       'positionMs': null,
       'textureId': null,
       'dataStatus': null,
+      'pipActive': IOSPipHelper.isActive,
+      'frontFramePull': frontFramePulling,
     };
     PlPlayerController? player;
     try {
@@ -1097,6 +1107,8 @@ abstract final class DiagProbe {
       't': DateTime.now().millisecondsSinceEpoch,
       'tag': tag,
       ...fields,
+      'pipActive': IOSPipHelper.isActive,
+      'frontFramePull': frontFramePulling,
     });
     _writeBuffer.add(line);
     if (_writeBuffer.length >= _writeBatchLines) {

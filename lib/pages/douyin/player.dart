@@ -360,6 +360,21 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
 
+  /// App 是否真的退到了后台（paused / hidden）。
+  ///
+  /// `_appPaused` 还包含 inactive（下拉控制中心），不能拿它判定「PiP 即将
+  /// 接管画面」；否则控制中心一开就会把页内画面压成黑底。这里单独记。
+  bool _appInBackground = false;
+
+  /// PiP 活跃时是否已停掉页内纹理采样。
+  ///
+  /// PiP 原生每帧 `copyPixelBuffer`，页内再挂一个 `Texture` 就是双份拷贝；
+  /// 置真后 [_video] 用黑底占位替代视频层，但播放器和控件都保留。
+  bool _pipFrameSuppressed = false;
+
+  /// 回前台后等原生关闭 PiP 的有界轮询，让页内画面尽快恢复。
+  Timer? _pipFrameWatch;
+
   /// `ui-block` 事件按 stage/step 限流，避免持续卡顿把日志刷爆。
   final Map<String, int> _uiBlockLoggedAt = <String, int>{};
 
@@ -428,6 +443,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
     _player.textureSource = 'douyin';
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
+    _syncFrameConsumer('init');
     _scheduleChromeHide();
     unawaited(_primeBrightness());
     unawaited(_primeVolume());
@@ -477,6 +493,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _stopPipTicker();
+    _pipFrameWatch?.cancel();
+    _pipFrameWatch = null;
     _chromeTimer?.cancel();
     _commentsSession++;
     _firstFrameWatchdog?.cancel();
@@ -514,6 +532,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_leaving && !alreadyLeft) return;
     _leaving = true;
     _disposed = true;
+    _pipFrameWatch?.cancel();
+    _pipFrameWatch = null;
     _disarmPipAutoEnter('shutdown');
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
@@ -548,6 +568,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     // 放在 dispose 之后：dispose 会上报最后一次 texture release，先 stop 就
     // 会把这条漏掉，session-summary 的 alive 峰值/收尾数会不准。
+    DiagProbe.frontFramePulling = false;
     DiagProbe.stop();
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
@@ -2120,6 +2141,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       await Future<void>.delayed(const Duration(milliseconds: 400));
       if (_disposed || _leaving) return;
       _syncPipTicker();
+      _syncFrameConsumer('pip-enter-poll');
       if (IOSPipHelper.isActive) return;
     }
   }
@@ -2135,6 +2157,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipStartRequested = false;
     _player.enterPip(autoEnter: true);
     _syncPipTicker();
+    _syncFrameConsumer('pip-arm');
     // arm 后原生要先拿到当前状态；显式 position 绕过状态签名去重。
     _publishPipState(_player.positionInMilliseconds);
     DiagProbe.event('pip-auto-arm', <String, Object?>{
@@ -2157,6 +2180,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipStartRequested = false;
     IOSPipHelper.disableAutoEnter();
     _syncPipTicker();
+    _syncFrameConsumer('pip-disarm');
     DiagProbe.event('pip-auto-arm', <String, Object?>{
       'armed': false,
       'reason': reason,
@@ -2170,6 +2194,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     if (_disposed) return;
     _pipStartRequested = false;
     _syncPipTicker();
+    _syncFrameConsumer('pip-auto-enter');
     DiagProbe.event('pip-auto-enter', <String, Object?>{
       'textureId': _player.videoController?.id.value,
       'isPlaying': _player.playerStatus.isPlaying,
@@ -2235,6 +2260,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   void _startPipTicker() {
     _pipTicker ??= Timer.periodic(const Duration(milliseconds: 500), (_) {
+      _syncFrameConsumer('pip-tick');
       // 原生小窗可能在页面不知情时结束：发现不再需要就自行停掉。
       if (!_pipShouldTick) {
         _stopPipTicker();
@@ -2259,6 +2285,68 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pipTicker?.cancel();
     _pipTicker = null;
     _lastPipTickMs = 0;
+  }
+
+  /// 同一时刻只允许一个消费者从 FlutterTexture 取帧。
+  ///
+  /// 这里选「PiP 活跃期间暂停页内采样」，而不是降低原生 enqueue 频率：
+  /// 后者会让小窗自己变慢，且双份拷贝依然存在。页内换成黑底占位后，mpv
+  /// 仍按渲染回调更新纹理，原生 PiP 每帧从同一纹理拷贝，小窗画面不受
+  /// 影响；PiP 结束（[IOSPipHelper.isActive] 变假）后下一次同步会重建
+  /// 视频层，返回播放页不会黑屏。
+  ///
+  /// 退后台请求 PiP 的那一段做乐观压制：Dart 在后台可能被挂起，等不到
+  /// active 回调；回到前台且 PiP 没起来时会立即恢复。
+  void _syncFrameConsumer(String reason) {
+    if (_disposed) return;
+    final pipActive = IOSPipHelper.isActive;
+    final wantSuppress =
+        pipActive ||
+        (_appInBackground && (_pipAutoArmed || _pipStartRequested));
+    DiagProbe.frontFramePulling = !wantSuppress;
+    if (wantSuppress != _pipFrameSuppressed) {
+      if (mounted) {
+        setState(() => _pipFrameSuppressed = wantSuppress);
+      } else {
+        _pipFrameSuppressed = wantSuppress;
+      }
+      DiagProbe.event('frame-consumer', <String, Object?>{
+        'mode': wantSuppress ? 'pip-only' : 'inline',
+        'pipActive': pipActive,
+        'frontFramePull': !wantSuppress,
+        'appPaused': _appInBackground,
+        'reason': reason,
+        'textureId': _player.videoController?.id.value,
+        'isPlaying': _player.playerStatus.isPlaying,
+      });
+    }
+    if (!wantSuppress) {
+      _pipFrameWatch?.cancel();
+      _pipFrameWatch = null;
+    } else if (pipActive && !_appInBackground) {
+      _watchPipFrameConsumer();
+    }
+  }
+
+  /// 原生要等 `didActivate` 才真正关掉小窗；只靠 500ms 的 PiP ticker 最坏
+  /// 会让返回播放页黑 0.5s。这里用 120ms 的有界轮询，active 一变假立即
+  /// 恢复内嵌视频层，最多跑 3s。
+  void _watchPipFrameConsumer() {
+    if (_pipFrameWatch != null) return;
+    var ticks = 0;
+    _pipFrameWatch = Timer.periodic(const Duration(milliseconds: 120), (timer) {
+      if (_disposed || _leaving) {
+        timer.cancel();
+        _pipFrameWatch = null;
+        return;
+      }
+      ticks += 1;
+      _syncFrameConsumer('pip-stop-watch');
+      if (!IOSPipHelper.isActive || ticks >= 25) {
+        timer.cancel();
+        _pipFrameWatch = null;
+      }
+    });
   }
 
   /// 字段形状与 pl_player 的 `_iosPipState()` 对齐；position/duration 用毫秒。
@@ -2482,6 +2570,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.inactive;
+    _appInBackground =
+        state == AppLifecycleState.paused || state == AppLifecycleState.hidden;
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _bgTextureId = textureId;
@@ -2526,6 +2616,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       _bgTextureId = null;
     }
+    _syncFrameConsumer('lifecycle-${state.name}');
   }
 
   /// 打开播放模式选择面板。六种模式一次列全，点哪项切哪项；
@@ -3016,6 +3107,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       ),
     );
+    // PiP 活跃时不再挂 `Texture`：Flutter 停止采样后，原生小窗仍是这条
+    // FlutterTexture 的唯一消费者。mpv 的纹理更新与小窗取帧都不依赖页内
+    // 是否绘制，所以小窗画面不受影响；PiP 结束会 setState 重建 video，
+    // 内嵌画面立即恢复。
+    final displayVideo = _pipFrameSuppressed
+        ? const ColoredBox(color: Colors.black)
+        : video;
     return GestureDetector(
       // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
       //
@@ -3061,9 +3159,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
             fit: StackFit.expand,
             children: [
               if (_pipLite && _quarterTurns == 0)
-                video
+                displayVideo
               else
-                RotatedBox(quarterTurns: _quarterTurns, child: video),
+                RotatedBox(quarterTurns: _quarterTurns, child: displayVideo),
               Obx(
                 () => _player.onlyPlayAudio.value
                     ? const IgnorePointer(child: _AudioOnlyBadge())
