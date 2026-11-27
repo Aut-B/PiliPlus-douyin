@@ -1347,9 +1347,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _startPlaybackHealthSampler() {
     _playbackHealthTimer?.cancel();
     _playbackHealthTimer = null;
-    // 纯诊断的 5s 全量采样在 diag 关闭时不应存在；吞吐看门狗有自己的
-    // 功能性采样，不依赖这个定时器。
-    if (!kDiagEnabled) return;
+    // 纯诊断的 5s 全量采样是同步 FFI（getProperty 会阻塞主线程），不能默认开：
+    // 只在显式 --dart-define=PILIPLUS_DIAG_VERBOSE=true 的深度诊断包里才跑。
+    // 124 没有这个定时器；138 把它错挂在默认 ON 的 kDiagEnabled 上，导致正式包
+    // 每 5 秒同步读一批 mpv 属性、在 6S 上周期性卡（含 B站，各片源都受影响）。
+    // 手动「导出诊断」仍按需读取当前状态；功能性吞吐看门狗另有采样，不依赖它。
+    if (!kDiagEnabled || !kDiagVerbose) return;
     _playbackHealthTimer = Timer.periodic(
       const Duration(milliseconds: _healthSampleIntervalMs),
       (_) => _samplePlaybackHealth(),
