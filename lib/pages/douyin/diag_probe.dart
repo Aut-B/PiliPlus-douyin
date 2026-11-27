@@ -154,6 +154,28 @@ abstract final class DiagProbe {
   static final Map<String, int> _sessionOpenBySource = <String, int>{};
   static final Map<String, int> _sessionBlackBySource = <String, int>{};
 
+  /// 本次 run 的唯一标识。
+  ///
+  /// 每条日志都带 `runId`，导出后可直接按 run 过滤；`startSession()` 会
+  /// 生成新值并清空上一 run 的落盘文件，避免旧行混进本次判定。
+  static String _runId = '';
+  static int _runSeq = 0;
+
+  /// 设备信息缓存（原生 `appInfo`）。session 很短时 summary 最多等 800ms。
+  static Map<String, Object?> _deviceInfo = <String, Object?>{};
+  static Future<Map<String, Object?>>? _deviceInfoFuture;
+
+  /// 混播续播聚合计数，`stop()` 时写进 `session-summary`。
+  static int _sessionPlayedItems = 0;
+  static final Set<String> _sessionPlayedKeys = <String>{};
+  static int _sessionItemSkipCount = 0;
+  static int _sessionItemSkipEventCount = 0;
+  static int _sessionSkipStopCount = 0;
+  static int _sessionMaxConsecutiveSkip = 0;
+  static int _sessionPipSwitchCount = 0;
+  static int _sessionBiliRetryCount = 0;
+  static bool _pipEverActive = false;
+
   /// 纹理生命周期账本：textureId -> source。
   ///
   /// 只统计 controller 通过 [PlPlayerController.textureObserver] 上报的纹理，
@@ -213,7 +235,7 @@ abstract final class DiagProbe {
   /// 页面会话起点。进入播放页时调用一次；[stop] 时写 `session-summary`。
   static void startSession() {
     if (!kDiagEnabled) return;
-    _sessionStartedAt = DateTime.now().millisecondsSinceEpoch;
+    _beginRun();
     _openSeq = 0;
     _sessionBlackCount = 0;
     _sessionTextureIds.clear();
@@ -238,6 +260,62 @@ abstract final class DiagProbe {
         reason: 'session-start',
       );
     }
+  }
+
+  /// 开始一轮新的诊断 run：新 runId、清空上一轮聚合计数，并把上一轮的
+  /// 诊断文件清空。旧缓冲先排进写链，再清文件，保证旧行不会落进新 run。
+  static void _beginRun() {
+    _runSeq += 1;
+    _runId =
+        '${DateTime.now().millisecondsSinceEpoch}-'
+        '${_runSeq.toString().padLeft(3, '0')}';
+    _sessionPlayedItems = 0;
+    _sessionPlayedKeys.clear();
+    _sessionItemSkipCount = 0;
+    _sessionItemSkipEventCount = 0;
+    _sessionSkipStopCount = 0;
+    _sessionMaxConsecutiveSkip = 0;
+    _sessionPipSwitchCount = 0;
+    _sessionBiliRetryCount = 0;
+    _pipEverActive = IOSPipHelper.isActive;
+    _deviceInfo = <String, Object?>{};
+    _deviceInfoFuture = appInfo().then((info) {
+      _deviceInfo = info;
+      return info;
+    });
+    _flushBuffer();
+    _writeChain = _writeChain.then((_) => _resetRunArtifacts());
+    _sessionStartedAt = DateTime.now().millisecondsSinceEpoch;
+    _append('session-start', <String, Object?>{
+      'runId': _runId,
+      'runSeq': _runSeq,
+      'pipActive': IOSPipHelper.isActive,
+      'pipLite': pipLiteMode,
+      'diagVerbose': kDiagVerbose,
+    });
+  }
+
+  /// 清空上一 run 的追加型诊断文件。失败只影响体积，不影响本次采样。
+  ///
+  /// `pip_trace.log` 由原生常驻句柄追加，这里只截断不删除：原生下次
+  /// `seekToEnd` 会从 0 继续写，不会把文件写坏。rootscan.json /
+  /// ui_hierarchy.txt 每次都是整文件覆盖，不在这里截断，避免和本次
+  /// postFrame 的写入抢时序。
+  static Future<void> _resetRunArtifacts() async {
+    try {
+      final dir = await _docDir();
+      for (final name in <String>[kDiagPlaybackFile, 'pip_trace.log']) {
+        try {
+          final file = File('${dir.path}/$name');
+          if (await file.exists()) {
+            await file.writeAsString('', flush: false);
+          }
+        } catch (_) {}
+      }
+      _playbackBytes = 0;
+      // 旧诊断包同样只保留本轮导出的那一份，避免 Documents 里累计。
+      await _deleteOldExports(dir, keep: '');
+    } catch (_) {}
   }
 
   static int? _currentTextureId() {
@@ -692,18 +770,35 @@ abstract final class DiagProbe {
   static void stop() {
     if (!kDiagEnabled) return;
     _stopOpenProbe();
-    _appendSessionSummary();
     PlPlayerController.textureObserver = null;
-    unawaited(flush());
+    final summary = _buildSessionSummary();
+    if (summary == null) {
+      unawaited(flush());
+    } else {
+      unawaited(_appendSummaryAndFlush(summary));
+    }
   }
 
-  static void _appendSessionSummary() {
-    if (_sessionStartedAt == 0) return;
+  /// 抓取 session 结束时的快照。必须在 [_sessionStartedAt] 清零前调用，
+  /// 否则 `pageAliveMs` 会被算成 0；重复调用返回 null，不会写两条 summary。
+  static Map<String, Object?>? _buildSessionSummary() {
+    if (_sessionStartedAt == 0) return null;
     Map<String, Object?> bySource(String key) => <String, Object?>{
       'open': _sessionOpenBySource[key] ?? 0,
       'black': _sessionBlackBySource[key] ?? 0,
     };
-    _append('session-summary', <String, Object?>{
+    final summary = <String, Object?>{
+      'runId': _runId,
+      'playedItemCount': _sessionPlayedItems,
+      'distinctItemCount': _sessionPlayedKeys.length,
+      'itemSkipCount': _sessionItemSkipCount,
+      'itemSkipEventCount': _sessionItemSkipEventCount,
+      'skipStopCount': _sessionSkipStopCount,
+      'maxConsecutiveSkip': _sessionMaxConsecutiveSkip,
+      'pipSwitchCount': _sessionPipSwitchCount,
+      'biliFirstFrameRetryCount': _sessionBiliRetryCount,
+      'pipActive': IOSPipHelper.isActive,
+      'pipEverActive': _pipEverActive,
       'openedCount': _sessionOpenBySource.values.fold<int>(
         0,
         (sum, value) => sum + value,
@@ -723,8 +818,49 @@ abstract final class DiagProbe {
         'playlistSelect': bySource('playlist-select'),
         'initial': bySource('initial'),
       },
-    });
+    };
     _sessionStartedAt = 0;
+    return summary;
+  }
+
+  /// 设备型号由原生通道异步读取；session 太短时最多等 800ms，拿不到就
+  /// 只写 Dart 侧能拿到的系统版本，绝不为了机型卡住退出流程。
+  static Future<void> _appendSummaryAndFlush(
+    Map<String, Object?> summary,
+  ) async {
+    var info = _deviceInfo;
+    if ((info['model'] as String?)?.isNotEmpty != true) {
+      try {
+        info = await (_deviceInfoFuture ?? appInfo()).timeout(
+          const Duration(milliseconds: 800),
+        );
+      } catch (_) {}
+    }
+    // 取机型期间若已开始下一 run，旧 summary 不能再写进新 run 的文件。
+    if (summary['runId'] != _runId) return;
+    final model = info['model'] as String?;
+    _append('session-summary', <String, Object?>{
+      ...summary,
+      'model': model,
+      'deviceLabel': _deviceLabel(model),
+      'systemVersion': info['systemVersion'] ?? Platform.operatingSystemVersion,
+      'appVersion': info['version'],
+      'appBuild': info['build'],
+      'app': info,
+    });
+    await flush();
+  }
+
+  /// 把硬件标识翻成测试同事看得懂的机型；未知型号保留原始值。
+  static String? _deviceLabel(String? model) {
+    if (model == null || model.isEmpty) return null;
+    const labels = <String, String>{
+      'iPhone8,1': 'iPhone 6s',
+      'iPhone8,2': 'iPhone 6s Plus',
+      'iPhone15,2': 'iPhone 15 Pro',
+      'iPhone15,3': 'iPhone 15 Pro Max',
+    };
+    return labels[model] ?? model;
   }
 
   /// 把 Documents 下的诊断文件打成一个 zip，并交给系统分享面板。
@@ -1103,9 +1239,18 @@ abstract final class DiagProbe {
 
   static void _append(String tag, Map<String, Object?> fields) {
     if (!kDiagEnabled) return;
+    if (_runId.isEmpty) {
+      _runSeq += 1;
+      _runId =
+          '${DateTime.now().millisecondsSinceEpoch}-'
+          '${_runSeq.toString().padLeft(3, '0')}';
+    }
+    if (IOSPipHelper.isActive) _pipEverActive = true;
+    _trackSessionMetrics(tag, fields);
     final line = jsonEncode(<String, Object?>{
       't': DateTime.now().millisecondsSinceEpoch,
       'tag': tag,
+      'runId': _runId,
       ...fields,
       'pipActive': IOSPipHelper.isActive,
       'frontFramePull': frontFramePulling,
@@ -1118,6 +1263,47 @@ abstract final class DiagProbe {
         const Duration(milliseconds: _writeFlushDelayMs),
         _flushBuffer,
       );
+    }
+  }
+
+  /// 从既有事件流里聚合续播指标，避免 player 每个出口再各写一套计数。
+  ///
+  /// - `pip-switch` 且 allow=true：PiP 内真实发生的切条；
+  /// - `bili-firstframe-retry`：B站首帧失败后重取 playurl；
+  /// - `play-item`：一次成功起播；
+  /// - `item-skip` / `item-skip-stop`：跳过次数与最大连续失败数。
+  static void _trackSessionMetrics(
+    String tag,
+    Map<String, Object?> fields,
+  ) {
+    if (_sessionStartedAt == 0) return;
+    if (tag == 'diag_event') {
+      final name = fields['event'];
+      if (name == 'pip-switch' && fields['allow'] == true) {
+        _sessionPipSwitchCount += 1;
+      } else if (name == 'bili-firstframe-retry') {
+        _sessionBiliRetryCount += 1;
+      } else if (name == 'item-skip') {
+        _sessionItemSkipEventCount += 1;
+        if (fields['toIndex'] != null) _sessionItemSkipCount += 1;
+        _noteSkipAttempt(fields);
+      } else if (name == 'item-skip-stop') {
+        _sessionSkipStopCount += 1;
+        _noteSkipAttempt(fields);
+      }
+      return;
+    }
+    if (tag == 'play-item') {
+      _sessionPlayedItems += 1;
+      final key = fields['key'];
+      if (key is String && key.isNotEmpty) _sessionPlayedKeys.add(key);
+    }
+  }
+
+  static void _noteSkipAttempt(Map<String, Object?> fields) {
+    final attempt = _asInt(fields['attempt'] ?? fields['streak']);
+    if (attempt != null && attempt > _sessionMaxConsecutiveSkip) {
+      _sessionMaxConsecutiveSkip = attempt;
     }
   }
 
