@@ -31,6 +31,8 @@ final class PipPlugin: NSObject, FlutterPlugin {
       "session start: version=\(version)(\(build)) system=\(UIDevice.current.systemVersion) "
         + "model=\(deviceModelIdentifier())"
     )
+    // 142: 常驻主线程延迟探针，把前台 position gap 对上「原生主线程到底被堵多久」。
+    MainThreadStallProbe.shared.start()
   }
 
   /// `UIDevice.model` 只说 "iPhone"，这里取真正的硬件标识（如 iPhone12,1）。
@@ -2309,5 +2311,36 @@ private enum TextureTracker {
       method_setImplementation(method, imp)
     }
     return true
+  }
+}
+
+/// 142: 主线程延迟探针。后台串行队列每 500ms dispatch 一次到主队列，测「实际到达」
+/// 比「发出」晚了多少；>300ms 记一条 `main-stall`。用来把前台 position gap 对上
+/// 「原生主线程到底被堵了多久」，从而区分是原生同步活、GPU 栅格化还是流投递滞后。
+/// 只写日志、极小开销、出错静默，不影响播放。
+final class MainThreadStallProbe {
+  static let shared = MainThreadStallProbe()
+  private let queue = DispatchQueue(label: "com.example.piliplus.mainstall")
+  private var timer: DispatchSourceTimer?
+  private let intervalMs = 500
+  private let thresholdMs = 300
+
+  func start() {
+    guard timer == nil else { return }
+    let t = DispatchSource.makeTimerSource(queue: queue)
+    t.schedule(deadline: .now() + .milliseconds(intervalMs), repeating: .milliseconds(intervalMs))
+    t.setEventHandler { [weak self] in
+      guard let self else { return }
+      let sent = DispatchTime.now().uptimeNanoseconds
+      DispatchQueue.main.async {
+        let arrived = DispatchTime.now().uptimeNanoseconds
+        let delayMs = Int((arrived &- sent) / 1_000_000)
+        if delayMs > self.thresholdMs {
+          PipTrace.log("main-stall: delayMs=\(delayMs)")
+        }
+      }
+    }
+    t.resume()
+    timer = t
   }
 }
