@@ -115,6 +115,21 @@ jobs:
                   done
               shell: bash
 
+            - name: Verify APK signature (fixed release key)
+              if: ${{ github.event_name == 'workflow_dispatch' }}
+              shell: bash
+              run: |
+                  set -e
+                  EXPECTED=e6ed1515f2f3e12f857f23cdd3a6b4901081ed9a86b504fd723e1209f6c6b35a
+                  BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+                  APK=$(ls PiliPlus_android_*_arm64-v8a.apk | head -1)
+                  GOT=$("$BT/apksigner" verify --print-certs "$APK" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | tr 'A-F' 'a-f')
+                  echo "apk=$APK signer_sha256=$GOT"
+                  if [ "$GOT" != "$EXPECTED" ]; then
+                    echo "::error::APK signer mismatch: $GOT != $EXPECTED"
+                    exit 1
+                  fi
+
             - name: Release
               if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
               uses: softprops/action-gh-release@v3
