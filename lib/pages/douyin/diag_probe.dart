@@ -36,6 +36,7 @@ const List<String> kMpvDiagKeys = <String>[
   'video-params/h',
   'video-params/pixfmt',
   'estimated-vf-fps',
+  'container-fps',
   'drop-frame-count',
   'vo-drop-frame-count',
   'decoder-frame-drop-count',
@@ -99,6 +100,7 @@ const List<String> _mpvLightKeys = <String>[
   'video-params/h',
   'video-params/pixfmt',
   'estimated-vf-fps',
+  'container-fps',
   'vo-drop-frame-count',
   'decoder-frame-drop-count',
   'cache-speed',
@@ -216,6 +218,12 @@ abstract final class DiagProbe {
   /// 取帧。这里由 player 页维护，只用于诊断：每条日志都带上该值，配合
   /// [IOSPipHelper.isActive] 即可证明同一时刻只有一个消费者。
   static bool frontFramePulling = false;
+
+  /// PiP 活跃时页内是否只挂着 2×2 的最小纹理消费者。
+  ///
+  /// 为真表示没有整块视频层，但 Flutter 仍在按帧从 texture 取 buffer；
+  /// 配合原生 `pip-frame-health` 可区分「没有新帧」与「页内根本没消费」。
+  static bool pipFrameKeepAlive = false;
 
   /// 诊断：PiP 轻量模式。默认开启；关闭后回到源分辨率渲染路径，便于 A/B。
   static bool get pipLiteMode {
@@ -412,6 +420,7 @@ abstract final class DiagProbe {
       'dataStatus': null,
       'pipActive': IOSPipHelper.isActive,
       'frontFramePull': frontFramePulling,
+      'pipFrameKeepAlive': pipFrameKeepAlive,
     };
     PlPlayerController? player;
     try {
@@ -477,6 +486,42 @@ abstract final class DiagProbe {
   /// 采样时机仍限定在开流/首帧/异常/导出。
   static Map<String, Object?> cachedSnapshot() =>
       snapshot(full: false, refresh: false);
+
+  /// 低频播放健康采样：5 秒节拍与吞吐看门狗专用。
+  ///
+  /// `getProperty` 是同步 FFI，绝不能放进 position 回调；这里只在 5 秒
+  /// 健康采样/慢样本判定时完整读一次，保证 hwdec-current、实际分辨率、
+  /// 供帧帧率和解复用缓存都有真实值可对照。
+  static Map<String, Object?> playbackSample(
+    String tag, {
+    Map<String, Object?> extra = const {},
+    bool functional = false,
+  }) {
+    // 纯诊断采样在 diag 关闭时连 mpv 属性都不读；只有吞吐看门狗这类
+    // 回滚判断需要的功能性采样才允许继续读。
+    if (!kDiagEnabled && !functional) {
+      return const <String, Object?>{};
+    }
+    final snap = snapshot(full: true, readMpv: true);
+    final fields = <String, Object?>{
+      ...extra,
+      'hwdec': snap['hwdec-current'],
+      'videoParamsW': snap['video-params/w'],
+      'videoParamsH': snap['video-params/h'],
+      'estimatedVfFps': snap['estimated-vf-fps'],
+      'containerFps': snap['container-fps'],
+      'demuxerCacheTime': snap['demuxer-cache-time'],
+      'cacheSpeed': snap['cache-speed'],
+      'dropFrameCount': snap['drop-frame-count'],
+      'positionMs': snap['positionMs'],
+      'textureId': snap['textureId'],
+      'dataStatus': snap['dataStatus'],
+      'mpvMissing': snap['mpvMissing'],
+      'mpvKeysUsed': snap['mpvKeysUsed'],
+    };
+    if (kDiagEnabled) _append(tag, fields);
+    return fields;
+  }
 
   static void _refreshMpv(PlPlayerController player, int now) {
     _mpvMissing.clear();
@@ -994,6 +1039,7 @@ abstract final class DiagProbe {
           'textureId': textureId,
         });
         final firstWidth = _asNum(snap['video-params/w']);
+        final firstHeight = _asNum(snap['video-params/h']);
         final firstCodec = snap['video-codec'] as String?;
         final firstHwdec = snap['hwdec-current'] as String?;
         tracker.dropBaseline = _asInt(snap['drop-frame-count']);
@@ -1006,9 +1052,15 @@ abstract final class DiagProbe {
               ? null
               : now - tracker.loadedAt!,
           'videoParamsW': firstWidth,
+          'videoParamsH': firstHeight,
           'videoCodec': firstCodec,
+          'estimatedVfFps': snap['estimated-vf-fps'],
+          'containerFps': snap['container-fps'],
+          'demuxerCacheTime': snap['demuxer-cache-time'],
+          'cacheSpeed': snap['cache-speed'],
           'hwdec': firstHwdec,
           'hwdecRequested': tracker.hwdecRequested,
+          'mpvMissing': snap['mpvMissing'],
         });
       }
       final elapsed = now - tracker.startedAt;
@@ -1254,6 +1306,7 @@ abstract final class DiagProbe {
       ...fields,
       'pipActive': IOSPipHelper.isActive,
       'frontFramePull': frontFramePulling,
+      'pipFrameKeepAlive': pipFrameKeepAlive,
     });
     _writeBuffer.add(line);
     if (_writeBuffer.length >= _writeBatchLines) {

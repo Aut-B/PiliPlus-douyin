@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show File, Platform;
 
 import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
@@ -436,6 +436,37 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// `hwdec-current` 连续为 `no` 这么久才回滚，避开解码器初始化的一两拍。
   static const int _hwdecNoFallbackMs = 1200;
 
+  /// 播放健康采样节拍。只在播放中读 mpv 属性，5 秒一次，不做逐帧读取。
+  static const int _healthSampleIntervalMs = 5000;
+
+  /// 起播后观察吞吐的窗口。6S 等低内存机型在 8 秒时仍 <0.5x 才回滚。
+  static const int _throughputWindowMs = 8000;
+  static const double _throughputRatioFloor = 0.5;
+  static const double _throughputFpsFloorRatio = 0.6;
+  static const double _throughputFpsFloorWithoutSource = 15;
+  static const int _throughputHighBitrateKbps = 4000;
+
+  /// 5 秒健康采样：上一次采样的墙钟与 position，用来算真实推进比。
+  Timer? _playbackHealthTimer;
+  int _healthLastAtMs = 0;
+  int _healthLastPositionMs = 0;
+
+  /// 6S 低吞吐看门狗：每次 open 只观察一个 8 秒窗口。
+  Timer? _throughputWatchdog;
+  int _throughputIndex = -1;
+  String _throughputKey = '';
+  String _throughputSource = 'auto';
+  String _throughputHwdec = _hwdec;
+  int _throughputStartAtMs = 0;
+  int _throughputStartPositionMs = 0;
+
+  /// 已经提示过吞吐不足的条目，避免 Toast 反复弹。
+  final Set<String> _throughputDegradedKeys = <String>{};
+
+  /// 当前 open 的媒体体积/码率。只用于吞吐降级判断与取证，不参与正常播放。
+  int? _currentMediaBytes;
+  int? _currentMediaBitrateKbps;
+
   /// App 是否在前台。后台时看门狗只记日志，不做重建（原生 PiP 由 C23 处理）。
   bool _appPaused = false;
 
@@ -445,10 +476,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 接管画面」；否则控制中心一开就会把页内画面压成黑底。这里单独记。
   bool _appInBackground = false;
 
-  /// PiP 活跃时是否已停掉页内纹理采样。
+  /// PiP 活跃时是否已把页内视频层压到最小。
   ///
-  /// PiP 原生每帧 `copyPixelBuffer`，页内再挂一个 `Texture` 就是双份拷贝；
-  /// 置真后 [_video] 用黑底占位替代视频层，但播放器和控件都保留。
+  /// 不能彻底摘掉 `Texture`：这个 media_kit fork 的 mpv 渲染回调依赖
+  /// Flutter 侧持续请求纹理，纹理没有消费者后小窗只能回放旧帧。置真后
+  /// [_video] 用黑底 + 2×2 `Texture` 占位，画面不可见但仍按帧取 buffer，
+  /// 也不给整页制造逐帧重绘。
   bool _pipFrameSuppressed = false;
 
   /// 回前台后等原生关闭 PiP 的有界轮询，让页内画面尽快恢复。
@@ -513,6 +546,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _restorePlayMode();
     _restoreVideoFit();
     _attachPlayerListeners();
+    _startPlaybackHealthSampler();
     _pushProgress(force: true);
     // 诊断包常开：会话摘要仍写进 Documents/diag_playback.log，但正常
     // 播放不再常驻采样，只在开流/首帧/异常/导出时各采一次。
@@ -587,6 +621,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _chromeTimer?.cancel();
     _commentsSession++;
     _firstFrameWatchdog?.cancel();
+    _cancelThroughputWatchdog();
+    _playbackHealthTimer?.cancel();
+    _playbackHealthTimer = null;
     _cancelHwdecProbe();
     // 走到这里说明页面已经真的没了。不管是不是走 _leave() 出去的，都必须
     // 确保播放器被释放——否则那个单例会一直活着，下次进播放页拿到的就是
@@ -623,6 +660,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _disposed = true;
     _pipFrameWatch?.cancel();
     _pipFrameWatch = null;
+    _cancelThroughputWatchdog();
+    _playbackHealthTimer?.cancel();
+    _playbackHealthTimer = null;
     _disarmPipAutoEnter('shutdown');
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
@@ -663,6 +703,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 放在 dispose 之后：dispose 会上报最后一次 texture release，先 stop 就
     // 会把这条漏掉，session-summary 的 alive 峰值/收尾数会不准。
     DiagProbe.frontFramePulling = false;
+    DiagProbe.pipFrameKeepAlive = false;
     DiagProbe.stop();
     // dispose() 会在 enableBackgroundPlay 仍为真时清掉 mediaItem；
     // 收尾后再恢复用户原来的开关，避免污染 B站配置。
@@ -788,6 +829,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final switchingBefore = _switching;
     _openStartedAtMs = DateTime.now().millisecondsSinceEpoch;
     _openStartPositionMs = _player.positionInMilliseconds;
+    _resetPlaybackHealthWindow();
     if (source != 'auto-recover') _recoverStreak = 0;
     // B 站重试也属于失败处理链路，不能把连续失败计数清零。
     if (source == 'initial' ||
@@ -915,12 +957,27 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       }
       // 自动连播会优先吃预取结果，手动选播通常重新解析；把来源与是否本地
       // 缓存写进日志，才能对比两条 open 路径拿到的媒体是否不同。
+      _currentMediaBytes = null;
+      _currentMediaBitrateKbps = null;
+      if (media.isLocal) {
+        try {
+          final bytes = File(media.url).lengthSync();
+          _currentMediaBytes = bytes;
+          if (bytes > 0 && entry.durationMs > 0) {
+            final seconds = entry.durationMs / 1000;
+            _currentMediaBitrateKbps = (bytes * 8 / seconds / 1000).round();
+          }
+        } catch (_) {}
+      }
       DiagProbe.event('open-media', <String, Object?>{
         'source': source,
         'index': target,
         'key': entry.key,
         'local': media.isLocal,
         'host': Uri.tryParse(media.url)?.host,
+        'bytes': _currentMediaBytes,
+        'bitrateKbps': _currentMediaBitrateKbps,
+        'durationMs': entry.durationMs,
         'hwdecRequested': hwdec,
       });
       // 切条必须在开新流前把旧 Player 连同 FlutterTexture 一起拆掉。
@@ -1121,6 +1178,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         hwdec: hwdec,
         deadlineMs: firstFrameDeadlineMs,
       );
+      _armThroughputWatchdog(
+        session: session,
+        index: target,
+        source: source,
+        hwdec: hwdec,
+      );
       if (source == 'bili-retry') _biliRetryOpenSucceeded = true;
       _pushProgress(force: true);
       DiagProbe.openPhase('played');
@@ -1281,6 +1344,74 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
   }
 
+  void _startPlaybackHealthSampler() {
+    _playbackHealthTimer?.cancel();
+    _playbackHealthTimer = null;
+    // 纯诊断的 5s 全量采样在 diag 关闭时不应存在；吞吐看门狗有自己的
+    // 功能性采样，不依赖这个定时器。
+    if (!kDiagEnabled) return;
+    _playbackHealthTimer = Timer.periodic(
+      const Duration(milliseconds: _healthSampleIntervalMs),
+      (_) => _samplePlaybackHealth(),
+    );
+  }
+
+  void _resetPlaybackHealthWindow() {
+    _healthLastAtMs = 0;
+    _healthLastPositionMs = 0;
+  }
+
+  /// 5 秒一次的低频健康采样。
+  ///
+  /// 只有这里和吞吐看门狗会同步读 mpv 属性；position 回调保持零 FFI。
+  /// 采样会同时判断上 5 秒的 position 推进比，推进不足就写成 `slow-sample`，
+  /// 让「能出画面但吞吐极低」的条目也有 hwdec/分辨率/帧率/缓存可对照。
+  void _samplePlaybackHealth() {
+    if (!kDiagEnabled) return;
+    if (_disposed || _leaving || !mounted) return;
+    if (_queue.isEmpty || _index < 0 || _index >= _queue.length) return;
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    if (_player.dataStatus.value != DataStatus.loaded ||
+        !_player.playerStatus.isPlaying) {
+      _resetPlaybackHealthWindow();
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final position = _player.positionInMilliseconds;
+    final wallMs = _healthLastAtMs == 0 ? 0 : now - _healthLastAtMs;
+    final advanceMs = _healthLastAtMs == 0
+        ? 0
+        : position - _healthLastPositionMs;
+    _healthLastAtMs = now;
+    _healthLastPositionMs = position;
+    final ratio = wallMs > 0 ? advanceMs / wallMs : null;
+    final slow =
+        wallMs >= 2000 &&
+        advanceMs >= 0 &&
+        ratio != null &&
+        ratio < _throughputRatioFloor;
+    final inPip = IOSPipHelper.isActive;
+    final tag = slow
+        ? 'slow-sample'
+        : (inPip ? 'pip-frame-health' : 'frame-health');
+    DiagProbe.playbackSample(
+      tag,
+      extra: <String, Object?>{
+        'source': 'dart',
+        'index': _index,
+        'key': _current.key,
+        'wallMs': wallMs,
+        'positionAdvanceMs': advanceMs,
+        'positionRatio': ratio,
+        'buffering': _player.isBuffering.value,
+        'hwdecRequested': _effectiveHwdecFor(_current.key),
+        'mediaBytes': _currentMediaBytes,
+        'mediaBitrateKbps': _currentMediaBitrateKbps,
+        'reason': slow ? 'low-position-ratio' : null,
+      },
+    );
+  }
+
   /// 把 position / duration / buffered 合并成一个低节拍的局部状态。
   ///
   /// position 回调一秒可能来好几次，直接逐次刷 widget 会把进度条和时间
@@ -1350,6 +1481,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     } catch (_) {
       return null;
     }
+  }
+
+  static num? _numOf(Object? value) {
+    if (value is num) return value;
+    if (value is String) return num.tryParse(value);
+    return null;
   }
 
   /// 起播后短窗口内观察 hwdec-current；已经请求 auto-copy 的 open 不再观察。
@@ -1472,6 +1609,167 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       () => _onFirstFrameWatchdog(session),
     );
     _armHwdecProbe(hwdec);
+  }
+
+  /// 6S 等低内存机型的低吞吐看门狗：起播后 8 秒检查一次真实推进比。
+  ///
+  /// 只看一个窗口；`ShortVideoPerf.lowMemory` 在触发时才读，避免首次
+  /// open 早于内存探测完成时漏看。非 6S 机型直接返回，不改变现有行为。
+  void _armThroughputWatchdog({
+    required int session,
+    required int index,
+    required String source,
+    required String hwdec,
+  }) {
+    _cancelThroughputWatchdog();
+    _throughputIndex = index;
+    _throughputSource = source;
+    _throughputKey = index >= 0 && index < _queue.length
+        ? _queue[index].key
+        : '';
+    _throughputHwdec = hwdec;
+    _throughputStartAtMs = DateTime.now().millisecondsSinceEpoch;
+    _throughputStartPositionMs = _player.positionInMilliseconds;
+    _throughputWatchdog = Timer(
+      const Duration(milliseconds: _throughputWindowMs),
+      () => _onThroughputWatchdog(session),
+    );
+  }
+
+  void _cancelThroughputWatchdog() {
+    _throughputWatchdog?.cancel();
+    _throughputWatchdog = null;
+    _throughputIndex = -1;
+    _throughputKey = '';
+    _throughputSource = 'auto';
+    _throughputStartAtMs = 0;
+    _throughputStartPositionMs = 0;
+  }
+
+  void _onThroughputWatchdog(int session) {
+    _throughputWatchdog = null;
+    if (_disposed || _leaving || session != _openSession) return;
+    if (!ShortVideoPerf.lowMemory) return;
+    if (_opening || _recovering || _pendingOpenIndex != null) return;
+    if (_throughputIndex < 0 || _throughputIndex >= _queue.length) return;
+    if (_throughputIndex != _index) return;
+    if (_player.dataStatus.value != DataStatus.loaded) return;
+    if (_appPaused ||
+        IOSPipHelper.isActive ||
+        !_firstFrameSeen ||
+        !_player.playerStatus.isPlaying ||
+        _player.isBuffering.value) {
+      DiagProbe.event('throughput-skip', <String, Object?>{
+        'reason': _appPaused
+            ? 'app-paused'
+            : (IOSPipHelper.isActive
+                  ? 'pip'
+                  : (!_firstFrameSeen
+                        ? 'no-first-frame'
+                        : (_player.isBuffering.value
+                              ? 'buffering'
+                              : 'not-playing'))),
+        'index': _throughputIndex,
+        'key': _throughputKey,
+        'hwdecRequested': _throughputHwdec,
+        'positionMs': _player.positionInMilliseconds,
+      });
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final elapsedMs = now - _throughputStartAtMs;
+    if (elapsedMs <= 0) return;
+    final advanceMs =
+        _player.positionInMilliseconds - _throughputStartPositionMs;
+    final ratio = advanceMs / elapsedMs;
+    final sample = DiagProbe.playbackSample(
+      'throughput-check',
+      functional: true,
+      extra: <String, Object?>{
+        'source': _throughputSource,
+        'index': _throughputIndex,
+        'key': _throughputKey,
+        'windowMs': elapsedMs,
+        'positionAdvanceMs': advanceMs,
+        'positionRatio': ratio,
+        'hwdecRequested': _throughputHwdec,
+        'buffering': _player.isBuffering.value,
+        'mediaBytes': _currentMediaBytes,
+        'mediaBitrateKbps': _currentMediaBitrateKbps,
+      },
+    );
+    final estFps = _numOf(sample['estimatedVfFps']);
+    final sourceFps = _numOf(sample['containerFps']);
+    final fpsLow =
+        estFps != null &&
+        (estFps <= 0 ||
+            (sourceFps != null && sourceFps > 0
+                ? estFps < sourceFps * _throughputFpsFloorRatio
+                : estFps < _throughputFpsFloorWithoutSource));
+    final low = (advanceMs >= 0 && ratio < _throughputRatioFloor) || fpsLow;
+    if (!low) {
+      DiagProbe.event('throughput-ok', <String, Object?>{
+        'index': _throughputIndex,
+        'key': _throughputKey,
+        'positionRatio': ratio,
+        'estimatedVfFps': estFps,
+        'sourceFps': sourceFps,
+      });
+      return;
+    }
+    final extra = <String, Object?>{
+      'positionRatio': ratio,
+      'estimatedVfFps': estFps,
+      'sourceFps': sourceFps,
+      'windowMs': elapsedMs,
+      'positionAdvanceMs': advanceMs,
+      'hwdecCurrent': sample['hwdec'],
+      'videoParamsW': sample['videoParamsW'],
+      'videoParamsH': sample['videoParamsH'],
+      'demuxerCacheTime': sample['demuxerCacheTime'],
+      'mediaBytes': _currentMediaBytes,
+      'mediaBitrateKbps': _currentMediaBitrateKbps,
+    };
+    if (_throughputHwdec != _hwdecFallback &&
+        _fallbackToAutoCopy(
+          reason: 'low-throughput',
+          index: _throughputIndex,
+          source: _throughputSource,
+          elapsedMs: elapsedMs,
+          elapsedFrom: 'throughput-window',
+          eventName: 'hwdec-throughput-fallback',
+          openSource: 'hwdec-throughput-fallback',
+          extra: extra,
+        )) {
+      return;
+    }
+    // 已经回滚过 auto-copy 仍然低，或当前无法独占重开：对 B 站/高码率
+    // 条目给一次可见提示。接口只返回一条地址，没有可切换的清晰度档位。
+    _notifyThroughputDegraded(extra);
+  }
+
+  void _notifyThroughputDegraded(Map<String, Object?> extra) {
+    final index = _throughputIndex;
+    if (index < 0 || index >= _queue.length) return;
+    final entry = _queue[index];
+    final key = entry.key;
+    final bitrate = _currentMediaBitrateKbps ?? 0;
+    final highBitrate = bitrate >= _throughputHighBitrateKbps;
+    final actionable = entry.isBili || highBitrate;
+    DiagProbe.event('throughput-degraded', <String, Object?>{
+      ...extra,
+      'index': index,
+      'key': key,
+      'source': _throughputSource,
+      'hwdecRequested': _throughputHwdec,
+      'isBili': entry.isBili,
+      'highBitrate': highBitrate,
+      'action': actionable ? 'prompt' : 'none',
+    });
+    if (!actionable) return;
+    if (!mounted || _disposed || _leaving) return;
+    if (!_throughputDegradedKeys.add(key)) return;
+    SmartDialog.showToast('当前设备解码吞吐不足，建议跳过该视频或换低清晰度');
   }
 
   void _cancelFirstFrameWatchdog() {
@@ -1651,6 +1949,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     required String source,
     required int elapsedMs,
     required String elapsedFrom,
+    String eventName = 'hwdec-fallback',
+    String? openSource,
+    Map<String, Object?> extra = const {},
   }) {
     if (_disposed || _leaving || _opening || _recovering) return false;
     if (_pendingOpenIndex != null) return false;
@@ -1670,7 +1971,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _cancelFirstFrameWatchdog();
     // 同一条要整实例重开，连播计数从 0 重新算。
     _autoPlaysSinceRebuild = 0;
-    DiagProbe.event('hwdec-fallback', <String, Object?>{
+    DiagProbe.event(eventName, <String, Object?>{
+      ...extra,
       'reason': reason,
       'from': from,
       'to': _hwdecFallback,
@@ -1684,7 +1986,9 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       'positionMs': _player.positionInMilliseconds,
       'textureId': _player.videoController?.id.value,
     });
-    unawaited(_open(index, source: 'hwdec-fallback', force: true));
+    unawaited(
+      _open(index, source: openSource ?? 'hwdec-fallback', force: true),
+    );
     return true;
   }
 
@@ -2373,6 +2677,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       if (!healthy && !_opening && !_recovering) {
         // 用户手动点这一条救场：清掉之前的回滚标记，重新从直通 auto 起。
         _hwdecFallbackKeys.remove(key);
+        _throughputDegradedKeys.remove(key);
         _recoverStreak = 0;
         unawaited(
           _recoverNoFirstFrame(sinceOpenMs: 0, source: 'playlist-select'),
@@ -2383,6 +2688,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 用户手动重选这一条，视为重新尝试直通硬解：一次网络抖动导致的
     // 看门狗超时不应把该条永久降级。
     _hwdecFallbackKeys.remove(key);
+    _throughputDegradedKeys.remove(key);
     // 正在解析/加载上一条时也不能丢弃这次点击。_open 会把目标排队，并把
     // 在途会话作废；列表页已经关了，用户点了就必须最终切过去。
     unawaited(_open(target, source: 'playlist-select'));
@@ -2711,13 +3017,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _lastPipTickMs = 0;
   }
 
-  /// 同一时刻只允许一个消费者从 FlutterTexture 取帧。
+  /// iOS PiP 期间把页内视频层压到最小，但保留一个纹理消费者。
   ///
-  /// 这里选「PiP 活跃期间暂停页内采样」，而不是降低原生 enqueue 频率：
-  /// 后者会让小窗自己变慢，且双份拷贝依然存在。页内换成黑底占位后，mpv
-  /// 仍按渲染回调更新纹理，原生 PiP 每帧从同一纹理拷贝，小窗画面不受
-  /// 影响；PiP 结束（[IOSPipHelper.isActive] 变假）后下一次同步会重建
-  /// 视频层，返回播放页不会黑屏。
+  /// 不能完全摘掉 `Texture`：这个 media_kit fork 的 mpv 渲染回调依赖
+  /// Flutter 侧持续请求纹理，一旦没有任何消费者，`textureFrameAvailable`
+  /// 会长时间不再触发，小窗只能反复回放 hold 的最后一帧。这里改由
+  /// [_video] 挂一个 2×2 的 `Texture`：只多一层极小合成，不做整页逐帧
+  /// 重绘，同时保证纹理仍被按帧拉取。PiP 结束（[IOSPipHelper.isActive]
+  /// 变假）后下一次同步会恢复整块视频层，返回播放页不会黑屏。
   ///
   /// 退后台请求 PiP 的那一段做乐观压制：Dart 在后台可能被挂起，等不到
   /// active 回调；回到前台且 PiP 没起来时会立即恢复。
@@ -2727,6 +3034,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       // Android 的 PiP 是整个 Activity 进入小窗，Flutter texture 仍是唯一
       // 画面来源；不能套用 iOS 的停页内采样逻辑，否则小窗会变黑。
       DiagProbe.frontFramePulling = true;
+      DiagProbe.pipFrameKeepAlive = false;
       if (_pipFrameSuppressed) {
         if (mounted) {
           setState(() => _pipFrameSuppressed = false);
@@ -2741,6 +3049,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         pipActive ||
         (_appInBackground && (_pipAutoArmed || _pipStartRequested));
     DiagProbe.frontFramePulling = !wantSuppress;
+    DiagProbe.pipFrameKeepAlive = wantSuppress;
     if (wantSuppress != _pipFrameSuppressed) {
       if (mounted) {
         setState(() => _pipFrameSuppressed = wantSuppress);
@@ -2751,6 +3060,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         'mode': wantSuppress ? 'pip-only' : 'inline',
         'pipActive': pipActive,
         'frontFramePull': !wantSuppress,
+        'keepAliveConsumer': wantSuppress,
         'appPaused': _appInBackground,
         'reason': reason,
         'textureId': _player.videoController?.id.value,
@@ -3551,12 +3861,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ),
       ),
     );
-    // PiP 活跃时不再挂 `Texture`：Flutter 停止采样后，原生小窗仍是这条
-    // FlutterTexture 的唯一消费者。mpv 的纹理更新与小窗取帧都不依赖页内
-    // 是否绘制，所以小窗画面不受影响；PiP 结束会 setState 重建 video，
-    // 内嵌画面立即恢复。
+    // PiP 活跃时页内不再显示整块视频，但必须保留一个纹理消费者：完全
+    // 摘掉 `Texture` 后 Flutter 不再按帧取 buffer，mpv 的渲染回调会停，
+    // 小窗只能回放 hold 的旧帧。这里用黑底铺满 + 2×2 `Texture` 占位，
+    // 只让这一小块参与合成与重绘，不构成整页逐帧重绘。PiP 结束后
+    // setState 重建 video，内嵌画面立即恢复。
     final displayVideo = _pipFrameSuppressed
-        ? const ColoredBox(color: Colors.black)
+        ? _pipKeepAliveVideo(controller)
         : video;
     return GestureDetector(
       // 和 B站播放页一致：双击暂停/播放，单击切换控件显隐（沉浸式）。
@@ -3617,6 +3928,39 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
           ),
         ),
       ),
+    );
+  }
+
+  /// PiP 期间的最小纹理消费者。
+  ///
+  /// `Texture` 只要还在树上、还参与合成，引擎就会按帧调
+  /// `copyPixelBuffer`，和它在屏幕上的大小无关。尺寸取 2×2 逻辑像素，
+  /// 黑底保证用户看不到这块纹理；`RepaintBoundary` 把这层逐帧重绘
+  /// 限制在 2×2 内，避免扩散到整页。
+  Widget _pipKeepAliveVideo(VideoController controller) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Colors.black),
+        Positioned(
+          left: 0,
+          top: 0,
+          width: 2,
+          height: 2,
+          child: RepaintBoundary(
+            child: ValueListenableBuilder<int?>(
+              valueListenable: controller.id,
+              builder: (context, textureId, _) {
+                if (textureId == null) return const SizedBox.shrink();
+                return Texture(
+                  textureId: textureId,
+                  filterQuality: FilterQuality.none,
+                );
+              },
+            ),
+          ),
+        ),
+      ],
     );
   }
 
