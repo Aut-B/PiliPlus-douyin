@@ -1147,6 +1147,20 @@ private final class PipSession: NSObject {
       PipTrace.log("frameAvailable: no texture for id=\(textureId) (this is fatal)")
       return
     }
+    // 141: 前台正常播放（App active、未进/未请求 PiP、也非自动进小窗的过渡态）时
+    // 不再向 PiP surface 供帧。此时小窗没显示，每帧 `copyPixelBuffer` 把 720×1280
+    // BGRA（6S 上单帧实测可达 117ms）拷一份只是白白抢 GPU/主线程，是前台 vo 丢帧
+    // 的合成负担。预热用的 surface/layer 仍保留（Home→小窗照旧秒进不黑），只是不再
+    // 逐帧拷贝；真进 PiP（inactive/后台、requestStart、或已 active）时下面的判定自然
+    // 放行，PiP 启动路径也会用 force:true 取首帧兜底。
+    if !force,
+      !isActive,
+      !controller.isPictureInPictureActive,
+      !pendingStart,
+      !pipStartRequested,
+      !(autoEnter && UIApplication.shared.applicationState != .active) {
+      return
+    }
     let now = CACurrentMediaTime()
     if !force && shouldThrottleForIdle(now: now) {
       throttleDropCount += 1
