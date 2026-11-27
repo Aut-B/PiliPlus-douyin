@@ -150,15 +150,9 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
   /// 56 只够旧的 BottomNavigationBar，默认的 M3 导航栏比它高 24。
   static const double _mainBottomNavHeight = 88;
 
-  /// 上滑收起底栏时累计位移的封顶值，约等于 M3 导航栏高度。
-  static const double _bottomBarHideOffset = 80;
-
-  /// 底栏收起进度：0 为完全展开，[_bottomBarHideOffset] 为完全收起。
-  final ValueNotifier<double> _barOffset = ValueNotifier<double>(0);
-
   /// 主界面悬浮四 tab 导航栏的位移，与 B站首页 `CommonPageState` 共用
   /// 同一个 Rx（量纲是 `Style.topBarHeight`）。用户在设置里关掉「隐藏底栏」
-  /// 时该值为 null，此时只收起本页自己的操作条。
+  /// 时该值为 null。
   RxDouble? _mainBarOffset;
 
   final List<ShortVideo> _videos = [];
@@ -217,7 +211,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _autoSync());
   }
 
-  /// 上滑累计正位移收起底栏，下滑再退回来；只跟随手指拖动，
+  /// 上滑累计正位移收起主界面导航栏，下滑再退回来；只跟随手指拖动，
   /// 松手后的惯性滚动不改位移，避免回弹闪动。
   bool _onScrollNotification(ScrollNotification notification) {
     if (_videos.isEmpty || notification.metrics.axis == Axis.horizontal) {
@@ -235,11 +229,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     if (delta == 0) return false;
     // 列表在顶部继续下拉时不要收起底栏（与 CommonPageState 一致）。
     if (notification.metrics.pixels < 0 && delta > 0) return false;
-    _barOffset.value = clampDouble(
-      _barOffset.value + delta,
-      0.0,
-      _bottomBarHideOffset,
-    );
     final mainBarOffset = _mainBarOffset;
     if (mainBarOffset != null) {
       mainBarOffset.value = clampDouble(
@@ -251,9 +240,8 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     return false;
   }
 
-  /// 本页操作条与主界面悬浮导航栏一起回到展开状态。
-  void _resetBarOffset() {
-    _barOffset.value = 0;
+  /// 主界面悬浮导航栏回到展开状态。
+  void _resetMainBarOffset() {
     final mainBarOffset = _mainBarOffset;
     if (mainBarOffset != null && mainBarOffset.value != 0) {
       mainBarOffset.value = 0;
@@ -271,7 +259,6 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
         mainBarOffset.value = 0;
       });
     }
-    _barOffset.dispose();
     super.dispose();
   }
 
@@ -279,7 +266,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     final stored = ShortVideoRepo.load(platform);
     if (!mounted) return;
     // 切换平台/重新拉取后列表回到顶部，底栏也跟着展开。
-    _resetBarOffset();
+    _resetMainBarOffset();
     setState(() {
       _videos
         ..clear()
@@ -447,7 +434,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     } finally {
       _openingWeb = false;
       // 网页是独立路由，回来时把底栏展开，别停在上次滚动的收起态。
-      if (mounted) _resetBarOffset();
+      if (mounted) _resetMainBarOffset();
     }
   }
 
@@ -475,7 +462,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     } finally {
       _openingWeb = false;
       // 与打开网页一致：独立路由返回后把底栏展开。
-      if (mounted) _resetBarOffset();
+      if (mounted) _resetMainBarOffset();
     }
   }
 
@@ -710,7 +697,7 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     } finally {
       _openingPlayer = false;
       // 播放页是独立路由，本页底栏不参与其竖滑；退出回来时重新展开。
-      if (mounted) _resetBarOffset();
+      if (mounted) _resetMainBarOffset();
     }
   }
 
@@ -1360,18 +1347,10 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
           ),
         ],
       ),
-      // 底栏叠在 body 之上：上滑只把它向下平移，body 不跟着变形；
-      // 底栏自己补系统安全区与主界面导航栏高度，按钮不会被底部导航栏盖住。
-      bottomNavigationBar: _videos.isEmpty
-          ? null
-          : ValueListenableBuilder<double>(
-              valueListenable: _barOffset,
-              child: _bottomBar(theme),
-              builder: (context, offset, child) => FractionalTranslation(
-                translation: Offset(0, offset / _bottomBarHideOffset),
-                child: child,
-              ),
-            ),
+      // 操作条常驻在页面底部，不再跟随滚动上下平移：平移会让按钮
+      // 滑到悬浮导航栏下面，看起来像被压住、点不到。
+      // 底栏自己补系统安全区与主界面导航栏高度。
+      bottomNavigationBar: _videos.isEmpty ? null : _bottomBar(theme),
     );
   }
 
@@ -1489,21 +1468,25 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     );
   }
 
-  /// 单行细状态条：同步、缓存、链接解析都走这里，不再塞进底部按钮区。
+  /// 同步/缓存状态 chip：允许两行，长文案（远端条数、失败原因）不截断。
   Widget _statusBar(ThemeData theme) {
     final scheme = theme.colorScheme;
     final busy = _syncing || _caching || _addingLink;
     final text = _status.trim().isEmpty ? '就绪' : _status.trim();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 8, 0),
+      padding: const EdgeInsets.fromLTRB(10, 4, 10, 0),
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.fromLTRB(8, 2, 4, 2),
+        padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
         decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest.withValues(alpha: 0.6),
-          borderRadius: BorderRadius.circular(6),
+          color: scheme.secondaryContainer.withValues(alpha: 0.6),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: scheme.outlineVariant.withValues(alpha: 0.6),
+          ),
         ),
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (busy)
               SizedBox(
@@ -1517,18 +1500,18 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
             else
               Icon(
                 Icons.info_outline,
-                size: 13,
-                color: scheme.onSurfaceVariant,
+                size: 14,
+                color: scheme.onSecondaryContainer,
               ),
             const SizedBox(width: 6),
             Expanded(
               child: Text(
                 text,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
-                  height: 1.2,
+                maxLines: 2,
+                overflow: TextOverflow.clip,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: scheme.onSecondaryContainer,
+                  height: 1.3,
                 ),
               ),
             ),
@@ -2153,131 +2136,143 @@ class _ShortVideoFavoritesPageState extends State<ShortVideoFavoritesPage> {
     // 「底栏挡住了下面两个按钮」一直没修好的原因。
     final safeBottom = MediaQuery.viewPaddingOf(context).bottom;
     final localSelected = _localSelected;
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-        12,
-        4,
-        12,
-        safeBottom + _mainBottomNavHeight + 2,
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        border: Border(
+          top: BorderSide(
+            color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+          ),
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (_linkNeedsLogin)
-            Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: _openWeb,
-                style: TextButton.styleFrom(
-                  visualDensity: VisualDensity.compact,
-                  padding: EdgeInsets.zero,
-                ),
-                icon: const Icon(Icons.open_in_browser, size: 16),
-                label: const Text('打开网页登录后再试'),
-              ),
-            ),
-          if (_selecting)
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: _videos.isEmpty ? null : _selectAll,
-                  icon: const Icon(Icons.select_all),
-                  label: Text(_allLocalSelected ? '取消全选' : '全选'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _selectedCount == 0 ? null : _playSelected,
-                  icon: const Icon(Icons.playlist_play),
-                  label: Text('播放所选 $_selectedCount 条'),
-                ),
-                FilledButton.icon(
-                  onPressed: localSelected.isEmpty || _caching
-                      ? null
-                      : _cacheSelected,
-                  icon: _caching
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.download_for_offline_outlined),
-                  label: Text(
-                    _caching && _cacheTotal > 0
-                        ? '缓存中 $_cacheDone/$_cacheTotal'
-                        : '缓存所选 ${localSelected.length} 条',
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: localSelected.isEmpty ? null : _deleteSelected,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: theme.colorScheme.error,
-                  ),
-                  icon: const Icon(Icons.delete_outline),
-                  label: Text('删除所选 ${localSelected.length} 条'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
-                  icon: const Icon(Icons.queue_play_next),
-                  label: Text('下一首 $_selectedCount 条'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _selectedCount == 0
-                      ? null
-                      : _addSelectedToPlaylist,
-                  icon: const Icon(Icons.playlist_add),
-                  label: Text('加入列表 $_selectedCount 条'),
-                ),
-              ],
-            )
-          else ...[
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _openWeb,
-                    style: FilledButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      minimumSize: const Size.fromHeight(38),
-                    ),
-                    icon: const Icon(Icons.public, size: 18),
-                    label: const Text('打开网页 / 抓取'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: _videos.isEmpty ? null : _playAll,
-                  style: OutlinedButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    minimumSize: const Size(0, 38),
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                  ),
-                  icon: const Icon(Icons.play_arrow_rounded, size: 18),
-                  label: const Text('全部播放'),
-                ),
-              ],
-            ),
-            Row(
-              children: [
-                TextButton.icon(
-                  onPressed: _openingWeb ? null : _directSync,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          12,
+          6,
+          12,
+          safeBottom + _mainBottomNavHeight + 2,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_linkNeedsLogin)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _openWeb,
                   style: TextButton.styleFrom(
                     visualDensity: VisualDensity.compact,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    minimumSize: const Size(0, 32),
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    padding: EdgeInsets.zero,
                   ),
-                  icon: const Icon(Icons.sync_alt, size: 16),
-                  label: const Text('直接同步（只拉新增）'),
+                  icon: const Icon(Icons.open_in_browser, size: 16),
+                  label: const Text('打开网页登录后再试'),
                 ),
-              ],
-            ),
+              ),
+            if (_selecting)
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: _videos.isEmpty ? null : _selectAll,
+                    icon: const Icon(Icons.select_all),
+                    label: Text(_allLocalSelected ? '取消全选' : '全选'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _selectedCount == 0 ? null : _playSelected,
+                    icon: const Icon(Icons.playlist_play),
+                    label: Text('播放所选 $_selectedCount 条'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: localSelected.isEmpty || _caching
+                        ? null
+                        : _cacheSelected,
+                    icon: _caching
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.download_for_offline_outlined),
+                    label: Text(
+                      _caching && _cacheTotal > 0
+                          ? '缓存中 $_cacheDone/$_cacheTotal'
+                          : '缓存所选 ${localSelected.length} 条',
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: localSelected.isEmpty ? null : _deleteSelected,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: theme.colorScheme.error,
+                    ),
+                    icon: const Icon(Icons.delete_outline),
+                    label: Text('删除所选 ${localSelected.length} 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selectedCount == 0 ? null : _queueSelectedNext,
+                    icon: const Icon(Icons.queue_play_next),
+                    label: Text('下一首 $_selectedCount 条'),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: _selectedCount == 0
+                        ? null
+                        : _addSelectedToPlaylist,
+                    icon: const Icon(Icons.playlist_add),
+                    label: Text('加入列表 $_selectedCount 条'),
+                  ),
+                ],
+              )
+            else ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _openWeb,
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        minimumSize: const Size.fromHeight(38),
+                      ),
+                      icon: const Icon(Icons.public, size: 18),
+                      label: const Text('打开网页 / 抓取'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: _videos.isEmpty ? null : _playAll,
+                    style: OutlinedButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      minimumSize: const Size(0, 38),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                    ),
+                    icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                    label: const Text('全部播放'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 2),
+              Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: _openingWeb ? null : _directSync,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      minimumSize: const Size(0, 32),
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                    ),
+                    icon: const Icon(Icons.sync_alt, size: 16),
+                    label: const Text('直接同步（只拉新增）'),
+                  ),
+                ],
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
 }
+
 // findstr-anchor (GBK bytes, do not re-encode): 粘贴链接
 // findstr-anchor (GBK bytes, do not re-encode): 导出诊断

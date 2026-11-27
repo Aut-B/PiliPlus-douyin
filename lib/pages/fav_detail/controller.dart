@@ -86,7 +86,11 @@ mixin BaseFavController
   }
 
   void addCheckedToPlaylist() {
-    final checked = allChecked.toList(growable: false);
+    final checked =
+        loadingState.value.dataOrNull
+            ?.where((item) => item.checked)
+            .toList(growable: false) ??
+        const <FavDetailItemModel>[];
     if (checked.isEmpty) {
       SmartDialog.showToast('先选几条');
       return;
