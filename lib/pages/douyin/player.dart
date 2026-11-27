@@ -4195,7 +4195,18 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _decodeCurrent = _mpvText(snap['hwdec-current']) ?? '';
     }
     setState(() => _panel = panel);
-    if (panel == _PlayerPanel.comments) unawaited(_ensureComments());
+    if (panel == _PlayerPanel.comments) {
+      final video = _current.short;
+      final platform =
+          ShortVideoPlatform.fromId(video?.platform) ??
+          ShortVideoPlatform.douyin;
+      _diagComments(
+        'opened',
+        platform: platform,
+        videoId: video?.videoId ?? '',
+      );
+      unawaited(_ensureComments());
+    }
   }
 
   void _closePanel() {
@@ -4221,6 +4232,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     final platform =
         ShortVideoPlatform.fromId(video?.platform) ?? ShortVideoPlatform.douyin;
     final videoId = video?.videoId ?? '';
+    if (!mounted) return;
     if (videoId.isEmpty) {
       setState(() {
         _commentsKey = '${platform.id}:';
@@ -4228,6 +4240,12 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         _commentsLoading = false;
         _commentsError = 'unsupported';
       });
+      _diagComments(
+        'error',
+        platform: platform,
+        videoId: videoId,
+        reason: 'unsupported',
+      );
       return;
     }
     final key = '${platform.id}:$videoId';
@@ -4245,22 +4263,89 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
       _commentsLoading = true;
       _commentsError = '';
     });
-    final list = await ShortVideoWeb.resolveComments(
-      platformId: platform.id,
-      videoId: videoId,
-      userAgent: platform.userAgent,
-      force: force,
-    );
+    _diagComments('loading', platform: platform, videoId: videoId);
+    var list = const <ShortVideoComment>[];
+    var reason = '';
+    var detail = '';
+    try {
+      list = await ShortVideoWeb.resolveComments(
+        platformId: platform.id,
+        videoId: videoId,
+        userAgent: platform.userAgent,
+        force: force,
+      );
+      if (list.isEmpty) {
+        reason = ShortVideoWeb.lastCommentError.isEmpty
+            ? 'blocked'
+            : ShortVideoWeb.lastCommentError;
+      }
+    } catch (error) {
+      // 通道异常 / 超时也必须落到失败态：_commentsLoading 一旦留成 true，
+      // 面板就停在骨架屏上，看起来和「没打开」一样。
+      reason = 'network';
+      detail = '$error';
+    }
     if (!mounted || session != _commentsSession) return;
     setState(() {
       _commentsLoading = false;
       _comments = list;
-      _commentsError = list.isEmpty
-          ? (ShortVideoWeb.lastCommentError.isEmpty
-                ? 'blocked'
-                : ShortVideoWeb.lastCommentError)
-          : '';
+      _commentsError = reason;
     });
+    if (list.isNotEmpty) {
+      _diagComments(
+        'success',
+        platform: platform,
+        videoId: videoId,
+        count: list.length,
+      );
+    } else if (reason == 'empty') {
+      _diagComments(
+        'empty',
+        platform: platform,
+        videoId: videoId,
+        reason: reason,
+      );
+    } else {
+      _diagComments(
+        'error',
+        platform: platform,
+        videoId: videoId,
+        reason: reason,
+        detail: detail,
+      );
+    }
+  }
+
+  /// 评论面板的取证事件：opened / loading / success / empty / error。
+  ///
+  /// 评论要等原生开网页抓接口，真机上「打不开」既可能是面板没弹出来，
+  /// 也可能是还在加载或拿不到数据。把打开结果、平台、视频 id 和失败原因
+  /// 都写进同一条日志，现场只看 `comments-panel` 就能区分。
+  void _diagComments(
+    String state, {
+    required ShortVideoPlatform platform,
+    required String videoId,
+    String reason = '',
+    int? count,
+    String detail = '',
+  }) {
+    final fields = <String, Object?>{
+      'state': state,
+      'platform': platform.id,
+      'videoId': videoId,
+      if (reason.isNotEmpty) 'reason': reason,
+    };
+    if (count != null) fields['count'] = count;
+    if (detail.isNotEmpty) {
+      fields['detail'] = detail.length > 160
+          ? detail.substring(0, 160)
+          : detail;
+    }
+    try {
+      DiagProbe.event('comments-panel', fields);
+    } catch (_) {
+      // 取证是旁路：写日志失败也不能挡住面板打开或评论状态落位。
+    }
   }
 
   /// 页内面板：半透明遮罩 + 底部卡片。
@@ -4325,21 +4410,33 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
         ? 'https://www.bilibili.com/video/$bvid'
         : (videoId.isEmpty ? '' : platform.shareUrl(videoId));
     final header = _comments.isNotEmpty ? '评论 · ${_comments.length}' : '评论';
-    return SizedBox(
-      height: MediaQuery.sizeOf(context).height * 0.62,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        child: Column(
-          children: [
-            _sheetHeader(header),
-            _commentCaption(entry.title),
-            const SizedBox(height: 8),
-            Expanded(
-              child: _commentsBody(platform: platform, shareUrl: shareUrl),
+    final double targetHeight = MediaQuery.sizeOf(context).height * 0.62;
+    // 外层最多给 70% 屏高，SafeArea 还要再扣底部安全区。矮屏 / 横屏下
+    // 固定 62% 会顶破约束，这里按实际可用高度收一刀，保证面板永远有地方放。
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double height =
+            constraints.maxHeight.isFinite &&
+                constraints.maxHeight < targetHeight
+            ? constraints.maxHeight
+            : targetHeight;
+        return SizedBox(
+          height: height,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Column(
+              children: [
+                _sheetHeader(header),
+                _commentCaption(entry.title),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: _commentsBody(platform: platform, shareUrl: shareUrl),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
@@ -4460,12 +4557,36 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
                 ),
               ),
             ),
+            if (reason.isNotEmpty && reason != 'empty') ...[
+              const SizedBox(height: 6),
+              Text(
+                '原因：${_commentsReasonLabel(reason)}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white30,
+                  fontSize: 10,
+                  height: 1.4,
+                ),
+              ),
+            ],
             const SizedBox(height: 16),
+            if (login) ...[
+              FilledButton.icon(
+                onPressed: () => unawaited(_openLoginWeb(platform)),
+                icon: const Icon(Icons.login, size: 16),
+                label: Text('打开网页登录${platform.album}'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF2F9BFF),
+                  foregroundColor: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
             if (shareUrl.isNotEmpty)
               OutlinedButton.icon(
                 onPressed: () => unawaited(_openCommentPage(shareUrl)),
                 icon: const Icon(Icons.open_in_browser, size: 16),
-                label: Text(login ? '去网页登录 / 打开视频页' : '在浏览器中打开该视频'),
+                label: Text(login ? '在浏览器打开视频页' : '在浏览器中打开该视频'),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: Colors.white70,
                   side: const BorderSide(color: Color(0x33FFFFFF)),
@@ -4669,15 +4790,45 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     };
   }
 
+  String _commentsReasonLabel(String reason) {
+    return switch (reason) {
+      'login' => '登录态缺失',
+      'blocked' => '平台未返回评论（风控或接口无响应）',
+      'network' => '网络或视频页加载失败',
+      'unsupported' => '当前视频没有可用的评论页',
+      'empty' => '没有评论',
+      _ => '未知原因',
+    };
+  }
+
   String _commentsHint(String album) {
     return switch (_commentsError) {
-      'login' => '请在网页里登录$album，登录态会共享给评论抓取；登录后再点重新加载。',
+      'login' => '先打开网页登录$album，登录后再点「重新加载」。',
       'blocked' => '评论接口没有返回数据，可能触发了平台风控；可以稍后重试，或直接去网页里看。',
       'network' => '网络不稳定，或视频页没能打开，请检查网络后重试。',
       'unsupported' => '当前只抓抖音 / TikTok 的评论，可先去网页查看。',
       'empty' => '这条视频还没有人评论，去抢个沙发吧。',
       _ => '平台没有公开评论，或这条视频还没有人评论。',
     };
+  }
+
+  /// 「去登录」必须打开 App 内的网页：评论抓取读的是原生 WKWebView 那罐
+  /// cookie，外部浏览器登录不会回传。登录完成回到播放页，再点「重新加载」。
+  Future<void> _openLoginWeb(ShortVideoPlatform platform) async {
+    final videoId = _current.short?.videoId ?? '';
+    _diagComments('login-open', platform: platform, videoId: videoId);
+    try {
+      await ShortVideoWeb.open(platform);
+    } catch (error) {
+      _diagComments(
+        'login-error',
+        platform: platform,
+        videoId: videoId,
+        reason: 'open-failed',
+        detail: '$error',
+      );
+      if (mounted) SmartDialog.showToast('无法打开登录页，请改用浏览器');
+    }
   }
 
   Future<void> _openCommentPage(String url) async {
