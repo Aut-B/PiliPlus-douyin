@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:PiliPlus/common/widgets/player_bar.dart';
 import 'package:PiliPlus/common/widgets/progress_bar/audio_video_progress_bar.dart';
@@ -19,6 +20,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/common_btn.dart';
 import 'package:PiliPlus/services/service_locator.dart';
+import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/ios/pip_helper.dart';
 import 'package:PiliPlus/utils/storage.dart';
@@ -224,6 +226,16 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 进页面后自动隐藏控件的计时器，和 B 站播放页的隐藏行为对齐。
   Timer? _chromeTimer;
+
+  /// Android PiP 精简布局：只留视频画面和一行标题。
+  /// 只在原生进入/退出回调时 setState 一次，PiP 期间不做逐帧重绘。
+  bool _isPipLayout = false;
+
+  /// 进入 PiP 前的控件可见状态，退出时原样恢复。
+  bool _chromeVisibleBeforePip = true;
+
+  /// 上次下发的 PiP 遥控键状态签名，避免同一状态重复走 JNI。
+  int? _pipActionSig;
 
   /// 播放页内嵌面板。评论 / 画质 / 更多都走这一层，不再开 Navigator 路由：
   /// 这条页面是 `Get.to` 推进来的，`showModalBottomSheet` / `PopupMenuButton`
@@ -483,6 +495,13 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     // 登记，之后再改来源，才不会把上一条/别的页面留下的纹理错标成 douyin。
     _player.textureSource = 'douyin';
     IOSPipHelper.onAutoEnter = _pipAutoEnterHandler;
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.setPictureInPictureModeListener(
+        _onAndroidPipModeChanged,
+      );
+      // 页面若是在小窗里重建的，第一次 build 就要用精简布局。
+      _isPipLayout = PiliAndroidHelper.isPipMode;
+    }
     _syncFrameConsumer('init');
     // B 站首帧预算要按机型分档（6S 12s / 其它 8s）；这里只问一次原生内存，
     // 之后同步读 ShortVideoPerf.lowMemory，不在看门狗路径上 await。
@@ -580,6 +599,11 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _disarmPipAutoEnter('shutdown');
     if (identical(IOSPipHelper.onAutoEnter, _pipAutoEnterHandler)) {
       IOSPipHelper.onAutoEnter = null;
+    }
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.clearPictureInPictureModeListener(
+        _onAndroidPipModeChanged,
+      );
     }
     _stopPipTicker();
     _prefetchKey = null;
@@ -2040,6 +2064,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pushProgress(force: true);
     _publishPipState();
     _publishBackgroundState(status: status);
+    _syncAndroidPipActions();
     if (status == PlayerStatus.completed) {
       if (!_completionArmed || _armedSession != _openSession) return;
       if (_player.dataStatus.value != DataStatus.loaded) return;
@@ -2357,6 +2382,7 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _pushProgress(force: true);
     _publishPipState();
     _publishBackgroundState();
+    _syncAndroidPipActions();
     if (_player.playerStatus.isPlaying) {
       _armPipAutoEnter('toggle-play');
     } else {
@@ -2365,6 +2391,25 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   Future<void> _enterPip() async {
+    if (Platform.isAndroid) {
+      final allow = PiliAndroidHelper.isPipAvailable;
+      DiagProbe.event('android-pip-enter', <String, Object?>{
+        'allow': allow,
+        'reason': allow ? 'manual' : 'unsupported',
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      if (!allow) {
+        SmartDialog.showToast('这台设备不支持画中画');
+        return;
+      }
+      _pipEntered = true;
+      // Android 的 PiP 由 controller 分派到 PageUtils/PiliAndroidHelper，
+      // 这里与 B 站播放页的手动入口保持一致，直接请求进入小窗。
+      _player.enterPip(autoEnter: false);
+      return;
+    }
     if (!IOSPipHelper.isAvailable) {
       SmartDialog.showToast('这台设备不支持画中画');
       return;
@@ -2384,6 +2429,59 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     _publishPipState(_player.positionInMilliseconds);
   }
 
+  /// 原生 PiP 进入/退出回调：只切换一次布局，并同步小窗遥控键。
+  void _onAndroidPipModeChanged() {
+    if (!mounted || _disposed) return;
+    final isPip = PiliAndroidHelper.isPipMode;
+    if (isPip == _isPipLayout) return;
+    if (isPip) {
+      _chromeVisibleBeforePip = _chromeVisible;
+      _chromeTimer?.cancel();
+      _chromeTimer = null;
+      setState(() => _isPipLayout = true);
+      _syncAndroidPipActions(force: true);
+    } else {
+      final restoreChrome = _chromeVisibleBeforePip;
+      setState(() {
+        _isPipLayout = false;
+        _chromeVisible = restoreChrome;
+      });
+      _pipActionSig = null;
+      if (restoreChrome) _scheduleChromeHide();
+    }
+    DiagProbe.event('android-pip-layout', <String, Object?>{
+      'pip': isPip,
+      'isPlaying': _player.playerStatus.isPlaying,
+      'textureId': _player.videoController?.id.value,
+    });
+  }
+
+  /// 小窗里的播放/暂停/快进键要和真实播放状态一致。
+  /// 只在 PiP 中、签名变化或显式 force 时下发，避免重复 JNI。
+  void _syncAndroidPipActions({bool force = false}) {
+    if (!Platform.isAndroid || !_isPipLayout) return;
+    final isLive = _player.isLive;
+    final isPlaying = _player.playerStatus.isPlaying;
+    final sig = Object.hash(isLive, isPlaying);
+    if (!force && sig == _pipActionSig) return;
+    _pipActionSig = sig;
+    try {
+      PiliAndroidHelper.updatePipActions(
+        isLive: isLive,
+        isPlaying: isPlaying,
+      );
+      DiagProbe.event('android-pip-actions', <String, Object?>{
+        'isLive': isLive,
+        'isPlaying': isPlaying,
+      });
+    } catch (error) {
+      DiagProbe.event('android-pip-actions', <String, Object?>{
+        'ok': false,
+        'error': '$error',
+      });
+    }
+  }
+
   Future<void> _syncPipTickerAfterEnter() async {
     // 原生小窗激活偶尔超过 1.6s，补够 3.2s；一旦 active 立即结束，仍然是
     // 有界的一次性追踪，不是常驻定时器。
@@ -2400,6 +2498,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// `canStartPictureInPictureAutomaticallyFromInline = true`，按 Home 退后台即起小窗。
   void _armPipAutoEnter(String reason) {
     if (_disposed || _leaving || !mounted || _appPaused) return;
+    if (Platform.isAndroid) {
+      if (_pipAutoArmed) return;
+      final allow = PiliAndroidHelper.isPipAvailable;
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': allow,
+        'reason': reason,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      if (!allow) return;
+      _pipAutoArmed = true;
+      _pipStartRequested = false;
+      // SDK >= 31 由原生设置 autoEnterEnabled；更老的版本在真正退后台时
+      // 再由 _requestPipAutoEnterOnBackground 显式请求进入。
+      _player.enterPip(autoEnter: true);
+      return;
+    }
     if (_pipAutoArmed || !IOSPipHelper.isAvailable) return;
     final textureId = _player.videoController?.id.value;
     if (textureId == null) return;
@@ -2428,6 +2544,17 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     }
     _pipAutoArmed = false;
     _pipStartRequested = false;
+    if (Platform.isAndroid) {
+      PiliAndroidHelper.disableAutoEnterPip();
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': true,
+        'armed': false,
+        'reason': reason,
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+      });
+      return;
+    }
     IOSPipHelper.disableAutoEnter();
     _syncPipTicker();
     _syncFrameConsumer('pip-disarm');
@@ -2461,8 +2588,24 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   void _requestPipAutoEnterOnBackground(String reason) {
     if (_disposed || _leaving || !mounted) return;
     if (!_pipAutoArmed || _pipStartRequested) return;
-    if (IOSPipHelper.isActive || !IOSPipHelper.isAvailable) return;
     if (!_player.playerStatus.isPlaying) return;
+    if (Platform.isAndroid) {
+      if (!PiliAndroidHelper.isPipAvailable) return;
+      _pipStartRequested = true;
+      // 已经离开前台，直接用 autoEnter:false 请求系统进入小窗；SDK < 31
+      // 的原生 autoEnter 不支持，但 enterPictureInPictureMode 仍可用。
+      _player.enterPip(autoEnter: false);
+      DiagProbe.event('android-pip-arm', <String, Object?>{
+        'allow': true,
+        'reason': reason,
+        'action': 'start',
+        'isPlaying': _player.playerStatus.isPlaying,
+        'positionMs': _player.positionInMilliseconds,
+        'textureId': _player.videoController?.id.value,
+      });
+      return;
+    }
+    if (IOSPipHelper.isActive || !IOSPipHelper.isAvailable) return;
     _pipStartRequested = true;
     IOSPipHelper.requestStart();
     DiagProbe.event('pip-auto-start', <String, Object?>{
@@ -2497,7 +2640,8 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// PiP 活跃时每 500ms 推一次 position，原生 timebase 才会前进；只在进入
   /// 画中画时推一次的话，老机型依旧会卡帧。非活跃时 [_publishPipState]
   /// 只在状态变化时真正下发，不再每 500ms 走一次 method channel。
-  bool get _pipShouldTick => _pipAutoArmed || IOSPipHelper.isActive;
+  bool get _pipShouldTick =>
+      !Platform.isAndroid && (_pipAutoArmed || IOSPipHelper.isActive);
 
   /// 只在 PiP armed / active 时跑 ticker，正常前台播放不产生 500ms 定时器。
   void _syncPipTicker() {
@@ -2549,6 +2693,19 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// active 回调；回到前台且 PiP 没起来时会立即恢复。
   void _syncFrameConsumer(String reason) {
     if (_disposed) return;
+    if (Platform.isAndroid) {
+      // Android 的 PiP 是整个 Activity 进入小窗，Flutter texture 仍是唯一
+      // 画面来源；不能套用 iOS 的停页内采样逻辑，否则小窗会变黑。
+      DiagProbe.frontFramePulling = true;
+      if (_pipFrameSuppressed) {
+        if (mounted) {
+          setState(() => _pipFrameSuppressed = false);
+        } else {
+          _pipFrameSuppressed = false;
+        }
+      }
+      return;
+    }
     final pipActive = IOSPipHelper.isActive;
     final wantSuppress =
         pipActive ||
@@ -2940,6 +3097,37 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   Widget build(BuildContext context) {
     final entry = _current;
     final viewPadding = MediaQuery.viewPaddingOf(context);
+    // PiP 精简布局：系统小窗只有视频画面和一行标题，不构建底栏/顶栏/
+    // 边缘手势/面板。只在进出 PiP 时 setState 一次，PiP 期间不做逐帧重绘。
+    if (_isPipLayout) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(child: _video()),
+            if (entry.title.isNotEmpty)
+              Positioned(
+                left: 12,
+                right: 12,
+                bottom: viewPadding.bottom + 8,
+                child: Text(
+                  entry.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    shadows: <Shadow>[
+                      Shadow(blurRadius: 4, color: Colors.black54),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+    }
     // 收紧后的栏高只留刚够用的空间；系统字号放大到 1.6 时标题和时间行
     // 会变高，这里按比例补回一点，避免底栏按钮被挤出屏幕。
     final double textScale = MediaQuery.textScalerOf(context).scale(1.0);
@@ -3896,12 +4084,14 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   /// 只挂在视频层的 onTap 上。视频层和控件条在几何上不重叠，所以点按钮
   /// 不会顺带把控件收起来（B 站播放页那套是整屏一层手势，这里刻意不这么写）。
   void _toggleChrome() {
+    if (_isPipLayout) return;
     setState(() => _chromeVisible = !_chromeVisible);
     _scheduleChromeHide();
   }
 
   /// 控件显示后 4 秒自动收起。用户又点一下可以立刻再收。
   void _scheduleChromeHide() {
+    if (_isPipLayout) return;
     _chromeTimer?.cancel();
     if (!_chromeVisible) return;
     _chromeTimer = Timer(const Duration(seconds: 4), () {
