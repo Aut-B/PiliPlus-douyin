@@ -31,6 +31,11 @@ const String kNetEscalatedExtra = '_net_escalated';
 /// allowed to escalate the transport).
 const String kNetAttemptStartExtra = '_net_attempt_start_ms';
 
+/// Retry counter written by [RetryInterceptor]. `> 0` means this request has
+/// already been replayed at least once (and therefore already rebuilt the
+/// pool), so the toast-level auto recovery must not replay it a second time.
+const String kNetRetryCountExtra = '_rt';
+
 /// What the owner did (or skipped) when asked to rebuild the transport pool.
 class NetResetOutcome {
   const NetResetOutcome({
@@ -136,8 +141,6 @@ class RetryInterceptor extends Interceptor {
     this.recoveredTag = 'net-recovered',
   });
 
-  static const String _rtKey = '_rt';
-
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
     final options = err.requestOptions;
@@ -184,11 +187,11 @@ class RetryInterceptor extends Interceptor {
       return handler.next(err);
     }
 
-    final attempt = ((options.extra[_rtKey] as int?) ?? 0) + 1;
+    final attempt = ((options.extra[kNetRetryCountExtra] as int?) ?? 0) + 1;
     if (attempt > _count) {
       return handler.next(err);
     }
-    options.extra[_rtKey] = attempt;
+    options.extra[kNetRetryCountExtra] = attempt;
 
     final dns = isDnsError(err);
     NetResetOutcome? reset;
