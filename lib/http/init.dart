@@ -11,16 +11,16 @@ import 'package:PiliPlus/pages/douyin/diag_probe.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/accounts/account.dart';
 import 'package:PiliPlus/utils/accounts/account_manager/account_mgr.dart';
+import 'package:PiliPlus/utils/connectivity_utils.dart';
 import 'package:PiliPlus/utils/global_data.dart';
 import 'package:PiliPlus/utils/login_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:brotli/brotli.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 import 'package:dio_http2_adapter/dio_http2_adapter.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, listEquals;
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/widgets.dart'
     show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 
@@ -118,6 +118,9 @@ class _NetFailDiagInterceptor extends Interceptor {
           options.extra[kNetGenerationExtra] ?? Request.poolGeneration,
       'switched': options.extra[kNetSwitchedExtra] == true,
       'escalated': options.extra[kNetEscalatedExtra] == true,
+      'fastFail': options.extra[kNetFastFailExtra] == true,
+      'staleSocket': isStaleSocketError(err),
+      'receiveTimeoutMs': options.receiveTimeout?.inMilliseconds,
     });
   }
 
@@ -316,23 +319,6 @@ class Request {
     return h11;
   }
 
-  static Timer? _networkChangeDebounce;
-
-  static void _onConnectivityChanged(List<ConnectivityResult> result) {
-    if (listEquals(result, const [ConnectivityResult.none])) {
-      return;
-    }
-    _networkChangeDebounce?.cancel();
-    _networkChangeDebounce = Timer(
-      const Duration(milliseconds: 500),
-      _resetAdaptersForNetworkChange,
-    );
-  }
-
-  static void _watchConnectivity() {
-    Connectivity().onConnectivityChanged.skip(1).listen(_onConnectivityChanged);
-  }
-
   static (IOHttpClientAdapter, ConnectionManager?) _createPool({
     required bool http2,
   }) {
@@ -376,11 +362,6 @@ class Request {
           )
         : null;
     return (http11Adapter, connectionManager);
-  }
-
-  @pragma('vm:notify-debugger-on-exception')
-  static void _resetAdaptersForNetworkChange() {
-    resetConnectionPool(reason: 'connectivity');
   }
 
   /// Force-close the current connection pool / http client and swap in a
@@ -622,7 +603,10 @@ class Request {
       //连接服务器超时时间，单位是毫秒.
       connectTimeout: const Duration(milliseconds: 10000),
       //响应流上前后两次接受到数据的间隔，单位为毫秒。
-      receiveTimeout: const Duration(milliseconds: 10000),
+      // Dead keep-alive sockets only fail when this fires. Keep it short so
+      // a frozen GET starts recovery sooner; connectTimeout stays as-is to
+      // avoid killing slow networks.
+      receiveTimeout: const Duration(milliseconds: 6000),
       //Http请求头.
       headers: {
         'user-agent': 'Dart/3.6 (dart:io)', // Http2Adapter不会自动添加标头
@@ -676,7 +660,7 @@ class Request {
         return status != null && status >= 200 && status < 300;
       };
 
-    if (Platform.isIOS) _watchConnectivity();
+    ConnectivityUtils.watchRecovery();
     _watchLifecycle();
   }
 

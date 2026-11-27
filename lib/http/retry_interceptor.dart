@@ -24,12 +24,18 @@ const String kNetTransportExtra = '_net_transport';
 const String kNetGenerationExtra = '_net_generation';
 const String kNetSwitchedExtra = '_net_switched';
 const String kNetEscalatedExtra = '_net_escalated';
+const String kNetFastFailExtra = '_net_fast_fail';
 
 /// When the current attempt actually hit the network. Used by the pool owner
 /// to tell a concurrent sibling (started before the rebuild, so it must be
 /// debounced) apart from a retry that started on the fresh pool (which is
 /// allowed to escalate the transport).
 const String kNetAttemptStartExtra = '_net_attempt_start_ms';
+
+/// Retry counter written by [RetryInterceptor]. `> 0` means this request has
+/// already been replayed at least once (and therefore already rebuilt the
+/// pool), so the toast-level auto recovery must not replay it a second time.
+const String kNetRetryCountExtra = '_rt';
 
 /// What the owner did (or skipped) when asked to rebuild the transport pool.
 class NetResetOutcome {
@@ -71,9 +77,18 @@ bool isRetryableNetError(DioException err) {
       // methods; otherwise the request may already have reached the server
       // and retrying could double-submit.
       err.error is! TransportConnectionException || isStaleSocketError(err),
+    // A dead keep-alive socket that silently swallowed the request only
+    // surfaces as a receive timeout. Idempotent replays are safe.
+    DioExceptionType.receiveTimeout =>
+      _isIdempotentMethod(err.requestOptions.method),
     _ => false,
   };
 }
+
+bool _isIdempotentMethod(String method) => switch (method.toUpperCase()) {
+  'GET' || 'HEAD' || 'OPTIONS' => true,
+  _ => false,
+};
 
 /// Whether [err] is a terminated keep-alive socket on an idempotent request.
 ///
@@ -85,10 +100,22 @@ bool isStaleSocketError(DioException err) {
   if (err.response != null) return false;
   if (err.requestOptions.responseType == ResponseType.stream) return false;
   if (err.error is! TransportConnectionException) return false;
-  return switch (err.requestOptions.method.toUpperCase()) {
-    'GET' || 'HEAD' || 'OPTIONS' => true,
-    _ => false,
-  };
+  return _isIdempotentMethod(err.requestOptions.method);
+}
+
+/// Whether an idempotent request failed in a way that should skip the normal
+/// backoff and retry immediately on the rebuilt pool.
+///
+/// [TransportConnectionException] is a forcefully terminated h2 socket;
+/// `sendTimeout` / `receiveTimeout` are the h2 adapter's signal that no
+/// response arrived on a dead connection.
+bool isFastFailNetError(DioException err) {
+  if (!_isIdempotentMethod(err.requestOptions.method)) return false;
+  if (err.response != null) return false;
+  if (err.requestOptions.responseType == ResponseType.stream) return false;
+  if (err.error is TransportConnectionException) return true;
+  return err.type == DioExceptionType.sendTimeout ||
+      err.type == DioExceptionType.receiveTimeout;
 }
 
 /// Whether [err] is a dns-resolution failure (Failed host lookup and friends).
@@ -136,8 +163,6 @@ class RetryInterceptor extends Interceptor {
     this.recoveredTag = 'net-recovered',
   });
 
-  static const String _rtKey = '_rt';
-
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
     final options = err.requestOptions;
@@ -184,13 +209,15 @@ class RetryInterceptor extends Interceptor {
       return handler.next(err);
     }
 
-    final attempt = ((options.extra[_rtKey] as int?) ?? 0) + 1;
+    final attempt = ((options.extra[kNetRetryCountExtra] as int?) ?? 0) + 1;
     if (attempt > _count) {
       return handler.next(err);
     }
-    options.extra[_rtKey] = attempt;
+    options.extra[kNetRetryCountExtra] = attempt;
 
     final dns = isDnsError(err);
+    final fastFail = isFastFailNetError(err);
+    options.extra[kNetFastFailExtra] = fastFail;
     NetResetOutcome? reset;
     final reason = _resetReason(err);
     if (reason != null) {
@@ -211,9 +238,9 @@ class RetryInterceptor extends Interceptor {
         ..[kNetSwitchedExtra] = reset.switched
         ..[kNetEscalatedExtra] = reset.escalated;
     }
-    _log(retryTag, err, attempt, dns, reset);
+    final waitMs = fastFail ? 0 : retryDelayMs(attempt, _delay);
+    _log(retryTag, err, attempt, dns, reset, fastFail, waitMs);
 
-    final waitMs = retryDelayMs(attempt, _delay);
     Timer(Duration(milliseconds: waitMs), () {
       // Mark the moment this attempt leaves for the wire: a failure from this
       // attempt started after the rebuild, so it may escalate the transport.
@@ -221,7 +248,7 @@ class RetryInterceptor extends Interceptor {
           DateTime.now().millisecondsSinceEpoch;
       _client.fetch(options).then<void>(
         (response) {
-          _log(recoveredTag, err, attempt, dns, reset);
+          _log(recoveredTag, err, attempt, dns, reset, fastFail, waitMs);
           handler.resolve(response);
         },
         onError: (Object error, StackTrace _) {
@@ -257,7 +284,8 @@ class RetryInterceptor extends Interceptor {
     // idempotent method a replay on a fresh pool is safe.
     if (err.type == DioExceptionType.connectionError ||
         err.type == DioExceptionType.connectionTimeout ||
-        err.type == DioExceptionType.sendTimeout) {
+        err.type == DioExceptionType.sendTimeout ||
+        err.type == DioExceptionType.receiveTimeout) {
       return 'connection';
     }
     // dio wraps some socket-level failures as `unknown`; only treat it as a
@@ -275,6 +303,8 @@ class RetryInterceptor extends Interceptor {
     int attempt,
     bool dns,
     NetResetOutcome? reset,
+    bool fastFail,
+    int delayMs,
   ) {
     try {
       log?.call(tag, <String, Object?>{
@@ -283,6 +313,10 @@ class RetryInterceptor extends Interceptor {
         'attempt': attempt,
         'max': _count,
         'dns': dns,
+        'fastFail': fastFail,
+        'staleSocket': isStaleSocketError(err),
+        'delayMs': delayMs,
+        'receiveTimeoutMs': err.requestOptions.receiveTimeout?.inMilliseconds,
         'dioType': err.type.name,
         'errorMsg': _short(err),
         'rebuild': reset?.rebuilt,

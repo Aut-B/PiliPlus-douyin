@@ -16,9 +16,8 @@ import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
-import 'package:material_ui/material_ui.dart';
 
 final _setCookieReg = RegExp('(?<=)(,)(?=[^;]+?=)');
 
@@ -156,7 +155,11 @@ class AccountManager extends Interceptor {
       return handler.next(err);
     }
 
-    if (options.method != 'POST') toast(err);
+    if (options.method != 'POST') {
+      toast(err);
+    } else {
+      _recoverWriteFailure(err);
+    }
 
     if (err.response case final res?) {
       if (_boundRequestAccount(options) case final account?) {
@@ -223,7 +226,7 @@ class AccountManager extends Interceptor {
 
     switch (kind) {
       case _ErrKind.network:
-        _showNetworkDown(err);
+        _autoRecoverNetwork(err);
       case _ErrKind.risk:
         final code = _apiCode(err) ?? err.response?.statusCode;
         SmartDialog.showToast(
@@ -285,42 +288,102 @@ class AccountManager extends Interceptor {
     return text.length > 300 ? '${text.substring(0, 300)}…' : text;
   }
 
-  /// 真·网络断：给用户一个能重发这次请求的按钮。
-  static void _showNetworkDown(DioException err) {
-    SmartDialog.show(
-      animationType: SmartAnimationType.centerFade_otherSlide,
-      builder: (context) => AlertDialog(
-        title: const Text('网络连接中断'),
-        content: const Text('没有收到服务器响应，请检查网络设置后重试。'),
-        actions: [
-          const TextButton(
-            onPressed: SmartDialog.dismiss,
-            child: Text('取消'),
-          ),
-          TextButton(
-            onPressed: () {
-              SmartDialog.dismiss();
-              _retryRequest(err.requestOptions);
-            },
-            child: const Text('重试'),
-          ),
-        ],
-      ),
+  /// 同一次失败已经被本层自动恢复拦下时置位，防止重发再失败后无限套娃。
+  static const String _kAutoRecoverExtra = '_net_auto_recover';
+
+  /// 同一秒内多个请求一起断连只重建一次连接池，避免反复 force-close
+  /// 正在被其它请求使用的新连接。
+  static const int _autoRebuildDebounceMs = 1000;
+  static int _lastAutoRebuildAtMs = 0;
+
+  /// 断连自愈：不再弹带 barrier 的模态框，改为重建连接池 + 非阻塞提示。
+  ///
+  /// 幂等 GET/HEAD/OPTIONS 在重建池后自动重发一次；其它方法（例如 POST）
+  /// 只重建池，绝不重发，避免双提交。若 [RetryInterceptor] 已经重发过，
+  /// 这里靠 [kNetRetryCountExtra] 识别并跳过，不突破其有界重试上限。
+  static void _autoRecoverNetwork(DioException err) {
+    final options = err.requestOptions;
+    final method = options.method.toUpperCase();
+    final idempotent =
+        method == 'GET' || method == 'HEAD' || method == 'OPTIONS';
+    final alreadyRetried =
+        ((options.extra[kNetRetryCountExtra] as int?) ?? 0) > 0;
+    final alreadyRecovered = options.extra[_kAutoRecoverExtra] == true;
+
+    final reset = alreadyRecovered ? null : _rebuildPoolForAutoRecover(err);
+    final autoResend = idempotent && !alreadyRetried && !alreadyRecovered;
+
+    SmartDialog.showToast('网络连接中断，正在自动重连…');
+    if (!autoResend) {
+      if (!alreadyRecovered) {
+        _logAutoRecover(err, reset, autoResend: false);
+      }
+      return;
+    }
+
+    options.extra[_kAutoRecoverExtra] = true;
+    Request.dio.fetch(options).then<void>(
+      (_) {
+        _logAutoRecover(err, reset, autoResend: true, success: true);
+        SmartDialog.showToast('网络已恢复');
+      },
+      onError: (Object _, StackTrace _) {
+        _logAutoRecover(err, reset, autoResend: true, success: false);
+      },
     );
   }
 
-  static Future<void> _retryRequest(RequestOptions options) async {
-    // 用户主动重试：清掉上一次自动重试的计数，让这次从新的尝试开始。
-    options.extra.remove('_rt');
+  /// POST 等非幂等请求断连：只重建连接池，不自动重发，避免双提交。
+  static void _recoverWriteFailure(DioException err) {
+    if (!_isNetworkDown(err)) return;
+    final options = err.requestOptions;
+    if (options.extra[_kAutoRecoverExtra] == true) return;
+    options.extra[_kAutoRecoverExtra] = true;
+    final reset = _rebuildPoolForAutoRecover(err);
+    _logAutoRecover(err, reset, autoResend: false);
+  }
+
+  /// 池重建去抖；被去抖时返回 null，表示这一次复用了刚重建好的池。
+  static NetResetOutcome? _rebuildPoolForAutoRecover(DioException err) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastAutoRebuildAtMs < _autoRebuildDebounceMs) {
+      return null;
+    }
+    _lastAutoRebuildAtMs = now;
     try {
-      await Request.dio.fetch(options);
-      SmartDialog.showToast('网络已恢复');
-    } on DioException catch (e) {
-      // 这次失败是用户主动触发的，不受上一条提示的去重窗口影响。
-      _lastToastKind = null;
-      toast(e);
+      return Request.resetConnectionPool(reason: 'auto', err: err);
     } catch (_) {
-      // 取消失败等非 Dio 异常：不额外打扰。
+      // 重建失败也不能挡住提示与页面自己的内联重试。
+      return null;
+    }
+  }
+
+  static void _logAutoRecover(
+    DioException err,
+    NetResetOutcome? reset, {
+    required bool autoResend,
+    bool? success,
+  }) {
+    try {
+      final uri = err.requestOptions.uri;
+      final path = uri.path.isEmpty
+          ? err.requestOptions.path.split('?').first
+          : uri.path;
+      DiagProbe.log('net-auto-recover', <String, Object?>{
+        'source': '${uri.host}$path',
+        'host': uri.host,
+        'path': path,
+        'method': err.requestOptions.method,
+        'dioType': err.type.name,
+        'rebuilt': reset?.rebuilt ?? false,
+        'rebuildDebounced': reset == null,
+        'transport': reset?.transport ?? Request.transportPath,
+        'generation': reset?.generation ?? Request.poolGeneration,
+        'autoResend': autoResend,
+        'success': success,
+      });
+    } catch (_) {
+      // 诊断永远不能影响恢复流程。
     }
   }
 
