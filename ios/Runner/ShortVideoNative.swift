@@ -1709,20 +1709,32 @@ final class ShortVideoPlayResolver: NSObject, WKScriptMessageHandler, WKNavigati
   }
 
   private func consume(_ text: String) {
-    meta.merge(ShortVideoPlayResolver.parseMeta(text, platform: platform))
-    if let url = ShortVideoPlayResolver.pick(text) {
-      finish(url)
-      return
-    }
-    if uriFallback == nil, let uri = ShortVideoPlayResolver.pickPlayURI(text) {
-      uriFallback = "https://www.iesdouyin.com/aweme/v1/play/"
-        + "?video_id=\(uri)&ratio=720p&line=0"
-      uriFoundAt = ticks
-    }
-    let lower = text.lowercased()
-    if lower.contains("captcha") || lower.contains("verify-center")
-      || lower.contains("passport") {
-      loginDetected = true
+    // 144 的 main-stack 抓到：这里在**主线程**对整段（可达 60 万字符）网页文本做
+    // parseMeta/pick，内部 split 全量切分，6S 上单次可达 5.3 秒，把主线程直接堵死
+    // （画面/滑动全卡）。改成在后台线程解析，只在主线程回写状态/finish。
+    let platform = self.platform
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      let parsedMeta = ShortVideoPlayResolver.parseMeta(text, platform: platform)
+      let pickedURL = ShortVideoPlayResolver.pick(text)
+      let pickedURI = ShortVideoPlayResolver.pickPlayURI(text)
+      let lower = text.lowercased()
+      let login = lower.contains("captcha") || lower.contains("verify-center")
+        || lower.contains("passport")
+      DispatchQueue.main.async {
+        guard !self.finished else { return }
+        self.meta.merge(parsedMeta)
+        if let pickedURL = pickedURL {
+          self.finish(pickedURL)
+          return
+        }
+        if self.uriFallback == nil, let pickedURI = pickedURI {
+          self.uriFallback = "https://www.iesdouyin.com/aweme/v1/play/"
+            + "?video_id=\(pickedURI)&ratio=720p&line=0"
+          self.uriFoundAt = self.ticks
+        }
+        if login { self.loginDetected = true }
+      }
     }
   }
 

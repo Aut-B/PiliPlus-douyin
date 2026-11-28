@@ -572,7 +572,6 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
     unawaited(_primeVolume());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_dumpViewHierarchy());
-      unawaited(PiliRootScan.run());
       unawaited(_open(_index, source: 'initial'));
       _shuffleRestore = _restoreShuffle();
     });
@@ -2974,6 +2973,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
 
   /// 诊断包专用：把 Documents 里的 trace / 采样打成 zip 并弹系统分享面板。
   Future<void> _exportDiagnostics() async {
+    // 144 main-stack 发现：rootscan 以前每次进播放页就自动跑（含 2s 信号量等待 +
+    // 全视图树遍历 + mpv 采样），每次开播都占主线程。改成只在点「导出诊断」时
+    // 跑一次，平时不占主线程；导出包内容不变。
+    await PiliRootScan.run();
     final path = await DiagProbe.exportAndShare();
     if (!mounted) return;
     SmartDialog.showToast(
@@ -4322,8 +4325,10 @@ class _ShortVideoPlayerPageState extends State<ShortVideoPlayerPage>
   }
 
   /// 底栏常驻动作。其余动作只从「更多」进入。
+  /// 画中画（pip）按用户要求放到播放页常驻，不再塞进右上角「更多」。
   static const List<_PlayerAction> _primaryActions = <_PlayerAction>[
     _PlayerAction.comments,
+    _PlayerAction.pip,
     _PlayerAction.quality,
     _PlayerAction.rotate,
     _PlayerAction.cast,
