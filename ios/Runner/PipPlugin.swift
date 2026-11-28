@@ -2389,24 +2389,17 @@ final class MainThreadStallProbe {
     }
   }
 
-  /// 采一次主线程栈：PC 一定拿得到；帧指针链用 mach_vm_read_overwrite 安全读取
-  /// （读错地址只返回失败、不会让进程崩），最多往上 9 层。
+  /// 采一次主线程栈：从线程状态直接拿 PC 和 LR（返回地址）两帧并符号化。
+  /// 只读寄存器、不解引用任何内存，绝对不会崩；PC=正在执行的函数，
+  /// LR=它的调用者，两帧足够点名堵在哪个函数。
   private func sampleOnce() -> String {
     guard let regs = mainThreadRegs() else { return "" }
     var frames: [String] = [symbolize(regs.pc)]
-    var cur = regs.fp
-    var n = 1
-    while cur != 0 && n < 10 {
-      guard let next = safeRead(cur), let lr = safeRead(cur &+ 8), lr != 0 else { break }
-      frames.append(symbolize(UInt(lr)))
-      if next <= cur || next &- cur > 0x100000 { break }
-      cur = next
-      n += 1
-    }
+    if regs.lr != 0 { frames.append(symbolize(regs.lr)) }
     return frames.joined(separator: " <- ")
   }
 
-  private func mainThreadRegs() -> (pc: UInt, fp: UInt)? {
+  private func mainThreadRegs() -> (pc: UInt, lr: UInt)? {
     let port = mainThreadPort
     guard port != 0 else { return nil }
     #if arch(arm64)
@@ -2418,26 +2411,10 @@ final class MainThreadStallProbe {
       }
     }
     guard kr == KERN_SUCCESS else { return nil }
-    return (UInt(state.__pc), UInt(state.__fp))
+    return (UInt(state.__pc), UInt(state.__lr))
     #else
     return nil
     #endif
-  }
-
-  private func safeRead(_ addr: UInt) -> UInt? {
-    guard addr > 0x1000 else { return nil }
-    var value: UInt64 = 0
-    var outSize: mach_vm_size_t = 0
-    let kr = withUnsafeMutablePointer(to: &value) { p -> kern_return_t in
-      mach_vm_read_overwrite(
-        mach_task_self_,
-        mach_vm_address_t(addr),
-        mach_vm_size_t(MemoryLayout<UInt64>.size),
-        mach_vm_address_t(UInt(bitPattern: p)),
-        &outSize)
-    }
-    guard kr == KERN_SUCCESS, outSize == MemoryLayout<UInt64>.size else { return nil }
-    return UInt(value)
   }
 
   private func symbolize(_ rawPC: UInt) -> String {
