@@ -1,5 +1,6 @@
 import AVKit
 import CoreImage
+import Darwin
 import Flutter
 import UIKit
 
@@ -2318,29 +2319,137 @@ private enum TextureTracker {
 /// 比「发出」晚了多少；>300ms 记一条 `main-stall`。用来把前台 position gap 对上
 /// 「原生主线程到底被堵了多久」，从而区分是原生同步活、GPU 栅格化还是流投递滞后。
 /// 只写日志、极小开销、出错静默，不影响播放。
+/// 143: 主线程卡顿「点名器」。
+///
+/// 142 的旧探针只测「主线程晚了多少毫秒」（delay），知道卡了 2 秒却不知道堵在
+/// 哪个函数——而 diag 显示堵的瞬间 PipPlugin 一条日志都没有，说明堵在插件之外
+/// 的渲染/引擎侧。这里改成：主线程每 100ms 打一次心跳；后台线程一旦发现心跳
+/// 停了 >300ms，就**直接采主线程的 PC + 帧指针栈并符号化**，输出
+/// `main-stack: <符号> <- <调用者> ...`，一次点名堵在哪个函数。
 final class MainThreadStallProbe {
   static let shared = MainThreadStallProbe()
-  private let queue = DispatchQueue(label: "com.example.piliplus.mainstall")
+  private let queue = DispatchQueue(label: "com.example.piliplus.mainstall", qos: .userInitiated)
   private var timer: DispatchSourceTimer?
-  private let intervalMs = 500
+  private var beatTimer: DispatchSourceTimer?
+  private let intervalMs = 250
   private let thresholdMs = 300
+  private let lock = NSLock()
+  private var lastBeat: CFTimeInterval = 0
+  private var reportedUntilBeat: CFTimeInterval = 0
+  private var mainThreadPort: mach_port_t = 0
+  private var started = false
 
   func start() {
-    guard timer == nil else { return }
-    let t = DispatchSource.makeTimerSource(queue: queue)
-    t.schedule(deadline: .now() + .milliseconds(intervalMs), repeating: .milliseconds(intervalMs))
-    t.setEventHandler { [weak self] in
+    guard !started else { return }
+    started = true
+    // 主线程心跳：每 100ms 记一次时间。这段本身极轻（只写一个变量）。
+    let b = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+    b.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(20))
+    b.setEventHandler { [weak self] in
       guard let self else { return }
-      let sent = DispatchTime.now().uptimeNanoseconds
-      DispatchQueue.main.async {
-        let arrived = DispatchTime.now().uptimeNanoseconds
-        let delayMs = Int((arrived &- sent) / 1_000_000)
-        if delayMs > self.thresholdMs {
-          PipTrace.log("main-stall: delayMs=\(delayMs)")
-        }
+      if self.mainThreadPort == 0 {
+        self.mainThreadPort = pthread_mach_thread_np(pthread_self())
       }
+      self.lock.lock(); self.lastBeat = CACurrentMediaTime(); self.lock.unlock()
     }
+    b.resume()
+    beatTimer = b
+
+    let t = DispatchSource.makeTimerSource(queue: queue)
+    t.schedule(deadline: .now() + .milliseconds(intervalMs), repeating: .milliseconds(intervalMs),
+               leeway: .milliseconds(50))
+    t.setEventHandler { [weak self] in self?.check() }
     t.resume()
     timer = t
+  }
+
+  private func check() {
+    lock.lock()
+    let beat = lastBeat
+    lock.unlock()
+    guard beat > 0 else { return }
+    let now = CACurrentMediaTime()
+    let stalledMs = Int((now - beat) * 1000)
+    guard stalledMs > thresholdMs else { return }
+    // 一次卡顿只报一次：同一心跳之后的重复检查跳过，避免刷屏。
+    lock.lock()
+    let dup = reportedUntilBeat >= beat
+    if !dup { reportedUntilBeat = now }
+    lock.unlock()
+    if dup { return }
+    PipTrace.log("main-stall: delayMs=\(stalledMs)")
+    var samples: [String] = []
+    for _ in 0..<6 {
+      let s = sampleOnce()
+      if !s.isEmpty { samples.append(s) }
+      usleep(40_000)
+    }
+    if !samples.isEmpty {
+      PipTrace.log("main-stack: " + samples.joined(separator: " || "))
+    }
+  }
+
+  /// 采一次主线程栈：PC 一定拿得到；帧指针链用 mach_vm_read_overwrite 安全读取
+  /// （读错地址只返回失败、不会让进程崩），最多往上 9 层。
+  private func sampleOnce() -> String {
+    guard let regs = mainThreadRegs() else { return "" }
+    var frames: [String] = [symbolize(regs.pc)]
+    var cur = regs.fp
+    var n = 1
+    while cur != 0 && n < 10 {
+      guard let next = safeRead(cur), let lr = safeRead(cur &+ 8), lr != 0 else { break }
+      frames.append(symbolize(UInt(lr)))
+      if next <= cur || next &- cur > 0x100000 { break }
+      cur = next
+      n += 1
+    }
+    return frames.joined(separator: " <- ")
+  }
+
+  private func mainThreadRegs() -> (pc: UInt, fp: UInt)? {
+    let port = mainThreadPort
+    guard port != 0 else { return nil }
+    #if arch(arm64)
+    var state = arm_thread_state64_t()
+    var count = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &state) {
+      $0.withMemoryRebound(to: natural_t.self, capacity: Int(count)) {
+        thread_get_state(port, ARM_THREAD_STATE64, $0, &count)
+      }
+    }
+    guard kr == KERN_SUCCESS else { return nil }
+    return (UInt(state.__pc), UInt(state.__fp))
+    #else
+    return nil
+    #endif
+  }
+
+  private func safeRead(_ addr: UInt) -> UInt? {
+    guard addr > 0x1000 else { return nil }
+    var value: UInt64 = 0
+    var outSize: mach_vm_size_t = 0
+    let kr = withUnsafeMutablePointer(to: &value) { p -> kern_return_t in
+      mach_vm_read_overwrite(
+        mach_task_self_,
+        mach_vm_address_t(addr),
+        mach_vm_size_t(MemoryLayout<UInt64>.size),
+        mach_vm_address_t(UInt(bitPattern: p)),
+        &outSize)
+    }
+    guard kr == KERN_SUCCESS, outSize == MemoryLayout<UInt64>.size else { return nil }
+    return UInt(value)
+  }
+
+  private func symbolize(_ rawPC: UInt) -> String {
+    guard rawPC != 0 else { return "0x0" }
+    var info = Dl_info()
+    if dladdr(UnsafeRawPointer(bitPattern: rawPC), &info) != 0, let name = info.dli_sname {
+      let base: UInt = info.dli_saddr.map { UInt(bitPattern: $0) } ?? 0
+      return "\(String(cString: name))+\(rawPC &- base)"
+    }
+    if let fname = info.dli_fname {
+      return "\(String(cString: fname))+0x\(String(rawPC, radix: 16))"
+    }
+    return "0x\(String(rawPC, radix: 16))"
   }
 }
