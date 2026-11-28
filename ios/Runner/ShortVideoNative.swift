@@ -2407,6 +2407,13 @@ final class ShortVideoCommentResolver: NSObject, WKScriptMessageHandler,
   private func poll() {
     guard !finished, let web = webView else { return }
     ticks += 1
+    // 已经明确判定为登录墙 / 风控（页面自己报了 blocked，或抓到验证码/访问频繁文案）
+    // 时不再空等满 20 秒：立刻给结论。144 diag 里抖音评论正是「blocked 干等 20s」，
+    // 面板在骨架屏上白等 20 秒才显示失败。有评论可取的路径（TikTok）不受影响。
+    if ticks >= 3, blockedDetected || loginDetected {
+      finish(reason: failureReason())
+      return
+    }
     // 评论面板要等页面渲染、点击、分页，12 秒经常不够；放宽到约 20 秒。
     if ticks >= 20 {
       finish(reason: collected.isEmpty ? failureReason() : "")
